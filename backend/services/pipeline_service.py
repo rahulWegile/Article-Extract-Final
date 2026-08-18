@@ -19,7 +19,7 @@ from pipeline.ocr.rapidocr_engine import RapidOCREngine
 
 from pipeline.page_processor_gemini import process_page
 
-from pipeline.gemini.newspaper_client import (
+from pipeline.openai.newspaper_client import (
     NewspaperClient,
 )
 
@@ -29,6 +29,10 @@ from pipeline.gemini.newspaper_client import (
 
 from pipeline.intelligence.gemini_article_extractor import (
     GeminiArticleExtractor,
+)
+
+from pipeline.intelligence.openai_article_extractor import (
+    OpenAIArticleExtractor,
 )
 
 from pipeline.intelligence.local.local_article_extractor import (
@@ -1071,7 +1075,7 @@ class PipelineService:
             article_extractor_engine = (
                 os.getenv(
                     "ARTICLE_EXTRACTOR_ENGINE",
-                    "gemini",
+                    "openai",
                 )
                 .strip()
                 .lower()
@@ -1106,10 +1110,18 @@ class PipelineService:
                     )
                 )
 
-            else:
+            elif article_extractor_engine == "gemini":
 
                 article_extractor = (
                     GeminiArticleExtractor(
+                        pages_per_batch=3,
+                    )
+                )
+
+            else:
+
+                article_extractor = (
+                    OpenAIArticleExtractor(
                         pages_per_batch=3,
                     )
                 )

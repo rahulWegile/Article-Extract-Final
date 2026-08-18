@@ -75,6 +75,19 @@ class ArticleGrouper:
 
         removed = 0
 
+        duplicate_conflicts = 0
+
+        #
+        # A block may only belong to ONE article. The model is asked
+        # for exclusive ownership, but is not always reliable about
+        # it on dense pages -- without this guard a block claimed by
+        # multiple articles makes their boundaries overlap/merge in
+        # BoundaryBuilder. First article to claim a block (in response
+        # order) keeps it; later claims are dropped.
+        #
+
+        claimed_block_ids = set()
+
         #
         # Build each article
         #
@@ -86,6 +99,12 @@ class ArticleGrouper:
             article_block_ids = []
 
             for block_id in article["blocks"]:
+
+                if block_id in claimed_block_ids:
+
+                    duplicate_conflicts += 1
+
+                    continue
 
                 block = block_lookup.get(block_id)
 
@@ -107,6 +126,8 @@ class ArticleGrouper:
                     removed += 1
 
                     continue
+
+                claimed_block_ids.add(block_id)
 
                 article_blocks.append(block)
 
@@ -166,6 +187,14 @@ class ArticleGrouper:
         print(f"Articles Built : {len(articles)}")
 
         print(f"Ignored Blocks : {removed}")
+
+        if duplicate_conflicts:
+
+            print(
+                f"WARNING: Dropped {duplicate_conflicts} duplicate "
+                "block claim(s) -- model assigned block(s) to more "
+                "than one article."
+            )
 
         print()
 

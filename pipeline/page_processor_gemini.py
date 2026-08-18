@@ -1,4 +1,5 @@
 import json
+import os
 import time
 
 from pipeline.block_parser import parse_results
@@ -14,7 +15,7 @@ from pipeline.export.gemini_page_exporter import (
     GeminiPageExporter,
 )
 
-from pipeline.gemini.gemini_service import GeminiService
+from pipeline.openai.openai_service import OpenAIService
 from pipeline.gemini.gemini_prompt import ARTICLE_GROUP_PROMPT
 
 from pipeline.gemini.gemini_boundary_pipeline import (
@@ -250,18 +251,24 @@ def process_page(
     )
 
     # =====================================================
-    # Stage 2.8 : Gemini Article Analysis
+    # Stage 2.8 : OpenAI Article Analysis
     # =====================================================
 
     print()
     print(
-        "Running Gemini..."
+        "Running OpenAI..."
     )
 
-    service = GeminiService()
+    # gpt-4o-mini is not reliable at keeping block-to-article
+    # ownership exclusive on dense newspaper pages (verified: it
+    # collapsed a ~8-story front page into 3 overlapping articles).
+    # This stage gets its own, stronger default model.
+    service = OpenAIService(
+        model=os.getenv("OPENAI_BOUNDARY_MODEL", "gpt-4o"),
+    )
 
     # -----------------------------------------------------
-    # Gemini API timer
+    # OpenAI API timer
     # -----------------------------------------------------
 
     gemini_start = time.perf_counter()
@@ -279,10 +286,10 @@ def process_page(
         - gemini_start
     )
 
-    timings["Gemini API"] = gemini_elapsed
+    timings["OpenAI API"] = gemini_elapsed
 
     # -----------------------------------------------------
-    # Save Gemini response
+    # Save OpenAI response
     # -----------------------------------------------------
 
     stage_start = time.perf_counter()
@@ -316,12 +323,12 @@ def process_page(
         )
 
     print(
-        f"✓ Gemini response saved -> "
+        f"✓ OpenAI response saved -> "
         f"{response_path}"
     )
 
     stage_start = _record_timing(timings, 
-        "Gemini response save",
+        "OpenAI response save",
         stage_start,
     )
 
@@ -520,7 +527,7 @@ def process_page(
     )
 
     print(
-        "✓ Gemini will read final crop "
+        "✓ OpenAI will read final crop "
         "images directly"
     )
 
@@ -546,8 +553,8 @@ def process_page(
         "Block knowledge",
         "Page cleaning",
         "Page JSON export",
-        "Gemini API",
-        "Gemini response save",
+        "OpenAI API",
+        "OpenAI response save",
         "Boundary pipeline",
         "Article cropping",
     ]

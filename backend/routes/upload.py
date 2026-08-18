@@ -3,6 +3,8 @@ from pathlib import Path
 import httpx
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from google.genai.errors import APIError
+from openai import APIConnectionError as OpenAIConnectionError
+from openai import APIStatusError as OpenAIStatusError
 
 from backend.core.config import settings
 from backend.services.pipeline_service import PipelineService
@@ -53,6 +55,22 @@ def _gemini_error_detail(exc: APIError) -> str:
     )
 
     return f"The AI service is temporarily unavailable (high demand).{wait_clause}"
+
+
+def _openai_error_detail(exc: OpenAIStatusError) -> str:
+
+    if exc.status_code == 429:
+
+        return (
+            "The OpenAI API quota/rate limit has been reached for this "
+            "API key/plan. Please wait a moment and try again, or check "
+            "https://platform.openai.com/account/limits."
+        )
+
+    return (
+        "The AI service is temporarily unavailable (high demand). "
+        "Please try uploading again in a few minutes."
+    )
 
 
 @router.post("/upload")
@@ -134,6 +152,32 @@ def upload_pdf(
         raise HTTPException(
             status_code=502,
             detail=f"The AI service rejected the request: {exc}",
+        ) from exc
+
+    except OpenAIStatusError as exc:
+
+        # Same idea as the Gemini APIError handling above, but for the
+        # OpenAI-backed engine (the default ARTICLE_EXTRACTOR_ENGINE).
+        if exc.status_code in (429, 500, 502, 503, 504):
+
+            raise HTTPException(
+                status_code=503,
+                detail=_openai_error_detail(exc),
+            ) from exc
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"The AI service rejected the request: {exc}",
+        ) from exc
+
+    except OpenAIConnectionError as exc:
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not reach the AI service (network error/connection "
+                f"dropped: {exc}). Please try uploading again shortly."
+            ),
         ) from exc
 
     except httpx.TransportError as exc:
