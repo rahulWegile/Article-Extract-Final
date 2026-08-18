@@ -1,0 +1,628 @@
+import cv2
+from rapidocr import RapidOCR
+
+from pipeline.ocr.block_cropper import BlockCropper
+from pipeline.ocr.ocr_models import OCRResult
+
+
+# ============================================================
+# OCR CLASSES
+# ============================================================
+
+OCR_CLASSES = {
+    "plain text",
+    "title",
+    "figure_caption",
+}
+
+
+class RapidOCREngine:
+
+    def __init__(self):
+
+        print("Loading RapidOCR...")
+
+        self.reader = RapidOCR()
+
+        self.cropper = BlockCropper()
+
+        print("✓ RapidOCR loaded")
+
+    # ========================================================
+    # Process Layout Blocks
+    # ========================================================
+
+    def process_blocks(
+        self,
+        image_path,
+        blocks,
+    ):
+
+        image = cv2.imread(
+            str(image_path)
+        )
+
+        if image is None:
+
+            raise FileNotFoundError(
+                f"Unable to read image: "
+                f"{image_path}"
+            )
+
+        results = []
+
+        processed_count = 0
+        skipped_count = 0
+
+        # ====================================================
+        # Process blocks
+        # ====================================================
+
+        for block in blocks:
+
+            # =================================================
+            # Skip obvious non-text blocks
+            # =================================================
+
+            if block.cls not in OCR_CLASSES:
+
+                skipped_count += 1
+
+                results.append(
+                    OCRResult(
+                        text="",
+                        confidence=0.0,
+
+                        x1=block.x1,
+                        y1=block.y1,
+                        x2=block.x2,
+                        y2=block.y2,
+
+                        lines=[],
+                    )
+                )
+
+                continue
+
+            processed_count += 1
+
+            # =================================================
+            # Crop block
+            # =================================================
+
+            crop = self.cropper.crop(
+                image,
+                block,
+            )
+
+            if crop.size == 0:
+
+                results.append(
+                    OCRResult(
+                        text="",
+                        confidence=0.0,
+
+                        x1=block.x1,
+                        y1=block.y1,
+                        x2=block.x2,
+                        y2=block.y2,
+
+                        lines=[],
+                    )
+                )
+
+                continue
+
+            # =================================================
+            # RapidOCR
+            # =================================================
+
+            result = self.reader(
+                crop
+            )
+
+            # =================================================
+            # Handle empty result
+            # =================================================
+
+            if result is None:
+
+                results.append(
+                    OCRResult(
+                        text="",
+                        confidence=0.0,
+
+                        x1=block.x1,
+                        y1=block.y1,
+                        x2=block.x2,
+                        y2=block.y2,
+
+                        lines=[],
+                    )
+                )
+
+                continue
+
+            # =================================================
+            # RapidOCR result
+            # =================================================
+
+            text_parts = []
+            confidences = []
+            lines = []
+
+            # RapidOCR returns:
+            #
+            # result.txts
+            # result.scores
+            # result.boxes
+            #
+            # in current versions.
+            # =================================================
+
+            txts = getattr(
+                result,
+                "txts",
+                None,
+            )
+
+            scores = getattr(
+                result,
+                "scores",
+                None,
+            )
+
+            boxes = getattr(
+                result,
+                "boxes",
+                None,
+            )
+
+            if txts is None:
+
+                txts = []
+
+            if scores is None:
+
+                scores = []
+
+            if boxes is None:
+
+                boxes = []
+
+            # =================================================
+            # Process OCR lines
+            # =================================================
+
+            for index, line_text in enumerate(
+                txts
+            ):
+
+                line_text = str(
+                    line_text
+                ).strip()
+
+                if not line_text:
+                    continue
+
+                # =============================================
+                # Confidence
+                # =============================================
+
+                line_confidence = 0.0
+
+                if index < len(scores):
+
+                    try:
+
+                        line_confidence = float(
+                            scores[index]
+                        )
+
+                    except Exception:
+
+                        line_confidence = 0.0
+
+                # =============================================
+                # Bounding box
+                # =============================================
+
+                if index < len(boxes):
+
+                    polygon = boxes[index]
+
+                    try:
+
+                        xs = [
+                            float(point[0])
+                            for point in polygon
+                        ]
+
+                        ys = [
+                            float(point[1])
+                            for point in polygon
+                        ]
+
+                        relative_x1 = min(xs)
+                        relative_y1 = min(ys)
+
+                        relative_x2 = max(xs)
+                        relative_y2 = max(ys)
+
+                        page_x1 = (
+                            block.x1
+                            + relative_x1
+                        )
+
+                        page_y1 = (
+                            block.y1
+                            + relative_y1
+                        )
+
+                        page_x2 = (
+                            block.x1
+                            + relative_x2
+                        )
+
+                        page_y2 = (
+                            block.y1
+                            + relative_y2
+                        )
+
+                    except Exception:
+
+                        page_x1 = block.x1
+                        page_y1 = block.y1
+                        page_x2 = block.x2
+                        page_y2 = block.y2
+
+                else:
+
+                    page_x1 = block.x1
+                    page_y1 = block.y1
+
+                    page_x2 = block.x2
+                    page_y2 = block.y2
+
+                # =============================================
+                # Store line
+                # =============================================
+
+                lines.append(
+                    {
+                        "text": line_text,
+
+                        "confidence": (
+                            line_confidence
+                        ),
+
+                        "bbox": {
+                            "x1": round(
+                                page_x1,
+                                2,
+                            ),
+
+                            "y1": round(
+                                page_y1,
+                                2,
+                            ),
+
+                            "x2": round(
+                                page_x2,
+                                2,
+                            ),
+
+                            "y2": round(
+                                page_y2,
+                                2,
+                            ),
+                        },
+                    }
+                )
+
+                text_parts.append(
+                    line_text
+                )
+
+                confidences.append(
+                    line_confidence
+                )
+
+            # =================================================
+            # Combined block text
+            # =================================================
+
+            text = " ".join(
+                text_parts
+            )
+
+            confidence = 0.0
+
+            if confidences:
+
+                confidence = (
+                    sum(confidences)
+                    / len(confidences)
+                )
+
+            # =================================================
+            # Save OCR result
+            # =================================================
+
+            results.append(
+                OCRResult(
+                    text=text,
+
+                    confidence=confidence,
+
+                    x1=block.x1,
+                    y1=block.y1,
+                    x2=block.x2,
+                    y2=block.y2,
+
+                    lines=lines,
+                )
+            )
+
+        # ====================================================
+        # Safety check
+        # ====================================================
+
+        if len(results) != len(blocks):
+
+            raise RuntimeError(
+                "OCR result count mismatch: "
+                f"{len(results)} results "
+                f"for {len(blocks)} blocks"
+            )
+
+        # ====================================================
+        # Summary
+        # ====================================================
+
+        non_empty = sum(
+            1
+            for result in results
+            if result.text.strip()
+        )
+
+        print()
+        print("=" * 60)
+        print("RAPIDOCR BLOCK SUMMARY")
+        print("=" * 60)
+
+        print(
+            f"Total blocks      : "
+            f"{len(blocks)}"
+        )
+
+        print(
+            f"OCR processed     : "
+            f"{processed_count}"
+        )
+
+        print(
+            f"OCR skipped       : "
+            f"{skipped_count}"
+        )
+
+        print(
+            f"OCR results       : "
+            f"{len(results)}"
+        )
+
+        print(
+            f"Non-empty results : "
+            f"{non_empty}"
+        )
+
+        print("=" * 60)
+
+        return results
+
+    # ========================================================
+    # Process Final Article Crop
+    # ========================================================
+
+    def process_article_crop(
+        self,
+        image_path,
+    ):
+
+        image = cv2.imread(
+            str(image_path)
+        )
+
+        if image is None:
+
+            raise FileNotFoundError(
+                f"Unable to read article crop: "
+                f"{image_path}"
+            )
+
+        result = self.reader(
+            image
+        )
+
+        if result is None:
+
+            return {
+                "text": "",
+                "confidence": 0.0,
+                "lines": [],
+                "width": int(
+                    image.shape[1]
+                ),
+                "height": int(
+                    image.shape[0]
+                ),
+                "line_count": 0,
+            }
+
+        txts = getattr(
+            result,
+            "txts",
+            None,
+        ) or []
+
+        scores = getattr(
+            result,
+            "scores",
+            None,
+        ) or []
+
+        boxes = getattr(
+            result,
+            "boxes",
+            None,
+        ) or []
+
+        text_parts = []
+        confidences = []
+        lines = []
+
+        for index, line_text in enumerate(
+            txts
+        ):
+
+            line_text = str(
+                line_text
+            ).strip()
+
+            if not line_text:
+                continue
+
+            line_confidence = 0.0
+
+            if index < len(scores):
+
+                try:
+
+                    line_confidence = float(
+                        scores[index]
+                    )
+
+                except Exception:
+
+                    line_confidence = 0.0
+
+            if index < len(boxes):
+
+                polygon = boxes[index]
+
+                try:
+
+                    xs = [
+                        float(point[0])
+                        for point in polygon
+                    ]
+
+                    ys = [
+                        float(point[1])
+                        for point in polygon
+                    ]
+
+                    x1 = min(xs)
+                    y1 = min(ys)
+
+                    x2 = max(xs)
+                    y2 = max(ys)
+
+                except Exception:
+
+                    x1 = 0.0
+                    y1 = 0.0
+
+                    x2 = float(
+                        image.shape[1]
+                    )
+
+                    y2 = float(
+                        image.shape[0]
+                    )
+
+            else:
+
+                x1 = 0.0
+                y1 = 0.0
+
+                x2 = float(
+                    image.shape[1]
+                )
+
+                y2 = float(
+                    image.shape[0]
+                )
+
+            lines.append(
+                {
+                    "text": line_text,
+
+                    "confidence": (
+                        line_confidence
+                    ),
+
+                    "bbox": {
+                        "x1": round(
+                            x1,
+                            2,
+                        ),
+
+                        "y1": round(
+                            y1,
+                            2,
+                        ),
+
+                        "x2": round(
+                            x2,
+                            2,
+                        ),
+
+                        "y2": round(
+                            y2,
+                            2,
+                        ),
+                    },
+                }
+            )
+
+            text_parts.append(
+                line_text
+            )
+
+            confidences.append(
+                line_confidence
+            )
+
+        text = "\n".join(
+            text_parts
+        )
+
+        confidence = 0.0
+
+        if confidences:
+
+            confidence = (
+                sum(confidences)
+                / len(confidences)
+            )
+
+        return {
+            "text": text,
+
+            "confidence": confidence,
+
+            "lines": lines,
+
+            "width": int(
+                image.shape[1]
+            ),
+
+            "height": int(
+                image.shape[0]
+            ),
+
+            "line_count": len(
+                lines
+            ),
+        }

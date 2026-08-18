@@ -1,0 +1,44 @@
+# Environment / secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+ocr_env/
+
+# IDE
+.vscode/
+.idea/
+
+# Generated/cache data
+cache/
+output/
+uploads/
+
+# Input/generated newspaper files
+input/
+
+# ML models
+models/
+*.pt
+*.pth
+*.onnx
+
+# Database backups / archives
+*.dump
+*.tar.gz
+*.zip
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

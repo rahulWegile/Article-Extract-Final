@@ -1,0 +1,751 @@
+import re
+
+
+class PageCleaner:
+    """
+    Clean and annotate layout blocks before exporting them.
+
+    Responsibilities
+    ----------------
+    ✓ Remove noise blocks
+    ✓ Detect newspaper masthead
+    ✓ Detect page header
+    ✓ Assign column ids
+    """
+
+
+    def clean(
+        self,
+        blocks,
+        page_width,
+        page_height,
+    ):
+
+        #
+        # Remove noise
+        #
+
+        blocks = self.remove_noise(
+            blocks
+        )
+
+        #
+        # Detect masthead
+        #
+
+        self.detect_masthead(
+            blocks,
+            page_height,
+        )
+
+        #
+        # Detect page header
+        #
+
+        self.detect_page_header(
+            blocks,
+            page_height,
+        )
+
+        #
+        # Detect section headers
+        #
+
+        self.detect_section_headers(
+            blocks,
+        )
+
+        #
+        # Assign article columns
+        #
+
+        self.assign_columns(
+            blocks,
+            page_width,
+        )
+
+        #
+        # Detect image captions
+        #
+
+        self.detect_captions(
+            blocks
+        )
+
+        return blocks
+    # -----------------------------------------------------
+
+    def remove_noise(
+        self,
+        blocks,
+    ):
+
+        cleaned = []
+
+        visual_classes = {
+            "object",
+            "image",
+            "photo",
+            "figure",
+        }
+
+        for block in blocks:
+
+            cls = block.cls.lower()
+
+            text = getattr(
+                block,
+                "text",
+                "",
+            ).strip()
+
+            #
+            # Remove abandoned detections
+            #
+
+            if cls == "abandon":
+                continue
+
+            #
+            # Keep visual blocks even when OCR
+            # returns no text.
+            #
+
+            if (
+                len(text) == 0
+                and cls not in visual_classes
+            ):
+                continue
+
+            #
+            # Remove tiny OCR garbage.
+            #
+            # IMPORTANT:
+            # Do not remove visual blocks.
+            #
+
+            if (
+                len(text) <= 2
+                and cls not in visual_classes
+            ):
+                continue
+
+            #
+            # Remove CMYK / printer marks
+            #
+
+            if text.upper() in {
+
+                "CMYK",
+                "CMY",
+                "MYK",
+                "C MY K",
+                "C MV K",
+
+            }:
+                continue
+
+            cleaned.append(block)
+
+        print()
+
+        print("=" * 60)
+        print("PAGE CLEANER")
+        print("=" * 60)
+
+        print(
+            f"Original Blocks : {len(blocks)}"
+        )
+
+        print(
+            f"Clean Blocks    : {len(cleaned)}"
+        )
+
+        print("=" * 60)
+
+        return cleaned
+
+    
+    def detect_masthead(
+        self,
+        blocks,
+        page_height,
+    ):
+
+        mastheads = [
+
+            "THE ASIAN AGE",
+
+            "THE HINDU",
+
+            "TIMES OF INDIA",
+
+            "INDIAN EXPRESS",
+
+            "HINDUSTAN TIMES",
+
+            "THE TELEGRAPH",
+
+            "DECCAN CHRONICLE",
+
+        ]
+
+        top_limit = page_height * 0.12
+
+        detected = 0
+
+        for block in blocks:
+
+            if not hasattr(block, "type"):
+                block.type = block.cls
+
+            if not hasattr(block, "is_global"):
+                block.is_global = False
+
+            text = getattr(
+                block,
+                "text",
+                "",
+            ).upper()
+
+            if block.y2 > top_limit:
+                continue
+
+            if any(name in text for name in mastheads):
+
+                block.type = "masthead"
+
+                block.is_global = True
+
+                block.column = -1
+
+                detected += 1
+
+        print(
+            f"Mastheads Detected : {detected}"
+        )
+    # -----------------------------------------------------
+
+    
+
+    # -----------------------------------------------------
+
+    def detect_page_header(
+        self,
+        blocks,
+        page_height,
+    ):
+
+        keywords = [
+
+            "MONDAY",
+
+            "TUESDAY",
+
+            "WEDNESDAY",
+
+            "THURSDAY",
+
+            "FRIDAY",
+
+            "SATURDAY",
+
+            "SUNDAY",
+
+            "WWW",
+
+            "PRICE",
+
+            "VOL",
+
+            "ISSUE",
+
+            "JAN",
+
+            "FEB",
+
+            "MAR",
+
+            "APR",
+
+            "MAY",
+
+            "JUN",
+
+            "JUL",
+
+            "AUG",
+
+            "SEP",
+
+            "OCT",
+
+            "NOV",
+
+            "DEC",
+
+        ]
+
+        top_limit = page_height * 0.15
+
+        detected = 0
+
+        for block in blocks:
+
+            if getattr(block, "is_global", False):
+                continue
+
+            text = getattr(
+                block,
+                "text",
+                "",
+            ).upper()
+
+            if block.y2 > top_limit:
+                continue
+
+            if any(word in text for word in keywords):
+
+                block.type = "page_header"
+
+                block.is_global = True
+
+                block.column = -1
+
+                detected += 1
+
+        print(
+            f"Page Headers : {detected}"
+        )
+
+    # -----------------------------------------------------
+
+    def assign_columns(
+        self,
+        blocks,
+        page_width,
+    ):
+
+        article_blocks = [
+
+            b
+
+            for b in blocks
+
+            if not getattr(
+                b,
+                "is_global",
+                False,
+            )
+
+        ]
+
+        if not article_blocks:
+            return
+
+        column_width = page_width / 6
+
+        for block in article_blocks:
+
+            center = (
+
+                block.x1 + block.x2
+
+            ) / 2
+
+            block.column = min(
+                int(center / column_width),
+                5,
+            )
+        
+
+    def detect_section_headers(
+        self,
+        blocks,
+    ):
+
+        pattern = re.compile(
+            r"^[A-Z ]+\s+\d+$"
+        )
+
+        detected = 0
+
+        for block in blocks:
+
+            if getattr(block, "is_global", False):
+                continue
+
+            text = getattr(
+                block,
+                "text",
+                "",
+            ).strip().upper()
+
+            if pattern.match(text):
+
+                block.type = "section_header"
+
+                block.is_global = True
+
+                block.column = -1
+
+                detected += 1
+
+        print(
+            f"Section Headers : {detected}"
+        )
+
+        print("=" * 60)
+
+
+    def detect_captions(
+        self,
+        blocks,
+    ):
+
+        """
+        Detect likely newspaper photo captions.
+
+        Uses:
+
+        - visual block geometry
+        - nearby OCR text
+        - horizontal overlap
+        - vertical distance
+        - text length
+        - uppercase filtering
+
+        The detector is intentionally conservative.
+        """
+
+        visual_classes = {
+            "object",
+            "image",
+            "photo",
+            "figure",
+        }
+
+        detected = 0
+
+        for image_block in blocks:
+
+            #
+            # Only inspect visual blocks
+            #
+
+            if (
+                image_block.cls.lower()
+                not in visual_classes
+            ):
+                continue
+
+            image_x1 = image_block.x1
+            image_y1 = image_block.y1
+            image_x2 = image_block.x2
+            image_y2 = image_block.y2
+
+            image_width = (
+                image_x2 - image_x1
+            )
+
+            if image_width <= 0:
+                continue
+
+            candidates = []
+
+            for text_block in blocks:
+
+                if text_block is image_block:
+                    continue
+
+                text = getattr(
+                    text_block,
+                    "text",
+                    "",
+                ).strip()
+
+                if not text:
+                    continue
+
+                #
+                # Another visual block is not a caption.
+                #
+
+                if (
+                    text_block.cls.lower()
+                    in visual_classes
+                ):
+                    continue
+
+                #
+                # Ignore global page elements.
+                #
+
+                if getattr(
+                    text_block,
+                    "is_global",
+                    False,
+                ):
+                    continue
+
+                #
+                # Captions are normally relatively short.
+                #
+
+                if len(text) > 250:
+                    continue
+
+                #
+                # Avoid one-word labels.
+                #
+
+                if len(text.split()) < 2:
+                    continue
+
+                #
+                # Horizontal overlap
+                #
+
+                overlap_x1 = max(
+                    image_x1,
+                    text_block.x1,
+                )
+
+                overlap_x2 = min(
+                    image_x2,
+                    text_block.x2,
+                )
+
+                overlap_width = (
+                    overlap_x2 - overlap_x1
+                )
+
+                if overlap_width <= 0:
+                    continue
+
+                text_width = max(
+                    text_block.x2
+                    - text_block.x1,
+                    1,
+                )
+
+                overlap_ratio = (
+                    overlap_width
+                    / min(
+                        image_width,
+                        text_width,
+                    )
+                )
+
+                if overlap_ratio < 0.30:
+                    continue
+
+                #
+                # Vertical relationship
+                #
+
+                gap_below = (
+                    text_block.y1
+                    - image_y2
+                )
+
+                gap_above = (
+                    image_y1
+                    - text_block.y2
+                )
+
+                max_gap = max(
+                    80,
+                    int(
+                        image_width * 0.12
+                    ),
+                )
+
+                is_below = (
+                    0 <= gap_below <= max_gap
+                )
+
+                is_above = (
+                    0 <= gap_above <= 40
+                )
+
+                if not (
+                    is_below
+                    or is_above
+                ):
+                    continue
+
+                #
+                # Avoid obvious uppercase headlines.
+                #
+
+                letters = [
+                    char
+                    for char in text
+                    if char.isalpha()
+                ]
+
+                uppercase_ratio = (
+                    sum(
+                        1
+                        for char in letters
+                        if char.isupper()
+                    )
+                    / max(
+                        len(letters),
+                        1,
+                    )
+                )
+
+                if (
+                    uppercase_ratio > 0.85
+                    and len(text) < 100
+                ):
+                    continue
+
+                #
+                # Caption score
+                #
+
+                score = 0.0
+
+                if is_below:
+                    score += 0.45
+
+                elif is_above:
+                    score += 0.20
+
+                score += (
+                    min(
+                        overlap_ratio,
+                        1.0,
+                    )
+                    * 0.30
+                )
+
+                if len(text) <= 150:
+                    score += 0.15
+
+                candidates.append(
+                    (
+                        score,
+                        text_block,
+                    )
+                )
+
+            #
+            # No candidate
+            #
+
+            if not candidates:
+                continue
+
+            #
+            # Highest score first
+            #
+
+            candidates.sort(
+                key=lambda item: item[0],
+                reverse=True,
+            )
+
+            score, caption_block = (
+                candidates[0]
+            )
+
+            #
+            # Conservative threshold
+            #
+
+            if score < 0.65:
+                continue
+
+            caption = {
+
+                "text": (
+                    caption_block.text.strip()
+                ),
+
+                "bbox": {
+
+                    "x1": caption_block.x1,
+
+                    "y1": caption_block.y1,
+
+                    "x2": caption_block.x2,
+
+                    "y2": caption_block.y2,
+
+                },
+
+                "confidence": round(
+                    score,
+                    3,
+                ),
+
+                "image_bbox": {
+
+                    "x1": image_x1,
+
+                    "y1": image_y1,
+
+                    "x2": image_x2,
+
+                    "y2": image_y2,
+
+                },
+
+            }
+
+            #
+            # Create caption list
+            #
+
+            if not hasattr(
+                image_block,
+                "captions",
+            ):
+
+                image_block.captions = []
+
+            #
+            # Avoid duplicates
+            #
+
+            already_added = any(
+
+                existing.get("text")
+                == caption["text"]
+
+                for existing
+                in image_block.captions
+
+            )
+
+            if already_added:
+                continue
+
+            #
+            # Attach caption to image
+            #
+
+            image_block.captions.append(
+                caption
+            )
+
+            #
+            # Mark the OCR block as caption
+            #
+
+            caption_block.is_caption = True
+
+            caption_block.caption_for = (
+                image_block.id
+            )
+
+            detected += 1
+
+        print(
+            f"Captions Detected : {detected}"
+        )
+            
