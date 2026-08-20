@@ -1,6 +1,12 @@
 import { useRef, useState } from "react";
 import api from "../api/api";
 
+// Temporarily disabled -- flip back to true to show the real
+// stage/percentage from /upload/status polling instead of a plain
+// indeterminate bar. Polling itself stays on regardless (the backend
+// only reports completion that way now), this just hides the numbers.
+const SHOW_LIVE_PROGRESS = false;
+
 function UploadCard({ onUploadSuccess }) {
 
     const fileInput = useRef(null);
@@ -8,6 +14,10 @@ function UploadCard({ onUploadSuccess }) {
     const [file, setFile] = useState(null);
 
     const [uploading, setUploading] = useState(false);
+
+    const [progress, setProgress] = useState(0);
+
+    const [stage, setStage] = useState("");
 
     const chooseFile = () => {
 
@@ -39,17 +49,87 @@ function UploadCard({ onUploadSuccess }) {
 
         formData.append("file", file);
 
+        let pollTimer = null;
+
         try {
 
             setUploading(true);
 
-            await api.post(
+            setProgress(0);
+
+            setStage("Uploading...");
+
+            const response = await api.post(
 
                 "/upload",
 
-                formData
+                formData,
+
+                {
+                    onUploadProgress: (event) => {
+
+                        if (!event.total) {
+
+                            return;
+
+                        }
+
+                        setProgress(
+                            Math.round((event.loaded * 100) / event.total)
+                        );
+
+                    },
+                }
 
             );
+
+            const jobId = response.data.job_id;
+
+            setStage("Starting...");
+
+            await new Promise((resolve, reject) => {
+
+                pollTimer = setInterval(async () => {
+
+                    try {
+
+                        const statusResponse = await api.get(
+
+                            `/upload/status/${jobId}`
+
+                        );
+
+                        const job = statusResponse.data;
+
+                        setProgress(job.progress ?? 0);
+
+                        setStage(job.stage ?? "");
+
+                        if (job.status === "completed") {
+
+                            clearInterval(pollTimer);
+
+                            resolve();
+
+                        } else if (job.status === "failed") {
+
+                            clearInterval(pollTimer);
+
+                            reject(new Error(job.error || "Pipeline failed."));
+
+                        }
+
+                    } catch (pollError) {
+
+                        clearInterval(pollTimer);
+
+                        reject(pollError);
+
+                    }
+
+                }, 4000);
+
+            });
 
             alert("Upload completed.");
 
@@ -67,11 +147,21 @@ function UploadCard({ onUploadSuccess }) {
 
             console.error(error);
 
-            alert("Upload failed.");
+            alert(`Upload failed: ${error.message || error}`);
 
         } finally {
 
+            if (pollTimer) {
+
+                clearInterval(pollTimer);
+
+            }
+
             setUploading(false);
+
+            setProgress(0);
+
+            setStage("");
 
         }
 
@@ -132,6 +222,42 @@ function UploadCard({ onUploadSuccess }) {
                 {uploading ? "Uploading..." : "Upload"}
 
             </button>
+
+            {uploading && SHOW_LIVE_PROGRESS && (
+
+                <>
+
+                    <div className="upload-progress">
+
+                        <div
+
+                            className="upload-progress-fill"
+
+                            style={{ width: `${progress}%` }}
+
+                        />
+
+                    </div>
+
+                    <div className="upload-stage">
+
+                        {stage} {stage ? `(${progress}%)` : ""}
+
+                    </div>
+
+                </>
+
+            )}
+
+            {uploading && !SHOW_LIVE_PROGRESS && (
+
+                <div className="upload-progress">
+
+                    <div className="upload-progress-fill upload-progress-indeterminate" />
+
+                </div>
+
+            )}
 
         </div>
 

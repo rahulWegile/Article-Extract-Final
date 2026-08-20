@@ -3,9 +3,15 @@
 .env.*
 !.env.example
 
+# Agent workspaces
+.agents/
+.claude/
+.gemini/
+
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.pyo
 
 # Virtual environments
@@ -13,15 +19,30 @@ venv/
 .venv/
 env/
 ocr_env/
+.tox/
+.nox/
+
+# Node
+node_modules/
+dist/
+build/
+npm-debug.log*
 
 # IDE
 .vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
 .idea/
+.cursor/
 
 # Generated/cache data
 cache/
 output/
 uploads/
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Input/generated newspaper files
 input/
@@ -31,15 +52,24 @@ models/
 *.pt
 *.pth
 *.onnx
+*.safetensors
 
 # Database backups / archives
 *.dump
 *.tar.gz
 *.zip
+*.sqlite3
 
 # Logs
 *.log
 
+# Backup files
+*.bak
+*.swp
+*~
+*.rapidocr_backup
+
 # OS
 .DS_Store
 Thumbs.db
+

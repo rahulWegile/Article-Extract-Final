@@ -78,7 +78,7 @@ class OpenAIArticleExtractor:
     - Local validation prevents invented article IDs and rejects continuation links involving non-article crops.
     """
 
-    DEFAULT_MODEL = "gpt-4o-mini"
+    DEFAULT_MODEL = "gpt-5.6-luna"
     DEFAULT_PAGES_PER_BATCH = 3
 
     # ========================================================
@@ -115,9 +115,23 @@ class OpenAIArticleExtractor:
             int(pages_per_batch),
         )
 
-        self.client = OpenAI(
-            api_key=self.api_key
+        timeout_seconds = int(
+            os.getenv(
+                "OPENAI_TIMEOUT_SECONDS",
+                "120",
+            )
         )
+
+        self.client = OpenAI(
+            api_key=self.api_key,
+            timeout=timeout_seconds,
+        )
+
+        # Some models (e.g. the gpt-5.x reasoning family) reject any
+        # temperature other than their default (1) with a 400. Assume
+        # support until proven otherwise, then remember it for the
+        # rest of this instance's calls instead of re-probing every time.
+        self._temperature_supported = True
 
         print()
         print("=" * 60)
@@ -1092,29 +1106,29 @@ class OpenAIArticleExtractor:
 
             try:
 
-                response = (
-                    self.client.chat.completions.create(
-                        model=self.model,
-
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": contents,
-                            }
-                        ],
-
-                        temperature=0,
-                        max_tokens=16384,
-
-                        response_format={
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "article_batch_extraction",
-                                "schema": self._response_schema(),
-                                "strict": True,
-                            },
+                kwargs = {
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": contents,
+                        }
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "article_batch_extraction",
+                            "schema": self._response_schema(),
+                            "strict": True,
                         },
-                    )
+                    },
+                }
+
+                if self._temperature_supported:
+                    kwargs["temperature"] = 0
+
+                response = (
+                    self.client.chat.completions.create(**kwargs)
                 )
 
                 if attempt > 1:
@@ -1126,6 +1140,20 @@ class OpenAIArticleExtractor:
                 break
 
             except (APIStatusError, APIConnectionError) as exc:
+
+                if (
+                    self._temperature_supported
+                    and isinstance(exc, APIStatusError)
+                    and exc.status_code == 400
+                    and isinstance(exc.body, dict)
+                    and exc.body.get("param") == "temperature"
+                ):
+                    # This model doesn't support a custom temperature at
+                    # all (e.g. reasoning-family models) -- remember
+                    # that and retry without it instead of repeating
+                    # the same doomed request on every attempt.
+                    self._temperature_supported = False
+                    continue
 
                 # Retry only temporary OpenAI unavailable errors.
                 retryable = (

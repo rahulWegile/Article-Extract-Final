@@ -820,6 +820,72 @@ However, if a title introduces a genuinely independent story,
 start a new article.
 
 =========================================================
+DUPLICATE BLOCK RULE
+=========================================================
+
+The supplied blocks may contain duplicate representations of the
+same physical newspaper content (e.g. a caption detected twice by
+different detector classes, or nearly identical bounding boxes with
+nearly identical OCR text covering the same physical region).
+
+If two blocks clearly represent the same physical content, do NOT
+use both as separate article content. Choose the more useful
+representation and assign the other a role that keeps it out of
+"articles" rather than inflating the article with a duplicate.
+
+=========================================================
+MULTI-IMAGE ARTICLE CHECK
+=========================================================
+
+Before finalizing EACH article, explicitly ask:
+
+"Does this article contain more than one photograph, figure,
+infographic, chart, or visual panel?"
+
+If YES, identify every related figure block and every related
+caption block, and include ALL of them -- do not stop after finding
+the first photograph. However, every additional visual block must
+have positive visual or semantic evidence that it belongs to the
+same story; physical proximity alone is not sufficient.
+
+=========================================================
+FULL PAGE SCAN
+=========================================================
+
+Perform THREE scans before returning the result.
+
+SCAN 1: Identify all major articles.
+
+SCAN 2: Search specifically for small articles, briefs,
+narrow-column articles, photo-led articles, caption-led articles,
+boxed stories, embedded stories, bottom stories, section-label
+stories, and articles without conventional headlines.
+
+SCAN 3: Inspect EVERY remaining block that has not yet been placed
+in "blocks" with a role or assigned to an article. For each one,
+determine whether it is (a) genuine article content that was missed,
+(b) page chrome, (c) an advertisement, (d) a duplicate representation,
+or (e) decorative/non-content. A genuine article block must NOT be
+left out merely because it is small or visually unusual.
+
+=========================================================
+UNASSIGNED BLOCKS
+=========================================================
+
+It is acceptable for these blocks to remain unassigned to any
+article: masthead, date/page metadata, navigation, decorative
+elements, advertisements, and duplicate representations already
+covered by another block.
+
+However, any block classified with an article-eligible role
+(article_title, article_text, article_image, caption, byline,
+teaser_box, utility_box) should normally end up inside some article
+in the "articles" list. Do not classify a block as one of these
+roles in "blocks" and then leave it out of every article in
+"articles" -- if it doesn't belong with any existing article, give
+it its own new article_id instead of omitting it.
+
+=========================================================
 ARTICLE COMPLETENESS
 =========================================================
 
@@ -1072,6 +1138,13 @@ wins.
 
 CHECK 24:
 Physical proximity is only a fallback signal.
+
+CHECK 25:
+Every block assigned an article-eligible role (article_title,
+article_text, article_image, caption, byline, teaser_box,
+utility_box) appears inside some article in "articles" -- either
+an existing one or a new one of its own. None were classified as
+article-eligible and then left out of every article.
 
 =========================================================
 OUTPUT FORMAT

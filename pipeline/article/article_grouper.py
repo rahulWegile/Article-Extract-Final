@@ -176,6 +176,44 @@ class ArticleGrouper:
 
             )
 
+        #
+        # Recover unclaimed content blocks. The model sometimes gives a
+        # block a genuine content role (e.g. caption, article_image,
+        # article_text) but never includes that block's id in any
+        # article's "blocks" list -- the loop above only ever visits
+        # blocks that appear in some article, so such blocks would
+        # otherwise be silently missing from the final output.
+        #
+        # Attaching them to the nearest EXISTING article was tried and
+        # reverted: when the model leaves a large fraction of a page
+        # unclaimed (observed up to ~35% on a dense page), that merges
+        # unrelated stories into one giant block instead of recovering
+        # a stray caption. Instead, give each unclaimed block its own
+        # standalone article -- this can never grow or alter an
+        # existing article (zero risk of the same regression), it just
+        # ensures nothing is left with no box at all. A distinguishing
+        # article_id range (100000+) and a lower confidence mark these
+        # as a fallback rather than a real model-confirmed grouping.
+        #
+
+        unclaimed_content_blocks = [
+            block
+            for block in blocks
+            if block.id not in claimed_block_ids
+            and getattr(block, "role", "unknown") not in self.IGNORE_ROLES
+        ]
+
+        for block in unclaimed_content_blocks:
+
+            articles.append(
+                Article(
+                    article_id=100000 + block.id,
+                    blocks=[block],
+                    block_ids=[block.id],
+                    confidence=0.5,
+                )
+            )
+
         print()
 
         print("=" * 60)
@@ -187,6 +225,21 @@ class ArticleGrouper:
         print(f"Articles Built : {len(articles)}")
 
         print(f"Ignored Blocks : {removed}")
+
+        if unclaimed_content_blocks:
+
+            print(
+                f"WARNING: {len(unclaimed_content_blocks)} content "
+                "block(s) got a real role but were not claimed by any "
+                "article -- missing from the final output:"
+            )
+
+            for block in unclaimed_content_blocks:
+
+                print(
+                    f"  Block {block.id} "
+                    f"(role={getattr(block, 'role', 'unknown')})"
+                )
 
         if duplicate_conflicts:
 

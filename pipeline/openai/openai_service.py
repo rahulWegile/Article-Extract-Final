@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from openai import APIConnectionError, APIStatusError
 
-
 load_dotenv()
 
 
@@ -20,7 +19,8 @@ load_dotenv()
 # ROLE ENUM
 #
 # Must match the roles listed in pipeline/gemini/gemini_prompt.py
-# (ARTICLE_GROUP_PROMPT).
+# (ARTICLE_GROUP_PROMPT) and pipeline/article/article_grouper.py
+# (IGNORE_ROLES).
 # ============================================================
 
 _BLOCK_ROLES = [
@@ -49,7 +49,7 @@ class OpenAIService:
     """
     Vision + JSON extraction service backed by the OpenAI API.
 
-    Drop-in replacement for the retired GeminiService, used for:
+    Used for:
 
     - Newspaper metadata extraction (first page).
     - Page-level article block classification / grouping.
@@ -72,7 +72,18 @@ class OpenAIService:
 
         self.model = model or os.getenv("OPENAI_MODEL", self.DEFAULT_MODEL)
 
-        self.client = OpenAI(api_key=self.api_key)
+        timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "120"))
+
+        self.client = OpenAI(
+            api_key=self.api_key,
+            timeout=timeout_seconds,
+        )
+
+        # Some models (e.g. the gpt-5.x reasoning family) reject any
+        # temperature other than their default (1) with a 400. Assume
+        # support until proven otherwise, then remember it for the
+        # rest of this instance's calls instead of re-probing every time.
+        self._temperature_supported = True
 
     # ========================================================
     # IMAGE CONTENT PART
@@ -150,12 +161,10 @@ class OpenAIService:
 
             try:
 
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": contents}],
-                    temperature=0,
-                    max_tokens=16384,
-                    response_format={
+                kwargs = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": contents}],
+                    "response_format": {
                         "type": "json_schema",
                         "json_schema": {
                             "name": schema_name,
@@ -163,7 +172,12 @@ class OpenAIService:
                             "strict": True,
                         },
                     },
-                )
+                }
+
+                if self._temperature_supported:
+                    kwargs["temperature"] = 0
+
+                response = self.client.chat.completions.create(**kwargs)
 
                 response_text = (
                     response.choices[0].message.content or ""
@@ -177,6 +191,20 @@ class OpenAIService:
             except (APIStatusError, APIConnectionError) as exc:
 
                 last_exc = exc
+
+                if (
+                    self._temperature_supported
+                    and isinstance(exc, APIStatusError)
+                    and exc.status_code == 400
+                    and isinstance(exc.body, dict)
+                    and exc.body.get("param") == "temperature"
+                ):
+                    # This model doesn't support a custom temperature at
+                    # all (e.g. reasoning-family models) -- remember
+                    # that and retry without it instead of repeating
+                    # the same doomed request on every attempt.
+                    self._temperature_supported = False
+                    continue
 
                 retryable = isinstance(exc, APIConnectionError) or getattr(
                     exc, "status_code", None
@@ -242,17 +270,17 @@ class OpenAIService:
     @staticmethod
     def _compact_blocks_payload(json_path: str) -> str:
         """
-        The exported page JSON (GeminiPageExporter) carries a lot of
-        fields the grouping prompt never asks for (width/height/center
-        derived from bbox, is_global/is_masthead/is_page_header,
-        ocr_confidence, always-null article_id/article_confidence/
-        gemini_notes, verbose knowledge dict) and is pretty-printed
-        with 4-space indentation. For a ~100-block page that bloats
-        the request to 150-200k+ characters, which both risks hitting
-        per-minute token limits and appears to degrade the model's
-        ability to keep block-to-article assignment exclusive. Keep
-        only what the prompt documents as input ("id, class, type,
-        bbox, reading_order, OCR text, column, confidence, optional
+        The exported page JSON carries a lot of fields the grouping
+        prompt never asks for (width/height/center derived from bbox,
+        is_global/is_masthead/is_page_header, ocr_confidence,
+        always-null article_id/article_confidence/gemini_notes,
+        verbose knowledge dict) and is pretty-printed with 4-space
+        indentation. For a ~100-block page that bloats the request to
+        150-200k+ characters, which both risks hitting per-minute
+        token limits and appears to degrade the model's ability to
+        keep block-to-article assignment exclusive. Keep only what
+        the prompt documents as input ("id, class, type, bbox,
+        reading_order, OCR text, column, confidence, optional
         knowledge") and serialize it compactly.
         """
 

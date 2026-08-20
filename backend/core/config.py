@@ -37,9 +37,16 @@ class Settings(BaseSettings):
     # Pipeline
     # --------------------------------------------------------
 
-    ARTICLE_EXTRACTOR_ENGINE: str = "gemini"
+    # Selects the article-level extraction engine: "openai", "gemini"
+    # or "local".
+    ARTICLE_EXTRACTOR_ENGINE: str = "openai"
 
-    GEMINI_API_KEY: str
+    # Selects the provider used for newspaper metadata extraction and
+    # page-level article grouping: "openai" or "gemini".
+    LLM_PROVIDER: str = "openai"
+
+    OPENAI_API_KEY: str | None = None
+    GEMINI_API_KEY: str | None = None
 
     # --------------------------------------------------------
     # Ops

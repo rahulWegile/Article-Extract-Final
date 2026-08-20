@@ -10,6 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -114,8 +115,18 @@ class GeminiArticleExtractor:
             int(pages_per_batch),
         )
 
+        timeout_seconds = int(
+            os.getenv(
+                "GEMINI_TIMEOUT_SECONDS",
+                "120",
+            )
+        )
+
         self.client = genai.Client(
-            api_key=self.api_key
+            api_key=self.api_key,
+            http_options=types.HttpOptions(
+                timeout=timeout_seconds * 1000,
+            ),
         )
 
         print()
@@ -1099,9 +1110,18 @@ class GeminiArticleExtractor:
 
                 error_text = str(exc)
 
-                # Retry only temporary Gemini unavailable errors.
+                # Retry temporary Gemini unavailable errors, plus a
+                # stalled/timed-out connection (no timeout configured
+                # on the client previously meant these hung forever
+                # instead of ever reaching this except block).
+                is_timeout = isinstance(
+                    exc,
+                    (httpx.TimeoutException, httpx.ConnectError),
+                )
+
                 if (
-                    "503" not in error_text
+                    not is_timeout
+                    and "503" not in error_text
                     and "UNAVAILABLE" not in error_text
                     and "unavailable" not in error_text
                 ):

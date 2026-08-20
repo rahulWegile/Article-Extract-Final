@@ -1,5 +1,14 @@
+import sys
 from pathlib import Path
 import logging
+
+# The pipeline prints unicode symbols (checkmarks, arrows) for progress
+# logging. On Windows, stdout/stderr default to the cp1252 console
+# codepage, which raises UnicodeEncodeError and crashes the pipeline
+# thread the first time one of those symbols is printed.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from backend.core.logging_config import configure_logging
 

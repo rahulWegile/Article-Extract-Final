@@ -1,0 +1,44 @@
+[
+    {
+        "template_id": "times_of_india_chandigarh",
+        "newspaper_name": "The Times of India",
+        "edition": "Chandigarh",
+        "language": "English",
+        "name_ocr_variants": [
+            "THE TIMES OF INDIA",
+            "TIMES OF INDIA",
+            "THETIMESOFINDIA"
+        ],
+        "masthead_region": [
+            0.0,
+            0.0,
+            1.0,
+            0.09
+        ],
+        "date_region": [
+            0.0,
+            0.0,
+            1.0,
+            0.03
+        ],
+        "edition_region": [
+            0.0,
+            0.0,
+            1.0,
+            0.03
+        ],
+        "edition_patterns": [
+            "CHANDIGARH",
+            "MOHALI",
+            "PANCHKULA",
+            "PATIALA",
+            "AMBALA"
+        ],
+        "edition_primary_token": "CHANDIGARH",
+        "date_format_hint": "DAY_NAME, MONTH_NAME D, YYYY",
+        "sample_source": "uploads/Times of India_Chandigarh_20260804_removed_removed_removed.pdf",
+        "verified": true,
+        "notes": "date_region and edition_region are the same crop -- on this masthead the served-city list, the date, page count and price all sit on one thin strip above the title, so both fields are parsed out of the same OCR'd line via regex rather than separate crops. Edition line lists 5 served cities; canonical edition is the first token. Marked verified:false pending human confirmation against a second real sample (see onboarding_tool.py) -- do not treat as production-ready until re-checked; the one document.json fixture that exists for this masthead has an internal date inconsistency (see plan notes) and should not be relied on as ground truth.",
+        "confirmation_count": 3
+    }
+]

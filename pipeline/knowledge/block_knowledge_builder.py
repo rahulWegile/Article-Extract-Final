@@ -8,9 +8,6 @@ from pipeline.knowledge.caption_classifier import CaptionClassifier
 from pipeline.knowledge.continuation_classifier import (
     ContinuationClassifier,
 )
-from pipeline.knowledge.embedding_generator import (
-    EmbeddingGenerator,
-)
 
 
 class BlockKnowledgeBuilder:
@@ -35,8 +32,6 @@ class BlockKnowledgeBuilder:
         self.caption = CaptionClassifier()
 
         self.continuation = ContinuationClassifier()
-
-        self.embedding = EmbeddingGenerator()
 
     # -----------------------------------------------------
 
@@ -138,16 +133,6 @@ class BlockKnowledgeBuilder:
 
         knowledge.continuation_probability = (
             self.continuation.predict(
-                knowledge.text,
-            )
-        )
-
-        # ------------------------------------------
-        # Embedding
-        # ------------------------------------------
-
-        knowledge.embedding = (
-            self.embedding.generate(
                 knowledge.text,
             )
         )

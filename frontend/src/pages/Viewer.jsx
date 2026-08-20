@@ -22,6 +22,30 @@ function Viewer() {
 
     }, [page]);
 
+    useEffect(() => {
+
+        const handleKeyDown = (event) => {
+
+            if (event.key === "ArrowLeft" && page > 1) {
+                setPage((current) => current - 1);
+            }
+
+            if (
+                event.key === "ArrowRight" &&
+                pageData &&
+                page < pageData.page_count
+            ) {
+                setPage((current) => current + 1);
+            }
+
+        };
+
+        window.addEventListener("keydown", handleKeyDown);
+
+        return () => window.removeEventListener("keydown", handleKeyDown);
+
+    }, [page, pageData]);
+
     const loadPage = async (pageNumber) => {
 
         try {
@@ -46,7 +70,17 @@ function Viewer() {
 
     if (!pageData) {
 
-        return <h2 style={{ textAlign: "center" }}>Loading...</h2>;
+        return (
+
+            <div className="viewer-loading">
+
+                <div className="viewer-spinner" />
+
+                <p>Loading page...</p>
+
+            </div>
+
+        );
 
     }
 
@@ -69,11 +103,11 @@ function Viewer() {
 
                 </h2>
 
-            </div>
+                <div className="page-badge">
 
-            <div className="page-info">
+                    Page {pageData.page} of {pageData.page_count}
 
-                Page {pageData.page} / {pageData.page_count}
+                </div>
 
             </div>
 
@@ -122,15 +156,15 @@ function Viewer() {
 
                             <div className="zoom-toolbar">
 
-                                <button onClick={() => zoomIn()}>
+                                <button title="Zoom in" onClick={() => zoomIn()}>
                                     +
                                 </button>
 
-                                <button onClick={() => zoomOut()}>
+                                <button title="Zoom out" onClick={() => zoomOut()}>
                                     −
                                 </button>
 
-                                <button onClick={() => resetTransform()}>
+                                <button title="Reset zoom" onClick={() => resetTransform()}>
                                     Reset
                                 </button>
 
@@ -139,7 +173,7 @@ function Viewer() {
                             <TransformComponent
                                 wrapperStyle={{
                                     width: "100%",
-                                    height: "85vh",
+                                    height: "82vh",
                                 }}
                                 contentStyle={{
                                     width: "100%",
@@ -179,6 +213,12 @@ function Viewer() {
                     ⬅ Previous
 
                 </button>
+
+                <span className="nav-page-indicator">
+
+                    {page} / {pageData.page_count}
+
+                </span>
 
                 <button
 

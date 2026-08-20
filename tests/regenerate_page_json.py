@@ -149,6 +149,7 @@ def regenerate_page_json():
         blocks=blocks,
         page_width=page_width,
         page_height=page_height,
+        page_number=PAGE_NUMBER,
     )
 
     print()

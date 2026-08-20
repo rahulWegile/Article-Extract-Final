@@ -15,8 +15,9 @@ from pipeline.export.gemini_page_exporter import (
     GeminiPageExporter,
 )
 
-from pipeline.openai.openai_service import OpenAIService
+from pipeline.gemini.gemini_service import GeminiService
 from pipeline.gemini.gemini_prompt import ARTICLE_GROUP_PROMPT
+from pipeline.openai.openai_service import OpenAIService
 
 from pipeline.gemini.gemini_boundary_pipeline import (
     GeminiBoundaryPipeline,
@@ -44,10 +45,10 @@ def _record_timing(timings, label, start_time):
 
 
 # =========================================================
-# PROCESS PAGE
+# PREPARE PAGE (everything before the Gemini network call)
 # =========================================================
 
-def process_page(
+def prepare_page(
     page_number,
     page_path,
     detector,
@@ -203,6 +204,7 @@ def process_page(
             blocks=blocks,
             page_width=page_width,
             page_height=page_height,
+            page_number=page_number,
         )
     )
 
@@ -245,31 +247,36 @@ def process_page(
         f"{json_path}"
     )
 
-    stage_start = _record_timing(timings, 
+    stage_start = _record_timing(timings,
         "Page JSON export",
         stage_start,
     )
 
-    # =====================================================
-    # Stage 2.8 : OpenAI Article Analysis
-    # =====================================================
+    return {
+        "page_number": page_number,
+        "page_path": page_path,
+        "document_dir": document_dir,
+        "json_path": json_path,
+        "clean_blocks": clean_blocks,
+        "knowledge_map": knowledge_map,
+        "timings": timings,
+        "page_start": page_start,
+    }
+
+
+# =========================================================
+# RUN GEMINI (the network call, independent per page --
+# safe to run concurrently across a document's pages)
+# =========================================================
+
+def run_gemini(page_path, json_path):
 
     print()
     print(
-        "Running OpenAI..."
+        "Running Gemini..."
     )
 
-    # gpt-4o-mini is not reliable at keeping block-to-article
-    # ownership exclusive on dense newspaper pages (verified: it
-    # collapsed a ~8-story front page into 3 overlapping articles).
-    # This stage gets its own, stronger default model.
-    service = OpenAIService(
-        model=os.getenv("OPENAI_BOUNDARY_MODEL", "gpt-4o"),
-    )
-
-    # -----------------------------------------------------
-    # OpenAI API timer
-    # -----------------------------------------------------
+    service = GeminiService()
 
     gemini_start = time.perf_counter()
 
@@ -286,17 +293,72 @@ def process_page(
         - gemini_start
     )
 
-    timings["OpenAI API"] = gemini_elapsed
+    return gemini_response, gemini_elapsed
+
+
+# =========================================================
+# RUN OPENAI (the network call, independent per page --
+# safe to run concurrently across a document's pages)
+# =========================================================
+
+def run_openai(page_path, json_path):
+
+    print()
+    print(
+        "Running OpenAI..."
+    )
+
+    service = OpenAIService(
+        model=os.getenv(
+            "OPENAI_BOUNDARY_MODEL",
+            os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        ),
+    )
+
+    openai_start = time.perf_counter()
+
+    openai_response = (
+        service.analyze_page(
+            image_path=page_path,
+            json_path=json_path,
+            prompt=ARTICLE_GROUP_PROMPT,
+        )
+    )
+
+    openai_elapsed = (
+        time.perf_counter()
+        - openai_start
+    )
+
+    return openai_response, openai_elapsed
+
+
+# =========================================================
+# FINISH PAGE (everything after the network call)
+# =========================================================
+
+def finish_page(prep, gemini_response, gemini_elapsed):
+
+    page_number = prep["page_number"]
+    page_path = prep["page_path"]
+    document_dir = prep["document_dir"]
+    json_path = prep["json_path"]
+    clean_blocks = prep["clean_blocks"]
+    knowledge_map = prep["knowledge_map"]
+    timings = prep["timings"]
+    page_start = prep["page_start"]
+
+    timings["LLM API"] = gemini_elapsed
 
     # -----------------------------------------------------
-    # Save OpenAI response
+    # Save LLM response
     # -----------------------------------------------------
 
     stage_start = time.perf_counter()
 
     response_dir = (
         document_dir
-        / "gemini"
+        / "llm_response"
     )
 
     response_dir.mkdir(
@@ -323,23 +385,23 @@ def process_page(
         )
 
     print(
-        f"✓ OpenAI response saved -> "
+        f"✓ LLM response saved -> "
         f"{response_path}"
     )
 
-    stage_start = _record_timing(timings, 
-        "OpenAI response save",
+    stage_start = _record_timing(timings,
+        "LLM response save",
         stage_start,
     )
 
     # =====================================================
-    # Stage 3 : Gemini Boundary Pipeline
+    # Stage 3 : LLM Boundary Pipeline
     # =====================================================
 
     print()
     print("=" * 60)
     print(
-        "GEMINI BOUNDARY PIPELINE"
+        "LLM BOUNDARY PIPELINE"
     )
     print("=" * 60)
 
@@ -390,7 +452,7 @@ def process_page(
     print()
     print("=" * 60)
     print(
-        "GEMINI PIPELINE COMPLETED"
+        "LLM PIPELINE COMPLETED"
     )
     print("=" * 60)
 
@@ -527,7 +589,7 @@ def process_page(
     )
 
     print(
-        "✓ OpenAI will read final crop "
+        "✓ The LLM will read final crop "
         "images directly"
     )
 
@@ -553,8 +615,8 @@ def process_page(
         "Block knowledge",
         "Page cleaning",
         "Page JSON export",
-        "OpenAI API",
-        "OpenAI response save",
+        "LLM API",
+        "LLM response save",
         "Boundary pipeline",
         "Article cropping",
     ]
@@ -596,3 +658,44 @@ def process_page(
             final_article_crops
         ),
     }
+
+
+# =========================================================
+# PROCESS PAGE (single-page convenience wrapper --
+# prepare + run the configured LLM synchronously + finish)
+# =========================================================
+
+def process_page(
+    page_number,
+    page_path,
+    detector,
+    ocr_engine,
+    document_id,
+    document_dir,
+):
+
+    prep = prepare_page(
+        page_number=page_number,
+        page_path=page_path,
+        detector=detector,
+        ocr_engine=ocr_engine,
+        document_id=document_id,
+        document_dir=document_dir,
+    )
+
+    run_page_llm = (
+        run_gemini
+        if os.getenv("LLM_PROVIDER", "openai").strip().lower() == "gemini"
+        else run_openai
+    )
+
+    llm_response, llm_elapsed = run_page_llm(
+        page_path=page_path,
+        json_path=prep["json_path"],
+    )
+
+    return finish_page(
+        prep,
+        llm_response,
+        llm_elapsed,
+    )

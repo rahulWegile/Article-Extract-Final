@@ -17,10 +17,25 @@ from pipeline.layout_detector import LayoutDetector
 
 from pipeline.ocr.rapidocr_engine import RapidOCREngine
 
-from pipeline.page_processor_gemini import process_page
+from pipeline.page_processor_gemini import (
+    prepare_page,
+    run_gemini,
+    run_openai,
+    finish_page,
+)
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from pipeline.gemini.newspaper_client import (
+    NewspaperClient as GeminiNewspaperClient,
+)
 
 from pipeline.openai.newspaper_client import (
-    NewspaperClient,
+    NewspaperClient as OpenAINewspaperClient,
+)
+
+from pipeline.intelligence.local.masthead.masthead_extractor import (
+    LocalMastheadExtractor,
 )
 
 # ============================================================
@@ -155,8 +170,22 @@ class PipelineService:
         # Newspaper Metadata Client
         # =====================================================
 
+        self.llm_provider = (
+            os.getenv("LLM_PROVIDER", "openai")
+            .strip()
+            .lower()
+        )
+
         self.newspaper_client = (
-            NewspaperClient()
+            GeminiNewspaperClient()
+            if self.llm_provider == "gemini"
+            else OpenAINewspaperClient()
+        )
+
+        self.local_masthead_extractor = (
+            LocalMastheadExtractor(
+                ocr_engine=self.ocr_engine,
+            )
         )
 
         print(
@@ -169,6 +198,11 @@ class PipelineService:
 
         print(
             "✓ Newspaper Client Loaded"
+        )
+
+        print(
+            "✓ Local Masthead Extractor Loaded "
+            f"({len(self.local_masthead_extractor.templates)} templates)"
         )
 
     # ========================================================
@@ -559,6 +593,14 @@ class PipelineService:
             or ""
         )
 
+        if metadata.get("metadata_source") is not None:
+
+            document_metadata[
+                "metadata_source"
+            ] = metadata.get(
+                "metadata_source"
+            )
+
         # ----------------------------------------------------
         # Counts
         # ----------------------------------------------------
@@ -653,24 +695,45 @@ class PipelineService:
         except Exception:
             document_metadata = {}
 
-        # A 429/503 from the Gemini API is a retry-worthy condition on
-        # Google's side (quota exhaustion / rate limiting / temporary
-        # overload), not a bug in this pipeline; surface that
-        # distinction (plus Google's own error `status`, e.g.
-        # RESOURCE_EXHAUSTED vs UNAVAILABLE) so the frontend/operator
-        # knows re-uploading is likely to work without any code change.
+        # A 429/503 from the LLM provider's API is a retry-worthy
+        # condition on the provider's side (quota exhaustion / rate
+        # limiting / temporary overload), not a bug in this pipeline;
+        # surface that distinction (plus the provider's own error
+        # `status`, e.g. RESOURCE_EXHAUSTED vs UNAVAILABLE) so the
+        # frontend/operator knows re-uploading is likely to work
+        # without any code change. Covers both Google's genai SDK
+        # exception names and the OpenAI SDK's status-code attribute.
+        error_type_name = type(error).__name__
         status_code = getattr(error, "code", None)
-        is_api_error = type(error).__name__ in {
+        is_gemini_api_error = error_type_name in {
             "ServerError", "ClientError", "APIError",
         }
-        gemini_unavailable = is_api_error and status_code in (429, 503)
+        is_openai_api_error = error_type_name in {
+            "APIStatusError", "APIConnectionError", "APITimeoutError",
+        }
+        openai_status_code = getattr(error, "status_code", None)
+
+        provider_unavailable = (
+            (is_gemini_api_error and status_code in (429, 503))
+            or (
+                is_openai_api_error
+                and (
+                    openai_status_code in (429, 500, 502, 503, 504)
+                    or error_type_name in {"APIConnectionError", "APITimeoutError"}
+                )
+            )
+        )
 
         document_metadata["status"] = "failed"
         document_metadata["error"] = {
-            "type": type(error).__name__,
+            "type": error_type_name,
             "message": str(error),
-            "transient": gemini_unavailable,
-            "api_status": getattr(error, "status", None) if is_api_error else None,
+            "transient": provider_unavailable,
+            "api_status": (
+                getattr(error, "status", None) if is_gemini_api_error
+                else openai_status_code if is_openai_api_error
+                else None
+            ),
         }
 
         with open(metadata_file, "w", encoding="utf-8") as f:
@@ -683,12 +746,26 @@ class PipelineService:
     def process_pdf(
         self,
         pdf_path,
+        progress_callback=None,
     ):
+
+        def _report(stage, percent, **extra):
+
+            if progress_callback is None:
+                return
+
+            try:
+                progress_callback(stage=stage, progress=percent, **extra)
+            except Exception:
+                # Progress reporting must never break the pipeline itself.
+                pass
 
         print()
         print("=" * 60)
         print("PROCESSING PDF")
         print("=" * 60)
+
+        _report("Starting", 1)
 
         # =====================================================
         # Temporary Workspace
@@ -719,6 +796,8 @@ class PipelineService:
             print("PDF RENDERING")
             print("=" * 60)
 
+            _report("Rendering PDF", 2)
+
             pages = render_pdf(
                 pdf_path=pdf_path,
                 output_dir=str(
@@ -748,30 +827,88 @@ class PipelineService:
             print("NEWSPAPER METADATA")
             print("=" * 60)
 
-            try:
+            _report("Reading newspaper metadata", 8)
 
-                metadata = (
-                    self.newspaper_client.extract_metadata(
-                        image_path=pages[0],
+            metadata = None
+            metadata_source = None
+
+            local_metadata_enabled = (
+                os.getenv(
+                    "LOCAL_METADATA_EXTRACTOR_ENABLED",
+                    "true",
+                )
+                .strip()
+                .lower()
+                != "false"
+            )
+
+            if local_metadata_enabled:
+
+                try:
+
+                    local_result = (
+                        self.local_masthead_extractor.extract_metadata(
+                            image_path=pages[0],
+                        )
                     )
-                )
 
-            except Exception as exc:
+                    if local_result is not None:
 
-                print()
-                print(
-                    "⚠ Newspaper metadata extraction failed:"
-                )
+                        metadata = local_result
+                        metadata_source = "local"
 
-                print(
-                    f"  {exc}"
-                )
+                except Exception as exc:
 
-                print(
-                    "  Using filename fallback."
-                )
+                    print()
+                    print(
+                        f"⚠ Local masthead extraction errored: {exc}"
+                    )
 
-                metadata = {}
+            if metadata is None:
+
+                try:
+
+                    metadata = (
+                        self.newspaper_client.extract_metadata(
+                            image_path=pages[0],
+                        )
+                    )
+
+                    metadata_source = self.llm_provider
+
+                    if local_metadata_enabled:
+
+                        try:
+
+                            self.local_masthead_extractor.record_gemini_result(
+                                image_path=pages[0],
+                                gemini_metadata=metadata,
+                            )
+
+                        except Exception as exc:
+
+                            print()
+                            print(
+                                f"⚠ Local masthead learning errored: {exc}"
+                            )
+
+                except Exception as exc:
+
+                    print()
+                    print(
+                        "⚠ Newspaper metadata extraction failed:"
+                    )
+
+                    print(
+                        f"  {exc}"
+                    )
+
+                    print(
+                        "  Using filename fallback."
+                    )
+
+                    metadata = {}
+                    metadata_source = "filename_fallback"
 
             if not isinstance(
                 metadata,
@@ -779,6 +916,10 @@ class PipelineService:
             ):
 
                 metadata = {}
+
+            print(
+                f"Metadata source : {metadata_source}"
+            )
 
             # -------------------------------------------------
             # Build reliable metadata
@@ -790,6 +931,8 @@ class PipelineService:
                     extracted_metadata=metadata,
                 )
             )
+
+            metadata["metadata_source"] = metadata_source
 
             print(
                 f"Newspaper : "
@@ -821,7 +964,7 @@ class PipelineService:
 
                 raise RuntimeError(
                     "Could not determine newspaper_name "
-                    "from Gemini metadata or filename."
+                    "from LLM metadata or filename."
                 )
 
             if not metadata.get(
@@ -830,7 +973,7 @@ class PipelineService:
 
                 raise RuntimeError(
                     "Could not determine publish_date "
-                    "from Gemini metadata or filename."
+                    "from LLM metadata or filename."
                 )
 
             # =================================================
@@ -868,6 +1011,12 @@ class PipelineService:
                 f"{document_dir}"
             )
 
+            _report(
+                "Document created",
+                10,
+                document_id=document_id,
+            )
+
             # =================================================
             # SAVE INITIAL DOCUMENT METADATA
             # =================================================
@@ -901,7 +1050,7 @@ class PipelineService:
             )
 
             (
-                document_dir / "gemini"
+                document_dir / "llm_response"
             ).mkdir(
                 parents=True,
                 exist_ok=True,
@@ -928,6 +1077,16 @@ class PipelineService:
 
             all_final_article_crops = []
 
+            # ---------------------------------------------
+            # Phase A: layout/OCR/knowledge/cleaning/export
+            # per page, unchanged and sequential -- these
+            # are CPU-bound stages with no cross-page
+            # dependency either way, so the ordering here
+            # is preserved as-is.
+            # ---------------------------------------------
+
+            preps = []
+
             for page_number, page_path in enumerate(
                 pages,
                 start=1,
@@ -937,23 +1096,132 @@ class PipelineService:
                 print("=" * 60)
 
                 print(
-                    f"PROCESSING PAGE "
+                    f"PREPARING PAGE "
                     f"{page_number}/{len(pages)}"
                 )
 
                 print("=" * 60)
 
-                # ---------------------------------------------
-                # Existing page pipeline
-                # ---------------------------------------------
+                _report(
+                    f"Preparing page {page_number}/{len(pages)}",
+                    11 + round(24 * (page_number - 1) / len(pages)),
+                )
 
-                result = process_page(
-                    page_number=page_number,
-                    page_path=page_path,
-                    detector=self.detector,
-                    ocr_engine=self.ocr_engine,
-                    document_id=document_id,
-                    document_dir=document_dir,
+                preps.append(
+                    prepare_page(
+                        page_number=page_number,
+                        page_path=page_path,
+                        detector=self.detector,
+                        ocr_engine=self.ocr_engine,
+                        document_id=document_id,
+                        document_dir=document_dir,
+                    )
+                )
+
+            # ---------------------------------------------
+            # Phase B: Gemini network calls -- each page's
+            # call is independent (own image/JSON in, own
+            # response out), so they run concurrently
+            # instead of waiting on one another.
+            # ---------------------------------------------
+
+            run_page_llm = (
+                run_gemini
+                if self.llm_provider == "gemini"
+                else run_openai
+            )
+
+            page_concurrency_env = (
+                "GEMINI_PAGE_CONCURRENCY"
+                if self.llm_provider == "gemini"
+                else "OPENAI_PAGE_CONCURRENCY"
+            )
+
+            gemini_concurrency = int(
+                os.getenv(
+                    page_concurrency_env,
+                    "4",
+                )
+            )
+
+            print()
+            print("=" * 60)
+            print(
+                f"RUNNING {self.llm_provider.upper()} ON "
+                f"{len(preps)} PAGE(S) "
+                f"(concurrency={gemini_concurrency})"
+            )
+            print("=" * 60)
+
+            _report(f"Running {self.llm_provider} on {len(preps)} page(s)", 35)
+
+            gemini_results = {}
+
+            with ThreadPoolExecutor(
+                max_workers=max(1, gemini_concurrency),
+            ) as executor:
+
+                futures = {
+                    executor.submit(
+                        run_page_llm,
+                        page_path=prep["page_path"],
+                        json_path=prep["json_path"],
+                    ): prep["page_number"]
+                    for prep in preps
+                }
+
+                completed = 0
+
+                for future in as_completed(futures):
+
+                    page_number = futures[future]
+
+                    gemini_results[
+                        page_number
+                    ] = future.result()
+
+                    completed += 1
+
+                    _report(
+                        f"{self.llm_provider} analyzed page {page_number} "
+                        f"({completed}/{len(preps)})",
+                        35 + round(30 * completed / len(preps)),
+                    )
+
+            # ---------------------------------------------
+            # Phase C: boundary pipeline + cropping per
+            # page, unchanged and sequential (each page's
+            # result only depends on its own Gemini
+            # response, already available from Phase B).
+            # ---------------------------------------------
+
+            for prep in preps:
+
+                page_number = prep["page_number"]
+
+                gemini_response, gemini_elapsed = (
+                    gemini_results[page_number]
+                )
+
+                print()
+                print("=" * 60)
+
+                print(
+                    f"FINISHING PAGE "
+                    f"{page_number}/{len(pages)}"
+                )
+
+                print("=" * 60)
+
+                _report(
+                    f"Finishing page {page_number}/{len(pages)}",
+                    65 + round(3 * page_number / len(pages)),
+                )
+
+                result = finish_page(
+                    prep,
+                    gemini_response,
+                    gemini_elapsed,
                 )
 
                 # ---------------------------------------------
@@ -1003,6 +1271,8 @@ class PipelineService:
             print("=" * 60)
             print("FINAL ARTICLE CROP SUMMARY")
             print("=" * 60)
+
+            _report("Finalizing article crops", 69)
 
             print(
                 f"Pages Processed : "
@@ -1101,6 +1371,11 @@ class PipelineService:
                 "Batch size: 3 pages"
             )
 
+            _report(
+                f"Extracting articles ({article_extractor_engine})",
+                72,
+            )
+
             if article_extractor_engine == "local":
 
                 article_extractor = (
@@ -1131,6 +1406,8 @@ class PipelineService:
                     document_dir
                 )
             )
+
+            _report("Article-level extraction completed", 90)
 
             print()
             print(
@@ -1164,6 +1441,8 @@ class PipelineService:
             print("=" * 60)
             print("LOGICAL ARTICLE FINALIZATION")
             print("=" * 60)
+
+            _report("Building logical articles", 92)
 
             print(
                 "Building logical articles..."
@@ -1280,6 +1559,8 @@ class PipelineService:
             print("UPDATING DOCUMENT METADATA")
             print("=" * 60)
 
+            _report("Updating document metadata", 95)
+
             document_metadata = (
                 self._save_document_metadata(
                     document_dir=document_dir,
@@ -1348,6 +1629,8 @@ class PipelineService:
             print("=" * 60)
             print("DATABASE IMPORT")
             print("=" * 60)
+
+            _report("Importing into database", 97)
 
             print(
                 f"Document ID : "
@@ -1510,6 +1793,13 @@ class PipelineService:
 
             print("=" * 70)
 
+            _report(
+                "Completed",
+                100,
+                document_id=document_id,
+                status="completed",
+            )
+
             # =================================================
             # RETURN
             # =================================================
@@ -1562,6 +1852,13 @@ class PipelineService:
                     document_dir=document_dir,
                     error=exc,
                 )
+
+            _report(
+                "Failed",
+                100,
+                status="failed",
+                error=str(exc),
+            )
 
             raise
 

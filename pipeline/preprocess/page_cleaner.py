@@ -20,6 +20,7 @@ class PageCleaner:
         blocks,
         page_width,
         page_height,
+        page_number=None,
     ):
         #
         # Remove noise
@@ -32,11 +33,25 @@ class PageCleaner:
         #
         # Detect masthead
         #
+        # The masthead (the paper's big front-page title block) only
+        # exists on page 1. Later pages commonly repeat the paper's
+        # name in a small running header strip -- that's a distinct,
+        # legitimate case already handled by detect_page_header below,
+        # and must not also be tagged "masthead".
+        #
 
-        self.detect_masthead(
-            blocks,
-            page_height,
-        )
+        if page_number is None or page_number == 1:
+
+            self.detect_masthead(
+                blocks,
+                page_height,
+            )
+
+        else:
+
+            print(
+                "Mastheads Detected : 0 (not page 1)"
+            )
 
         #
         # Detect page header

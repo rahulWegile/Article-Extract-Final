@@ -35,9 +35,22 @@ _BYLINE_PATTERNS = (
     ),
 )
 
-# Classic newspaper dateline: "NEW DELHI, Aug 12:" / "MUMBAI:" / "CHANDIGARH, August 12, 2026:"
+# "Koushiki.Saha@timesofindia.com" / "Madan.Kumar @timesofindia.com" --
+# this paper's actual byline convention, printed as a standalone line
+# right below the headline/subheadline. OCR sometimes inserts a stray
+# space before "@", so that's tolerated and normalized away.
+_BYLINE_EMAIL_PATTERN = re.compile(
+    r"\b([A-Za-z]+\.[A-Za-z]+)\s*@\s*([A-Za-z0-9.\-]+\.[a-z]{2,})\b"
+)
+
+# Classic newspaper dateline: "NEW DELHI, Aug 12:" / "MUMBAI:" /
+# "CHANDIGARH, August 12, 2026:" -- and equally, this paper's own
+# Title Case convention "New Delhi: ..." / "Patna: ...". The character
+# class deliberately allows lowercase too (not just [A-Z]); the
+# gazetteer/length check below is what actually guards against a
+# false-positive match on some unrelated capitalized opening phrase.
 _DATELINE_PATTERN = re.compile(
-    r"^\s*([A-Z][A-Z .]{2,30}?)"
+    r"^\s*([A-Za-z][A-Za-z .]{2,30}?)"
     r"(?:,\s*([A-Za-z]+\.?\s+\d{1,2}(?:,?\s*\d{4})?))?"
     r"\s*[:—\-]\s*"
 )
@@ -179,6 +192,11 @@ def extract_author(article_text: str) -> str | None:
     search_lines = lines[:3] + lines[-2:]
 
     for line in search_lines:
+        email_match = _BYLINE_EMAIL_PATTERN.search(line)
+        if email_match:
+            return f"{email_match.group(1)}@{email_match.group(2)}"
+
+    for line in search_lines:
         for pattern in _BYLINE_PATTERNS:
             match = pattern.search(line)
             if match:
@@ -196,23 +214,36 @@ def extract_author(article_text: str) -> str | None:
 
 
 def extract_location_and_date(article_text: str) -> tuple[str | None, str | None]:
-    """Classic dateline at the start of the article body."""
-    lead = article_text.strip()[:200]
+    """
+    Classic dateline at the start of the article body.
 
-    match = _DATELINE_PATTERN.match(lead)
-    if not match:
-        return None, None
+    `article_text` here is block-OCR text, which -- unlike Gemini's
+    reading of the crop image -- still has the headline/subheadline/
+    byline lines stacked on top of the actual lead paragraph rather
+    than stripped out, so the dateline is a few lines down rather than
+    at position 0. Check each of the first few lines rather than only
+    the very start of the whole blob.
+    """
+    lines = [line.strip() for line in article_text.strip().splitlines() if line.strip()]
 
-    location = match.group(1).strip()
-    date = match.group(2).strip() if match.group(2) else None
+    for line in lines[:6]:
 
-    # Only trust the match if it looks like a real place name: either it's
-    # in the gazetteer, or it's short (avoids false-positives on generic
-    # ALL-CAPS opening phrases that aren't datelines).
-    if location.upper() not in _PLACE_GAZETTEER and len(location.split()) > 3:
-        return None, None
+        match = _DATELINE_PATTERN.match(line)
+        if not match:
+            continue
 
-    return location, date
+        location = match.group(1).strip()
+        date = match.group(2).strip() if match.group(2) else None
+
+        # Only trust the match if it looks like a real place name: either
+        # it's in the gazetteer, or it's short (avoids false-positives on
+        # generic ALL-CAPS opening phrases that aren't datelines).
+        if location.upper() not in _PLACE_GAZETTEER and len(location.split()) > 3:
+            continue
+
+        return location, date
+
+    return None, None
 
 
 def classify_content_type(
