@@ -30,8 +30,10 @@ class SentenceFeatures:
         # Split into sentences
         # ---------------------------------
 
+        # Devanagari sentences end with "।" (danda) / "॥", not ".",
+        # so those must split sentences too.
         sentences = re.split(
-            r"(?<=[.!?])\s+",
+            r"(?<=[.!?।॥])\s+",
             text,
         )
 
@@ -57,8 +59,10 @@ class SentenceFeatures:
         # Words
         # ---------------------------------
 
+        # Latin and Devanagari word runs, so `first_word`/`last_word`
+        # aren't always empty on Hindi-only text.
         words = re.findall(
-            r"[A-Za-z]+",
+            r"[A-Za-zऀ-ॿ]+",
             text,
         )
 
@@ -85,7 +89,7 @@ class SentenceFeatures:
 
         ends_with_punctuation = (
             len(text) > 0
-            and text[-1] in ".!?:;"
+            and text[-1] in ".!?:;।॥"
         )
 
         return {

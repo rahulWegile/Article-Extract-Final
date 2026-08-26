@@ -7,6 +7,7 @@
 .agents/
 .claude/
 .gemini/
+.playwright-mcp/
 
 # Python
 __pycache__/

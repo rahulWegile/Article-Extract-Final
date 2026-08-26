@@ -334,6 +334,49 @@ def run_openai(page_path, json_path):
 
 
 # =========================================================
+# LOCAL GROUPING (NO API CALL)
+# =========================================================
+
+def run_local(page_path, json_path):
+    """
+    Drop-in replacement for run_openai / run_gemini that groups the
+    page with pipeline.article.local_grouper instead of a model.
+
+    Returns the same (response, elapsed) pair and the same response
+    shape, so finish_page and every stage after it are unchanged.
+    """
+
+    print()
+    print(
+        "Grouping locally (no API call)..."
+    )
+
+    from pipeline.article.local_grouper import (
+        build_local_response,
+    )
+
+    local_start = time.perf_counter()
+
+    local_response = build_local_response(
+        json_path,
+        page_image_path=page_path,
+    )
+
+    local_elapsed = (
+        time.perf_counter()
+        - local_start
+    )
+
+    print(
+        f"Local grouping: "
+        f"{len(local_response.get('articles', []))} article(s) "
+        f"in {local_elapsed:.2f}s"
+    )
+
+    return local_response, local_elapsed
+
+
+# =========================================================
 # FINISH PAGE (everything after the network call)
 # =========================================================
 

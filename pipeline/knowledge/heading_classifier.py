@@ -28,7 +28,10 @@ class HeadingClassifier:
         if len(words) <= 10:
             score += 0.35
 
-        # Mostly Title Case
+        # Mostly Title Case.
+        # No-op for scripts without letter case (e.g. Devanagari) --
+        # those blocks simply don't get this signal either way,
+        # rather than being penalized for lacking it.
         title_case = sum(
             1
             for w in words
@@ -41,8 +44,11 @@ class HeadingClassifier:
             if ratio > 0.70:
                 score += 0.35
 
-        # Headings usually don't end with punctuation
-        if text[-1] not in ".!?;":
+        # Headings usually don't end with punctuation.
+        # Devanagari sentences end with "।" (danda) or "॥", not ".",
+        # so those must count as sentence-ending punctuation too --
+        # otherwise every Hindi paragraph falsely gets this signal.
+        if text[-1] not in ".!?;।॥":
             score += 0.20
 
         # Few commas
@@ -57,8 +63,8 @@ class HeadingClassifier:
         if len(words) > 15:
             score -= 0.40
 
-        # Paragraphs usually end with a period
-        if text.endswith("."):
+        # Paragraphs usually end with a sentence terminator
+        if text.endswith((".", "।", "॥")):
             score -= 0.30
 
         # Long OCR text is unlikely to be a heading
@@ -66,7 +72,7 @@ class HeadingClassifier:
             score -= 0.20
 
         # Multiple sentences → body text
-        if text.count(".") > 1:
+        if (text.count(".") + text.count("।")) > 1:
             score -= 0.20
 
         # Many commas → paragraph

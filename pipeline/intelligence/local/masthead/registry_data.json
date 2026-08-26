@@ -40,5 +40,41 @@
         "verified": true,
         "notes": "date_region and edition_region are the same crop -- on this masthead the served-city list, the date, page count and price all sit on one thin strip above the title, so both fields are parsed out of the same OCR'd line via regex rather than separate crops. Edition line lists 5 served cities; canonical edition is the first token. Marked verified:false pending human confirmation against a second real sample (see onboarding_tool.py) -- do not treat as production-ready until re-checked; the one document.json fixture that exists for this masthead has an internal date inconsistency (see plan notes) and should not be relied on as ground truth.",
         "confirmation_count": 3
+    },
+    {
+        "template_id": "hindustan_times_new_delhi_metro",
+        "newspaper_name": "Hindustan Times",
+        "edition": "New Delhi/Metro",
+        "language": "English",
+        "name_ocr_variants": [
+            "@hindustantimes"
+        ],
+        "masthead_region": [
+            0.013689515161889048,
+            0.0328125,
+            0.09417338504870622,
+            0.058750000000000004
+        ],
+        "date_region": [
+            0.0,
+            0.0321875,
+            1.0,
+            0.06375
+        ],
+        "edition_region": [
+            0.0,
+            0.025,
+            1.0,
+            0.051875000000000004
+        ],
+        "edition_patterns": [
+            "NEW DELHIMETRO"
+        ],
+        "edition_primary_token": "NEW DELHIMETRO",
+        "date_format_hint": "",
+        "sample_source": "output\\temp\\pages\\page_001.png",
+        "verified": false,
+        "notes": "auto-learned from a Gemini fallback result",
+        "confirmation_count": 1
     }
 ]

@@ -168,11 +168,15 @@ function Search() {
                 urlNewspaper
             );
 
-            loadDates(
-                urlNewspaper
-            );
-
         }
+
+
+        // Load publication dates -- scoped to the newspaper if one
+        // was supplied, otherwise every date across all newspapers.
+
+        loadDates(
+            urlNewspaper
+        );
 
 
         // ----------------------------------------------------
@@ -196,16 +200,30 @@ function Search() {
 
 
         // ----------------------------------------------------
-        // Otherwise perform normal text search.
+        // Newspaper selected without a date -- browse that
+        // newspaper's entire archive.
         // ----------------------------------------------------
 
-        if (urlQuery) {
+        if (urlNewspaper) {
 
             performSearch({
                 suppliedQuery: urlQuery,
+                suppliedNewspaper: urlNewspaper,
             });
 
+            return;
+
         }
+
+
+        // ----------------------------------------------------
+        // Otherwise perform a text search, or -- if nothing was
+        // supplied in the URL at all -- browse the full archive.
+        // ----------------------------------------------------
+
+        performSearch({
+            suppliedQuery: urlQuery,
+        });
 
     }, []);
 
@@ -270,15 +288,6 @@ function Search() {
         newspaper
     ) => {
 
-        if (!newspaper) {
-
-            setPublishDates([]);
-
-            return;
-
-        }
-
-
         setLoadingDates(
             true
         );
@@ -290,9 +299,11 @@ function Search() {
                 await api.get(
                     "/search/dates",
                     {
-                        params: {
-                            newspaper,
-                        },
+                        // Omitting `newspaper` returns every
+                        // publish date across all newspapers.
+                        params: newspaper
+                            ? { newspaper }
+                            : {},
                     }
                 );
 
@@ -376,16 +387,13 @@ function Search() {
 
 
         // ----------------------------------------------------
-        // Load dates for selected newspaper.
+        // Load dates -- scoped to the newspaper if one was picked,
+        // otherwise every date across all newspapers.
         // ----------------------------------------------------
 
-        if (newspaper) {
-
-            await loadDates(
-                newspaper
-            );
-
-        }
+        await loadDates(
+            newspaper
+        );
 
 
         // ----------------------------------------------------
@@ -539,25 +547,9 @@ function Search() {
 
 
         // ----------------------------------------------------
-        // Nothing selected.
+        // No filters selected means "browse the entire archive" --
+        // fall through and let the backend return every article.
         // ----------------------------------------------------
-
-        if (
-            !value &&
-            !newspaper &&
-            !date
-        ) {
-
-            setResults([]);
-
-            setTotal(0);
-
-            setSearched(false);
-
-            return;
-
-        }
-
 
         setLoading(
             true
@@ -572,57 +564,103 @@ function Search() {
 
         try {
 
-            const params = {
+            // ----------------------------------------------------
+            // The backend caps `limit` at 100 per request, so a
+            // newspaper/query with more matches than that would be
+            // silently truncated. Page through every result here so
+            // the archive always shows the full set.
+            // ----------------------------------------------------
 
-                // Empty string is allowed by backend.
-                q: value,
+            const pageSize = 100;
 
-                limit: 100,
+            let allArticles = [];
 
-                offset: 0,
+            let totalCount = 0;
 
-            };
+            let pageOffset = 0;
+
+            while (true) {
+
+                const params = {
+
+                    // Empty string is allowed by backend.
+                    q: value,
+
+                    limit: pageSize,
+
+                    offset: pageOffset,
+
+                };
 
 
-            // ------------------------------------------------
-            // Add newspaper filter.
-            // ------------------------------------------------
+                // ------------------------------------------------
+                // Add newspaper filter.
+                // ------------------------------------------------
 
-            if (newspaper) {
+                if (newspaper) {
 
-                params.newspaper =
-                    newspaper;
+                    params.newspaper =
+                        newspaper;
+
+                }
+
+
+                // ------------------------------------------------
+                // Add publication-date filter.
+                // ------------------------------------------------
+
+                if (date) {
+
+                    params.publish_date =
+                        date;
+
+                }
+
+
+                const response =
+                    await api.get(
+                        "/search/articles",
+                        {
+                            params,
+                        }
+                    );
+
+
+                const data =
+                    response.data;
+
+
+                const articles =
+                    data.results || [];
+
+
+                allArticles =
+                    allArticles.concat(
+                        articles
+                    );
+
+
+                totalCount =
+                    data.total || 0;
+
+
+                pageOffset += pageSize;
+
+
+                if (
+                    articles.length === 0 ||
+                    allArticles.length >= totalCount
+                ) {
+
+                    break;
+
+                }
 
             }
-
-
-            // ------------------------------------------------
-            // Add publication-date filter.
-            // ------------------------------------------------
-
-            if (date) {
-
-                params.publish_date =
-                    date;
-
-            }
-
-
-            const response =
-                await api.get(
-                    "/search/articles",
-                    {
-                        params,
-                    }
-                );
-
-
-            const data =
-                response.data;
 
 
             const articles =
-                data.results || [];
+                allArticles;
 
 
             setResults(
@@ -631,7 +669,7 @@ function Search() {
 
 
             setTotal(
-                data.total || 0
+                totalCount
             );
 
 
@@ -651,7 +689,7 @@ function Search() {
                         date || "",
 
                     total:
-                        data.total || 0,
+                        totalCount,
 
                     results:
                         articles,
@@ -1035,18 +1073,15 @@ function Search() {
                                 handleDateChange
                             }
                             disabled={
-                                !selectedNewspaper ||
                                 loadingDates
                             }
                         >
 
                             <option value="">
 
-                                {!selectedNewspaper
-                                    ? "Select newspaper first"
-                                    : loadingDates
-                                        ? "Loading dates..."
-                                        : "All dates"
+                                {loadingDates
+                                    ? "Loading dates..."
+                                    : "All dates"
                                 }
 
                             </option>
@@ -1084,12 +1119,7 @@ function Search() {
                             performSearch()
                         }
                         disabled={
-                            loading ||
-                            (
-                                !query.trim() &&
-                                !selectedNewspaper &&
-                                !selectedDate
-                            )
+                            loading
                         }
                     >
 

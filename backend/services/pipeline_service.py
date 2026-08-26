@@ -21,14 +21,11 @@ from pipeline.page_processor_gemini import (
     prepare_page,
     run_gemini,
     run_openai,
+    run_local,
     finish_page,
 )
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from pipeline.gemini.newspaper_client import (
-    NewspaperClient as GeminiNewspaperClient,
-)
 
 from pipeline.openai.newspaper_client import (
     NewspaperClient as OpenAINewspaperClient,
@@ -166,6 +163,12 @@ class PipelineService:
 
         self.ocr_engine = RapidOCREngine()
 
+        # Lazily-created, cached Devanagari-configured OCR engine.
+        # Kept separate from self.ocr_engine so switching a Hindi
+        # document to it never affects English documents processed
+        # by this same (long-lived) PipelineService instance.
+        self._hindi_ocr_engine = None
+
         # =====================================================
         # Newspaper Metadata Client
         # =====================================================
@@ -176,11 +179,21 @@ class PipelineService:
             .lower()
         )
 
-        self.newspaper_client = (
-            GeminiNewspaperClient()
-            if self.llm_provider == "gemini"
-            else OpenAINewspaperClient()
-        )
+        # Local mode must not require an API key at all, so the
+        # network client is simply never constructed.
+        #
+        # Newspaper masthead metadata (name/edition/date/language)
+        # always goes through OpenAI, regardless of LLM_PROVIDER or
+        # the document's language -- this call is what DETERMINES
+        # the document's language in the first place, so there is
+        # nothing to route on yet at this point. The per-document
+        # Hindi-vs-English choice below (see _is_hindi_language)
+        # only applies to boundary detection and article extraction,
+        # both of which run after the language is already known.
+        if self.llm_provider == "local":
+            self.newspaper_client = None
+        else:
+            self.newspaper_client = OpenAINewspaperClient()
 
         self.local_masthead_extractor = (
             LocalMastheadExtractor(
@@ -206,8 +219,132 @@ class PipelineService:
         )
 
     # ========================================================
-    # METADATA HELPERS
+    # LANGUAGE DETECTION (shared by OCR engine AND LLM routing)
     # ========================================================
+
+    @staticmethod
+    def _is_hindi_language(language):
+        """
+        Shared Hindi/Devanagari check for both OCR engine selection
+        (_get_ocr_engine_for_language) and per-document LLM routing
+        (see the LLM ROUTING note in process_pdf): "Hindi", "hi",
+        "hin", and anything containing "hindi" (e.g. "Hindi
+        (Devanagari)") all count. Kept as one place so the two
+        decisions can never quietly disagree with each other.
+        """
+
+        language = (language or "").strip().lower()
+
+        return (
+            language in ("hi", "hin", "hindi")
+            or "hindi" in language
+        )
+
+    # ========================================================
+    # OCR ENGINE SELECTION
+    # ========================================================
+
+    def _get_ocr_engine_for_language(self, language):
+        """
+        Pick the RapidOCR engine to use for this document.
+
+        Hindi documents get a Devanagari-configured engine;
+        everything else keeps using the default (English/Latin)
+        engine that was already validated. This is a per-document
+        choice, not a global config change, so English documents
+        are never affected by the Hindi model.
+        """
+
+        if not self._is_hindi_language(language):
+            return self.ocr_engine
+
+        if self._hindi_ocr_engine is None:
+
+            self._hindi_ocr_engine = RapidOCREngine(
+                lang="hi"
+            )
+
+        return self._hindi_ocr_engine
+
+    def _detect_script_locally(self, page_image_path):
+        """
+        Cheap Devanagari-vs-Latin script probe for local mode.
+
+        There is no LLM here to name the language outright, so both
+        the default (Latin/English) and the Devanagari OCR engines
+        are run on the same small, text-dense crop of the page, and
+        whichever gets meaningfully higher average recognition
+        confidence wins. A wrong-script recognizer reliably produces
+        low-confidence noise, which is what makes this comparison
+        work without understanding the text itself.
+
+        Runs once per document, and only when local mode could not
+        otherwise identify the language -- the one-time cost of
+        loading the Devanagari model is paid only when it might
+        actually be needed.
+
+        Returns "Hindi", or None to leave the language as-is.
+        """
+
+        import cv2
+
+        try:
+            image = cv2.imread(str(page_image_path))
+        except Exception:
+            return None
+
+        if image is None:
+            return None
+
+        height, width = image.shape[:2]
+
+        # A central, text-dense band: skips the masthead/graphics
+        # usually at the very top of the page.
+        y1 = int(height * 0.15)
+        y2 = int(height * 0.45)
+
+        crop = image[y1:y2, :]
+
+        def average_confidence(engine):
+
+            try:
+                result = engine.reader(crop)
+            except Exception:
+                return 0.0
+
+            scores = getattr(result, "scores", None) if result else None
+
+            if not scores:
+                return 0.0
+
+            scores = [s for s in scores if s is not None]
+
+            return sum(scores) / len(scores) if scores else 0.0
+
+        latin_confidence = average_confidence(self.ocr_engine)
+
+        if self._hindi_ocr_engine is None:
+            self._hindi_ocr_engine = RapidOCREngine(lang="hi")
+
+        hindi_confidence = average_confidence(
+            self._hindi_ocr_engine
+        )
+
+        print(
+            "  Script probe -- latin confidence: "
+            f"{latin_confidence:.2f}, devanagari confidence: "
+            f"{hindi_confidence:.2f}"
+        )
+
+        # A clear margin is required so a genuinely English/mixed
+        # page is not switched to Devanagari over ordinary noise.
+        if (
+            hindi_confidence > latin_confidence + 0.05
+            and hindi_confidence > 0.3
+        ):
+            return "Hindi"
+
+        return None
 
     @staticmethod
     def _clean_metadata_value(value):
@@ -771,8 +908,13 @@ class PipelineService:
         # Temporary Workspace
         # =====================================================
 
+        # Held in a variable so the cleanup in `finally` removes THIS
+        # run's workspace specifically, rather than a fresh instance
+        # wiping a concurrently-running upload's workspace too.
+        workspace_manager = WorkspaceManager()
+
         workspace = (
-            WorkspaceManager().create()
+            workspace_manager.create()
         )
 
         print(
@@ -864,6 +1006,21 @@ class PipelineService:
                         f"⚠ Local masthead extraction errored: {exc}"
                     )
 
+            if metadata is None and self.llm_provider == "local":
+
+                # Fully-local mode makes no network calls at all, so
+                # there is no LLM fallback to reach for here. An
+                # unrecognised masthead simply stays unidentified
+                # rather than silently contacting an API.
+                print()
+                print(
+                    "Local mode: skipping LLM metadata fallback "
+                    "(masthead not recognised locally)"
+                )
+
+                metadata = {}
+                metadata_source = "local_unresolved"
+
             if metadata is None:
 
                 try:
@@ -874,7 +1031,14 @@ class PipelineService:
                         )
                     )
 
-                    metadata_source = self.llm_provider
+                    # self.newspaper_client is always OpenAI's
+                    # client here (see __init__) regardless of
+                    # LLM_PROVIDER, so the source label must say so
+                    # literally rather than echo self.llm_provider
+                    # -- which could read "gemini" for a Hindi
+                    # document even though metadata always comes
+                    # from OpenAI.
+                    metadata_source = "openai"
 
                     if local_metadata_enabled:
 
@@ -955,6 +1119,46 @@ class PipelineService:
             )
 
             # -------------------------------------------------
+            # LOCAL-MODE METADATA FALLBACK
+            # -------------------------------------------------
+            #
+            # In local mode there is no LLM to identify an unknown
+            # masthead, and a filename like "2 poage.pdf" carries
+            # neither a paper name nor a date. Failing the whole
+            # upload over unknown cover metadata would throw away
+            # perfectly good article extraction, so the document is
+            # accepted with clearly-marked placeholder values
+            # instead. The API modes keep the hard failure, where
+            # missing metadata really does signal a broken call.
+            # -------------------------------------------------
+
+            if self.llm_provider == "local":
+
+                if not metadata.get("newspaper_name"):
+
+                    metadata["newspaper_name"] = "Unknown"
+
+                    print(
+                        "⚠ Local mode: newspaper_name unknown "
+                        "(masthead not in local templates)"
+                    )
+
+                if not metadata.get("publish_date"):
+
+                    fallback_date = datetime.fromtimestamp(
+                        Path(pdf_path).stat().st_mtime
+                    ).strftime("%Y-%m-%d")
+
+                    metadata["publish_date"] = fallback_date
+
+                    print(
+                        "⚠ Local mode: publish_date not found in "
+                        "masthead or filename -- using the PDF's "
+                        f"file date ({fallback_date}) as a "
+                        "placeholder"
+                    )
+
+            # -------------------------------------------------
             # IMPORTANT SAFETY CHECK
             # -------------------------------------------------
 
@@ -975,6 +1179,91 @@ class PipelineService:
                     "Could not determine publish_date "
                     "from LLM metadata or filename."
                 )
+
+            # -------------------------------------------------
+            # LOCAL-MODE SCRIPT DETECTION
+            #
+            # _build_document_metadata defaults an unresolved
+            # language to "English" so publish_date/newspaper_name
+            # checks never see a blank value. With no LLM to name
+            # the actual language, that default was silently
+            # selecting the English/Latin OCR engine for every
+            # Hindi document run in local mode -- OCR wasn't merely
+            # inaccurate, it was reading Devanagari text with a
+            # recognizer that has no Devanagari characters in its
+            # vocabulary at all. A quick script probe on the
+            # rendered page catches this before OCR runs for real.
+            # -------------------------------------------------
+
+            if (
+                self.llm_provider == "local"
+                and metadata.get("metadata_source")
+                == "local_unresolved"
+            ):
+
+                detected_language = (
+                    self._detect_script_locally(
+                        pages[0]
+                    )
+                )
+
+                if detected_language:
+
+                    metadata["language"] = detected_language
+
+                    print(
+                        "Local mode: script probe detected "
+                        f"{detected_language}"
+                    )
+
+            # -------------------------------------------------
+            # Pick OCR engine for this document's language
+            # -------------------------------------------------
+
+            active_ocr_engine = (
+                self._get_ocr_engine_for_language(
+                    metadata.get("language", "")
+                )
+            )
+
+            print(
+                f"OCR engine : "
+                f"{'devanagari' if active_ocr_engine is self._hindi_ocr_engine else 'default'}"
+            )
+
+            # -------------------------------------------------
+            # LLM ROUTING (boundary detection + article
+            # extraction only -- newspaper metadata above always
+            # uses OpenAI, see __init__)
+            #
+            # Hindi/Devanagari documents route to Gemini
+            # (gemini-3.6-flash): confirmed this session, on the
+            # same real headline crop, to read Devanagari
+            # correctly where gpt-5.6-luna fabricates unrelated
+            # text instead. Every other language stays on OpenAI.
+            #
+            # This is a PER-DOCUMENT decision based on the
+            # language just determined above, not the global
+            # LLM_PROVIDER value -- LLM_PROVIDER=gemini/openai no
+            # longer manually pins boundary/extraction to one
+            # engine, only LLM_PROVIDER=local still does (the
+            # explicit no-API-calls override, orthogonal to
+            # language).
+            # -------------------------------------------------
+
+            if self.llm_provider == "local":
+                document_llm_provider = "local"
+            elif self._is_hindi_language(
+                metadata.get("language", "")
+            ):
+                document_llm_provider = "gemini"
+            else:
+                document_llm_provider = "openai"
+
+            print(
+                f"LLM routing : {document_llm_provider} "
+                f"(language={metadata.get('language', '')})"
+            )
 
             # =================================================
             # STEP 3
@@ -1078,62 +1367,36 @@ class PipelineService:
             all_final_article_crops = []
 
             # ---------------------------------------------
-            # Phase A: layout/OCR/knowledge/cleaning/export
-            # per page, unchanged and sequential -- these
-            # are CPU-bound stages with no cross-page
-            # dependency either way, so the ordering here
-            # is preserved as-is.
+            # PIPELINED: page prepare (layout/OCR/knowledge/
+            # cleaning/export) and the page-level LLM call are
+            # no longer two fully sequential phases with a
+            # document-wide barrier between them.
+            #
+            # OCR/prepare still happens one page at a time on
+            # the main thread (CPU-bound, no benefit from
+            # threading it), but as soon as EACH page's prepare
+            # finishes, that page's LLM call is submitted to run
+            # concurrently in the background while prepare moves
+            # on to the next page immediately -- instead of
+            # waiting for every page's OCR to finish before any
+            # LLM call starts.
+            #
+            # Previously: total time ~= sum(prepare) + sum(LLM)/concurrency.
+            # Now: total time trends toward max(sum(prepare), sum(LLM)/concurrency),
+            # since the two stages overlap across pages instead of
+            # being separated by a whole-document barrier.
             # ---------------------------------------------
 
-            preps = []
-
-            for page_number, page_path in enumerate(
-                pages,
-                start=1,
-            ):
-
-                print()
-                print("=" * 60)
-
-                print(
-                    f"PREPARING PAGE "
-                    f"{page_number}/{len(pages)}"
-                )
-
-                print("=" * 60)
-
-                _report(
-                    f"Preparing page {page_number}/{len(pages)}",
-                    11 + round(24 * (page_number - 1) / len(pages)),
-                )
-
-                preps.append(
-                    prepare_page(
-                        page_number=page_number,
-                        page_path=page_path,
-                        detector=self.detector,
-                        ocr_engine=self.ocr_engine,
-                        document_id=document_id,
-                        document_dir=document_dir,
-                    )
-                )
-
-            # ---------------------------------------------
-            # Phase B: Gemini network calls -- each page's
-            # call is independent (own image/JSON in, own
-            # response out), so they run concurrently
-            # instead of waiting on one another.
-            # ---------------------------------------------
-
-            run_page_llm = (
-                run_gemini
-                if self.llm_provider == "gemini"
-                else run_openai
-            )
+            if document_llm_provider == "local":
+                run_page_llm = run_local
+            elif document_llm_provider == "gemini":
+                run_page_llm = run_gemini
+            else:
+                run_page_llm = run_openai
 
             page_concurrency_env = (
                 "GEMINI_PAGE_CONCURRENCY"
-                if self.llm_provider == "gemini"
+                if document_llm_provider == "gemini"
                 else "OPENAI_PAGE_CONCURRENCY"
             )
 
@@ -1147,28 +1410,81 @@ class PipelineService:
             print()
             print("=" * 60)
             print(
-                f"RUNNING {self.llm_provider.upper()} ON "
-                f"{len(preps)} PAGE(S) "
+                f"PIPELINED PAGE PREPARE + "
+                f"{document_llm_provider.upper()} "
                 f"(concurrency={gemini_concurrency})"
             )
             print("=" * 60)
 
-            _report(f"Running {self.llm_provider} on {len(preps)} page(s)", 35)
-
+            preps = []
             gemini_results = {}
 
             with ThreadPoolExecutor(
                 max_workers=max(1, gemini_concurrency),
             ) as executor:
 
-                futures = {
-                    executor.submit(
-                        run_page_llm,
-                        page_path=prep["page_path"],
-                        json_path=prep["json_path"],
-                    ): prep["page_number"]
-                    for prep in preps
-                }
+                futures = {}
+
+                for page_number, page_path in enumerate(
+                    pages,
+                    start=1,
+                ):
+
+                    print()
+                    print("=" * 60)
+
+                    print(
+                        f"PREPARING PAGE "
+                        f"{page_number}/{len(pages)}"
+                    )
+
+                    print("=" * 60)
+
+                    _report(
+                        f"Preparing page {page_number}/{len(pages)}",
+                        11 + round(24 * (page_number - 1) / len(pages)),
+                    )
+
+                    prep = prepare_page(
+                        page_number=page_number,
+                        page_path=page_path,
+                        detector=self.detector,
+                        ocr_engine=active_ocr_engine,
+                        document_id=document_id,
+                        document_dir=document_dir,
+                    )
+
+                    preps.append(prep)
+
+                    # ---------------------------------------------
+                    # Submit this page's LLM call NOW -- it runs in
+                    # the background while the loop immediately
+                    # continues preparing the next page, instead of
+                    # waiting for every page to finish preparing
+                    # first.
+                    # ---------------------------------------------
+
+                    print(
+                        f"→ Submitting {document_llm_provider} call "
+                        f"for page {page_number} (runs in "
+                        f"background while later pages are "
+                        f"prepared)"
+                    )
+
+                    futures[
+                        executor.submit(
+                            run_page_llm,
+                            page_path=prep["page_path"],
+                            json_path=prep["json_path"],
+                        )
+                    ] = prep["page_number"]
+
+                _report(
+                    f"All {len(preps)} page(s) prepared -- "
+                    f"waiting on remaining "
+                    f"{document_llm_provider} calls",
+                    35,
+                )
 
                 completed = 0
 
@@ -1183,16 +1499,15 @@ class PipelineService:
                     completed += 1
 
                     _report(
-                        f"{self.llm_provider} analyzed page {page_number} "
-                        f"({completed}/{len(preps)})",
+                        f"{document_llm_provider} analyzed page "
+                        f"{page_number} ({completed}/{len(preps)})",
                         35 + round(30 * completed / len(preps)),
                     )
 
             # ---------------------------------------------
-            # Phase C: boundary pipeline + cropping per
-            # page, unchanged and sequential (each page's
-            # result only depends on its own Gemini
-            # response, already available from Phase B).
+            # Boundary pipeline + cropping per page, unchanged
+            # and sequential (each page's result only depends
+            # on its own LLM response, already collected above).
             # ---------------------------------------------
 
             for prep in preps:
@@ -1342,14 +1657,12 @@ class PipelineService:
             # ARTICLE-LEVEL EXTRACTION
             # =================================================
 
-            article_extractor_engine = (
-                os.getenv(
-                    "ARTICLE_EXTRACTOR_ENGINE",
-                    "openai",
-                )
-                .strip()
-                .lower()
-            )
+            # Same per-document choice as boundary detection above
+            # (document_llm_provider), not a separate global
+            # ARTICLE_EXTRACTOR_ENGINE setting -- Hindi/Devanagari
+            # documents extract via Gemini, everything else via
+            # OpenAI, "local" only when LLM_PROVIDER=local.
+            article_extractor_engine = document_llm_provider
 
             print()
             print("=" * 60)
@@ -1381,7 +1694,7 @@ class PipelineService:
                 article_extractor = (
                     LocalArticleExtractor(
                         pages_per_batch=3,
-                        ocr_engine=self.ocr_engine,
+                        ocr_engine=active_ocr_engine,
                     )
                 )
 
@@ -1868,4 +2181,4 @@ class PipelineService:
             # Always clean temporary workspace
             # =================================================
 
-            WorkspaceManager().cleanup()
+            workspace_manager.cleanup()

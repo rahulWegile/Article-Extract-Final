@@ -35,17 +35,9 @@ class ArticleSearchService:
         newspaper = (newspaper or "").strip() or None
         publish_date = (publish_date or "").strip() or None
 
-        # Browsing by newspaper/date is allowed even without
-        # a text-search query.
-        if not query and not newspaper and not publish_date:
-
-            return {
-                "query": "",
-                "total": 0,
-                "limit": limit,
-                "offset": offset,
-                "results": [],
-            }
+        # No filters at all means "browse the entire archive" --
+        # the WHERE clauses below already treat an empty query and
+        # NULL newspaper/publish_date as "match everything".
 
         limit = max(
             1,

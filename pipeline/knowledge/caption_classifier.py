@@ -19,6 +19,17 @@ class CaptionClassifier:
         "file",
     }
 
+    # Hindi (Devanagari) equivalents. Checked separately against the
+    # raw (non-lowercased) text, since Devanagari has no case.
+    PREFIXES_DEVANAGARI = (
+        "फोटो",
+        "फ़ोटो",
+        "चित्र",
+        "तस्वीर",
+        "सौजन्य",
+        "फाइल फोटो",
+    )
+
     AGENCIES = {
         "ani",
         "pti",
@@ -28,6 +39,15 @@ class CaptionClassifier:
         "getty",
         "ians",
     }
+
+    # News agency names as commonly transliterated in Hindi text.
+    AGENCIES_DEVANAGARI = (
+        "पीटीआई",
+        "एएनआई",
+        "रॉयटर्स",
+        "एएफपी",
+        "आईएएनएस",
+    )
 
     MAX_WORDS = 25
 
@@ -61,6 +81,14 @@ class CaptionClassifier:
                 score += 0.45
                 break
 
+        else:
+
+            for prefix in self.PREFIXES_DEVANAGARI:
+
+                if text.startswith(prefix):
+                    score += 0.45
+                    break
+
         # ---------------------------------
         # News agencies
         # ---------------------------------
@@ -70,6 +98,14 @@ class CaptionClassifier:
             if agency in lower:
                 score += 0.35
                 break
+
+        else:
+
+            for agency in self.AGENCIES_DEVANAGARI:
+
+                if agency in text:
+                    score += 0.35
+                    break
 
         # ---------------------------------
         # Short descriptive text
@@ -82,7 +118,7 @@ class CaptionClassifier:
         # Ends with period
         # ---------------------------------
 
-        if text.endswith("."):
+        if text.endswith((".", "।", "॥")):
             score += 0.05
 
         return min(score, 1.0)

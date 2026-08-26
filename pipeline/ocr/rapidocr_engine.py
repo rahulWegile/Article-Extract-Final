@@ -1,7 +1,10 @@
 import cv2
+import os
+import threading
 import time
 
 from rapidocr import RapidOCR
+from rapidocr.utils.typings import LangRec, ModelType, OCRVersion
 
 from pipeline.ocr.ocr_models import OCRResult
 
@@ -23,11 +26,95 @@ OCR_CLASSES = {
 
 class RapidOCREngine:
 
-    def __init__(self):
+    # A Devanagari block whose average recognition confidence falls
+    # below this is retried with contrast enhancement + upscaling
+    # rather than accepted as-is (see _enhance_for_devanagari).
+    # English is left alone -- 0.95 average confidence was already
+    # measured there, and the enhancement is tuned for the specific
+    # failure mode of small, low-contrast matras/conjuncts, not for
+    # Latin script.
+    LOW_CONFIDENCE_THRESHOLD = 0.55
 
-        print("Loading RapidOCR...")
+    # Upscale factor applied only inside _enhance_for_devanagari.
+    ENHANCE_SCALE = 1.6
 
-        self.reader = RapidOCR()
+    # process_blocks() stops issuing further per-block retries once
+    # this much total time has passed since it was called (see
+    # process_blocks's TIME BUDGET note). Left with real margin
+    # under a 30s target -- the caller may want headroom for
+    # whatever runs after OCR in the same page-processing step.
+    DEFAULT_TIME_BUDGET_SECONDS = 25.0
+
+    # Native PaddleOCR runs the SAME Devanagari weights RapidOCR's
+    # ONNX export uses (confirmed: neither library ships a larger
+    # Devanagari model), but scored measurably higher on real text
+    # (0.9076 vs 0.9566 avg confidence, 26-line benchmark) -- a
+    # difference in the two runtimes' pre/post-processing, not model
+    # quality. It is recognition-only (no detector -- native
+    # PaddleOCR's own detector crashes on this machine), so it is
+    # used ONLY as a per-LINE retry for already-low-confidence lines,
+    # never as the primary pass: unconditional whole-page use both
+    # risks the 25s time budget (extrapolated ~33-42s on a dense
+    # page) and pays its ~660MB load cost (vs RapidOCR's 103MB for
+    # all three of its own models) on every document instead of only
+    # documents that actually need it.
+    #
+    # Ships disabled by default -- flip via this env var only after
+    # the manual accuracy spot-check in the project plan has been
+    # done. Confidence-improvement alone does not prove
+    # correctness-improvement.
+    NATIVE_DEVANAGARI_MODEL_NAME = "devanagari_PP-OCRv5_mobile_rec"
+
+    def __init__(self, lang="en"):
+
+        print(f"Loading RapidOCR (lang={lang})...")
+
+        self.lang = lang
+
+        if lang in ("hi", "hindi"):
+
+            # PP-OCRv6 (the package default) has no Devanagari
+            # recognition model -- only PP-OCRv4/v5 ship one.
+            # Detection/orientation stay on their normal defaults;
+            # only the recognition model is swapped, and only for
+            # documents already identified as Hindi.
+            self.reader = RapidOCR(
+                params={
+                    "Rec.lang_type": LangRec.DEVANAGARI,
+                    "Rec.ocr_version": OCRVersion.PPOCRV5,
+                    "Rec.model_type": ModelType.MOBILE,
+                }
+            )
+
+        else:
+
+            self.reader = RapidOCR()
+
+        # ----------------------------------------------------
+        # Native-paddle line-level retry (Hindi only, lazy, opt-in)
+        # ----------------------------------------------------
+
+        self._native_devanagari_recognizer = None
+
+        self._native_devanagari_unavailable = False
+
+        # Guards the lazy-load in _get_native_devanagari_recognizer
+        # so the background preload thread (started from
+        # process_blocks, see _start_native_devanagari_preload) and
+        # the retry loop calling the same method later can never
+        # both start constructing the model at once.
+        self._native_load_lock = threading.Lock()
+
+        self._native_load_thread = None
+
+        self._native_retry_enabled = (
+            lang in ("hi", "hindi")
+            and os.getenv(
+                "OCR_NATIVE_PADDLE_RETRY",
+                "0",
+            )
+            == "1"
+        )
 
         print("✓ RapidOCR loaded")
 
@@ -48,6 +135,457 @@ class RapidOCREngine:
             y2=block.y2,
 
             lines=[],
+        )
+
+    # ========================================================
+    # WHOLE-PAGE CONTRAST NORMALIZATION (every Hindi page)
+    # ========================================================
+
+    @staticmethod
+    def _normalize_contrast(image):
+        """
+        CLAHE contrast normalization applied to the whole page once,
+        before the single full-page OCR call, for Hindi documents.
+
+        This is deliberately different from _enhance_for_devanagari
+        below: that one is a targeted, upscaled retry paid for only
+        on a block that already scored poorly. This one runs
+        unconditionally on every Hindi page because it is cheap
+        (measured near-zero added time on a 4072x6368 page) and can
+        only help or be a no-op -- it corrects the specific kind of
+        degradation a real scan or phone photo introduces (uneven
+        lighting across the page), which a clean digitally-rendered
+        PDF simply does not have much of, so its benefit will not
+        show up as strongly on a rendered PDF as it will on an
+        actual scanned/photographed newspaper page.
+        """
+
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+
+        l_channel, a_channel, b_channel = cv2.split(lab)
+
+        clahe = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(16, 16),
+        )
+
+        l_channel = clahe.apply(l_channel)
+
+        merged = cv2.merge(
+            [l_channel, a_channel, b_channel]
+        )
+
+        return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
+    # ========================================================
+    # DEVANAGARI ENHANCEMENT (low-confidence retry only)
+    # ========================================================
+
+    @classmethod
+    def _enhance_for_devanagari(cls, crop):
+        """
+        Contrast-normalize and upscale a crop before a second OCR
+        attempt on a block that scored below LOW_CONFIDENCE_THRESHOLD.
+
+        Devanagari relies on small strokes above/below the headline
+        line -- matras and stacked conjuncts -- that are the first
+        detail lost to uneven scan lighting or a soft/small source
+        image. CLAHE evens out local contrast (a flat global
+        brightness/contrast adjustment does not help a scan with
+        uneven lighting across the block), and the upscale gives the
+        recognizer more pixels per stroke to work with.
+
+        This is intentionally NOT applied to every block: it costs a
+        second OCR pass, and unlike the initial full-page call
+        (proven at ~0.95 average confidence in normal light), it is
+        only worth paying for where the first pass already struggled.
+        """
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+        clahe = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8),
+        )
+
+        contrasted = clahe.apply(gray)
+
+        upscaled = cv2.resize(
+            contrasted,
+            None,
+            fx=cls.ENHANCE_SCALE,
+            fy=cls.ENHANCE_SCALE,
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+        blurred = cv2.GaussianBlur(upscaled, (0, 0), 3)
+
+        sharpened = cv2.addWeighted(
+            upscaled, 1.4,
+            blurred, -0.4,
+            0,
+        )
+
+        return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+
+    # ========================================================
+    # NATIVE-PADDLE LINE RETRY (Hindi, low-confidence lines only)
+    # ========================================================
+
+    def _get_native_devanagari_recognizer(self, wait_timeout=None):
+        """
+        Lazily build and cache the native-paddle Devanagari
+        recognizer for this engine instance.
+
+        Deliberately NOT imported at module level: a deployment
+        without paddlepaddle/paddlex installed must still be able to
+        import this whole file and run RapidOCR normally -- only
+        this one lazy path is affected if those packages are
+        missing.
+
+        `self._native_devanagari_unavailable` is sticky once set, so
+        a failed load is not retried on every subsequent block --
+        every call after the first failure short-circuits to None
+        immediately instead of repeating a known-doomed import/
+        construction attempt.
+
+        Guarded by `self._native_load_lock`: measured directly, this
+        construction call takes 17-27s (dominated by first-inference
+        JIT/graph warmup, not just building the model object -- a
+        second call on an already-loaded model measured 0.03-0.045s).
+        `_start_native_devanagari_preload` kicks this off in a
+        background thread as early as possible (see process_blocks)
+        so that cost overlaps with the full-page OCR pass instead of
+        landing inside the retry loop's own time budget.
+
+        `wait_timeout`: when the retry loop calls this (as opposed to
+        the background preload thread, which always waits until
+        done), it must NOT block past its own remaining time budget
+        if the preload happens to still be running -- e.g. on an
+        unusually fast full-page pass. Pass the remaining budget (or
+        some bounded slice of it) here; if the lock can't be acquired
+        within that window, this returns None WITHOUT marking the
+        recognizer unavailable (it may simply still be loading), so a
+        later call on the same or a later block can still succeed
+        once the background load finishes.
+        """
+
+        if self._native_devanagari_unavailable:
+            return None
+
+        if self._native_devanagari_recognizer is not None:
+            return self._native_devanagari_recognizer
+
+        if wait_timeout is not None:
+
+            acquired = self._native_load_lock.acquire(
+                timeout=max(0.0, wait_timeout)
+            )
+
+            if not acquired:
+                # Still loading and we're out of time to wait for
+                # it this call -- not a failure, just not ready yet.
+                return None
+
+        else:
+
+            self._native_load_lock.acquire()
+
+        try:
+
+            # Re-check inside the lock: another thread (the
+            # background preload, most likely) may have already
+            # finished the load while this call was waiting.
+
+            if self._native_devanagari_unavailable:
+                return None
+
+            if self._native_devanagari_recognizer is not None:
+                return self._native_devanagari_recognizer
+
+            try:
+
+                import paddlex
+
+                self._native_devanagari_recognizer = (
+                    paddlex.create_model(
+                        self.NATIVE_DEVANAGARI_MODEL_NAME,
+                        device="cpu",
+                    )
+                )
+
+            except Exception as exc:
+
+                self._native_devanagari_unavailable = True
+
+                print(
+                    "⚠ Native-paddle Devanagari recognizer "
+                    f"unavailable, staying on RapidOCR's own "
+                    f"retry for the rest of this document: {exc}"
+                )
+
+                return None
+
+        finally:
+
+            self._native_load_lock.release()
+
+        return self._native_devanagari_recognizer
+
+    def _start_native_devanagari_preload(self):
+        """
+        Kick off the native-paddle recognizer's cold load in a
+        background thread, called as early as possible in
+        process_blocks (before the full-page RapidOCR pass) so its
+        measured 17-27s cold-start cost overlaps with that pass's own
+        time instead of landing synchronously inside the budget-
+        constrained retry loop -- confirmed by direct testing to
+        otherwise consume the entire remaining budget on just the
+        first weak line encountered.
+
+        Safe to call every time process_blocks runs: a no-op once
+        already loaded, already known unavailable, or already
+        loading from an earlier call on this same engine instance.
+        """
+
+        if not self._native_retry_enabled:
+            return
+
+        if self._native_devanagari_recognizer is not None:
+            return
+
+        if self._native_devanagari_unavailable:
+            return
+
+        if (
+            self._native_load_thread is not None
+            and self._native_load_thread.is_alive()
+        ):
+            return
+
+        self._native_load_thread = threading.Thread(
+            target=self._get_native_devanagari_recognizer,
+            daemon=True,
+        )
+
+        self._native_load_thread.start()
+
+    def _native_paddle_recognize_line(self, line_crop):
+        """
+        Recognize ONE single-line crop via native paddle.
+
+        Returns (text, confidence) or None on any failure -- this is
+        the single choke point that guarantees a native-paddle crash
+        (this machine's paddle install has a confirmed detector-side
+        stability bug; recognition-only was confirmed working in
+        testing, but this must still never be trusted to not throw)
+        can never propagate out of the OCR pipeline.
+        """
+
+        model = self._get_native_devanagari_recognizer()
+
+        if model is None:
+            return None
+
+        try:
+
+            outputs = list(
+                model.predict(input=line_crop)
+            )
+
+            if not outputs:
+                return None
+
+            result = outputs[0]
+
+            text = str(
+                result.get("rec_text", "") or ""
+            ).strip()
+
+            confidence = float(
+                result.get("rec_score", 0.0) or 0.0
+            )
+
+            return text, confidence
+
+        except Exception as exc:
+
+            print(
+                "  WARNING: native-paddle line recognition "
+                f"failed, keeping existing reading: {exc}"
+            )
+
+            return None
+
+    def _retry_block_lines_with_native_paddle(
+        self,
+        block,
+        current_result,
+        results,
+        image,
+        overall_start,
+        time_budget_seconds,
+    ):
+        """
+        Retry only the individually-weak lines of one block through
+        native paddle, at LINE granularity.
+
+        This is line-level, not block-level, because native paddle's
+        recognizer has no detector of its own -- handed a multi-line
+        block crop it would read the whole thing as one line and
+        produce garbage. Each line already carries its own bbox (page
+        coordinates) and confidence from the initial full-page
+        RapidOCR pass, via current_result.lines.
+
+        Mutates `results[block.id]` in place when at least one line
+        improves; otherwise leaves it untouched.
+        """
+
+        height, width = image.shape[:2]
+
+        new_lines = []
+
+        any_changed = False
+
+        for line in current_result.lines:
+
+            line_confidence = (
+                line.get("confidence", 0.0) or 0.0
+            )
+
+            # ------------------------------------------------
+            # Time budget -- same expression/constant the outer
+            # per-block loop already uses, checked per LINE here
+            # so one block with many weak lines can't itself
+            # blow past budget between block-level checks.
+            # ------------------------------------------------
+
+            if (
+                time.perf_counter() - overall_start
+                >= time_budget_seconds
+            ):
+
+                new_lines.append(line)
+
+                continue
+
+            # ------------------------------------------------
+            # Only lines that are themselves weak -- a block can
+            # average below threshold while most of its lines
+            # are already fine.
+            # ------------------------------------------------
+
+            if (
+                line_confidence
+                >= self.LOW_CONFIDENCE_THRESHOLD
+            ):
+
+                new_lines.append(line)
+
+                continue
+
+            bbox = line.get("bbox") or {}
+
+            lx1 = max(0, int(bbox.get("x1", 0)))
+            ly1 = max(0, int(bbox.get("y1", 0)))
+            lx2 = min(width, int(bbox.get("x2", 0)))
+            ly2 = min(height, int(bbox.get("y2", 0)))
+
+            if lx2 <= lx1 or ly2 <= ly1:
+
+                new_lines.append(line)
+
+                continue
+
+            line_crop = image[ly1:ly2, lx1:lx2]
+
+            if line_crop.size == 0:
+
+                new_lines.append(line)
+
+                continue
+
+            # Native paddle's own preprocessing is resize +
+            # mean/std normalization only (no contrast handling),
+            # confirmed by reading its source -- this enhancement
+            # step is not redundant with anything paddle does
+            # internally.
+            enhanced_crop = self._enhance_for_devanagari(
+                line_crop
+            )
+
+            native_result = self._native_paddle_recognize_line(
+                enhanced_crop
+            )
+
+            self._native_retry_attempts += 1
+
+            if native_result is None:
+
+                self._native_retry_failures += 1
+
+                new_lines.append(line)
+
+                continue
+
+            native_text, native_confidence = native_result
+
+            if (
+                native_text
+                and native_confidence > line_confidence
+            ):
+
+                any_changed = True
+
+                new_lines.append(
+                    {
+                        "text": native_text,
+                        "confidence": native_confidence,
+                        # Recognition-only: no new geometry:
+                        # the line's own bbox is reused as-is.
+                        "bbox": bbox,
+                    }
+                )
+
+            else:
+
+                new_lines.append(line)
+
+        if not any_changed:
+            return
+
+        new_lines.sort(
+            key=lambda item: (
+                item["bbox"]["y1"],
+                item["bbox"]["x1"],
+            )
+        )
+
+        text = " ".join(
+            item["text"] for item in new_lines
+        )
+
+        confidences = [
+            item["confidence"] for item in new_lines
+        ]
+
+        confidence = (
+            sum(confidences) / len(confidences)
+            if confidences
+            else 0.0
+        )
+
+        results[block.id] = OCRResult(
+            text=text,
+
+            confidence=confidence,
+
+            x1=block.x1,
+            y1=block.y1,
+            x2=block.x2,
+            y2=block.y2,
+
+            lines=new_lines,
         )
 
     # ========================================================
@@ -256,7 +794,33 @@ class RapidOCREngine:
         self,
         image_path,
         blocks,
+        time_budget_seconds=None,
     ):
+
+        # ====================================================
+        # TIME BUDGET
+        #
+        # The full-page pass and any retryable low-confidence
+        # blocks together are not guaranteed to fit any particular
+        # ceiling on their own -- measured 27.3s on a 103-block page
+        # with 14 weak blocks, and each retry costs roughly another
+        # second, so a page with more weak blocks than that WOULD
+        # exceed a 30s target without an enforced stop. This is
+        # tracked from the very start of the call (not just the
+        # fallback loop) so the full-page pass itself counts against
+        # it too.
+        # ====================================================
+
+        overall_start = time.perf_counter()
+
+        if time_budget_seconds is None:
+            time_budget_seconds = self.DEFAULT_TIME_BUDGET_SECONDS
+
+        # Start the native-paddle recognizer's cold load now (if
+        # enabled) so its 17-27s one-time cost overlaps with the
+        # full-page OCR pass below instead of landing inside the
+        # retry loop's own budget later.
+        self._start_native_devanagari_preload()
 
         # ====================================================
         # READ PAGE ONCE
@@ -380,8 +944,27 @@ class RapidOCREngine:
             time.perf_counter()
         )
 
+        # Whole-page contrast normalization, Devanagari documents
+        # only. Cheap (measured near-zero added time on a 4072x6368
+        # page) and only ever helps or is a no-op, so it is applied
+        # unconditionally for Hindi rather than gated behind a
+        # confidence check the way the targeted per-block retry is.
+        # Kept as a SEPARATE image from `image` itself -- the crop-
+        # based fallback further below deliberately keeps reading
+        # from the untouched original, since a block that needs its
+        # own retry already gets its own purpose-built enhancement
+        # there (_enhance_for_devanagari), and stacking two contrast
+        # passes on top of each other has no benefit.
+        ocr_input = image
+
+        if self.lang in ("hi", "hindi"):
+
+            ocr_input = self._normalize_contrast(
+                image
+            )
+
         result = self.reader(
-            image
+            ocr_input
         )
 
         full_page_elapsed = (
@@ -707,7 +1290,54 @@ class RapidOCREngine:
 
         fallback_count = 0
 
+        budget_exhausted = False
+
+        skipped_for_budget = 0
+
+        self._native_retry_attempts = 0
+
+        self._native_retry_failures = 0
+
         for block in processed_blocks:
+
+            # ------------------------------------------------
+            # Time budget check
+            #
+            # Checked once per block rather than once for the
+            # whole loop so a page that starts well within budget
+            # but has an unusually large number of weak blocks
+            # still gets stopped partway through instead of
+            # running every retry regardless of how long it takes.
+            # ------------------------------------------------
+
+            if (
+                not budget_exhausted
+                and time.perf_counter() - overall_start
+                >= time_budget_seconds
+            ):
+
+                budget_exhausted = True
+
+                print(
+                    "⚠ OCR time budget "
+                    f"({time_budget_seconds:.0f}s) reached -- "
+                    "remaining blocks keep their current reading "
+                    "instead of being retried"
+                )
+
+            if budget_exhausted:
+
+                current_result = results.get(block.id)
+
+                current_has_text = bool(
+                    current_result
+                    and (current_result.text or "").strip()
+                )
+
+                if not current_has_text:
+                    skipped_for_budget += 1
+
+                continue
 
             current_result = results.get(
                 block.id
@@ -721,11 +1351,33 @@ class RapidOCREngine:
                 or ""
             ).strip()
 
+            current_confidence = (
+                current_result.confidence
+                or 0.0
+            )
+
             # ------------------------------------------------
-            # Already has text
+            # Decide whether this block needs a second pass.
+            #
+            # Empty result: always worth retrying (original
+            # behaviour, any language).
+            #
+            # Low-confidence Devanagari: the mobile Devanagari
+            # model is more sensitive to scan quality than the
+            # default model, and unlike an empty result there IS
+            # already a candidate reading here, so the enhanced
+            # retry's output only replaces it further below if it
+            # actually scores higher -- never blindly.
             # ------------------------------------------------
 
-            if current_text:
+            needs_enhancement = (
+                bool(current_text)
+                and self.lang in ("hi", "hindi")
+                and current_confidence
+                < self.LOW_CONFIDENCE_THRESHOLD
+            )
+
+            if current_text and not needs_enhancement:
 
                 continue
 
@@ -776,11 +1428,76 @@ class RapidOCREngine:
                 continue
 
             # ------------------------------------------------
+            # Native-paddle per-line retry (Hindi, opt-in)
+            #
+            # Tried first, ahead of the whole-block RapidOCR
+            # retry below: recognition-only native paddle scored
+            # measurably higher on real text in testing, but only
+            # when applied per LINE (see
+            # _retry_block_lines_with_native_paddle's docstring
+            # for why block-level would corrupt multi-line
+            # blocks). Falls through unchanged to the existing
+            # whole-block retry when disabled, not installed, or
+            # unavailable this run -- zero regression either way.
+            # ------------------------------------------------
+
+            if needs_enhancement and self._native_retry_enabled:
+
+                # Bounded wait, not an indefinite block: on an
+                # unusually fast full-page pass the background
+                # preload (started at the top of process_blocks)
+                # may not be done yet. Cap the wait well under
+                # whatever budget remains rather than risking most
+                # of it on just waiting for the load.
+                remaining_budget = (
+                    time_budget_seconds
+                    - (time.perf_counter() - overall_start)
+                )
+
+                wait_timeout = max(
+                    0.0,
+                    min(remaining_budget, 5.0),
+                )
+
+                recognizer = (
+                    self._get_native_devanagari_recognizer(
+                        wait_timeout=wait_timeout,
+                    )
+                )
+
+                if recognizer is not None:
+
+                    self._retry_block_lines_with_native_paddle(
+                        block,
+                        current_result,
+                        results,
+                        image,
+                        overall_start,
+                        time_budget_seconds,
+                    )
+
+                    continue
+
+            # ------------------------------------------------
             # Fallback OCR
             # ------------------------------------------------
 
+            coordinate_scale = 1.0
+
+            if needs_enhancement:
+
+                crop_for_ocr = (
+                    self._enhance_for_devanagari(crop)
+                )
+
+                coordinate_scale = self.ENHANCE_SCALE
+
+            else:
+
+                crop_for_ocr = crop
+
             fallback_result = self.reader(
-                crop
+                crop_for_ocr
             )
 
             fallback_count += 1
@@ -881,23 +1598,30 @@ class RapidOCREngine:
                         polygon
                     )
 
+                    # coordinate_scale > 1.0 when this crop was
+                    # enhanced/upscaled before OCR (see
+                    # _enhance_for_devanagari) -- without dividing
+                    # it back out here, an enhanced block's line
+                    # boxes would land at the wrong place on the
+                    # page, off by the upscale factor.
+
                     page_x1 = (
-                        crop_x1
+                        crop_x1 / coordinate_scale
                         + x1
                     )
 
                     page_y1 = (
-                        crop_y1
+                        crop_y1 / coordinate_scale
                         + y1
                     )
 
                     page_x2 = (
-                        crop_x2
+                        crop_x2 / coordinate_scale
                         + x1
                     )
 
                     page_y2 = (
-                        crop_y2
+                        crop_y2 / coordinate_scale
                         + y1
                     )
 
@@ -988,22 +1712,38 @@ class RapidOCREngine:
 
                     fallback_confidence = 0.0
 
-                results[
-                    block.id
-                ] = OCRResult(
-                    text=fallback_text,
+                # The empty-result path (needs_enhancement False)
+                # always has nothing to lose, so it always keeps
+                # the fallback. The low-confidence Devanagari retry
+                # DOES already have a candidate reading, so its
+                # enhanced result only replaces it when it actually
+                # scored higher -- an enhanced retry is not
+                # guaranteed to beat the original on every block.
 
-                    confidence=(
-                        fallback_confidence
-                    ),
-
-                    x1=block.x1,
-                    y1=block.y1,
-                    x2=block.x2,
-                    y2=block.y2,
-
-                    lines=fallback_lines,
+                keep_fallback = (
+                    not needs_enhancement
+                    or fallback_confidence
+                    > current_confidence
                 )
+
+                if keep_fallback:
+
+                    results[
+                        block.id
+                    ] = OCRResult(
+                        text=fallback_text,
+
+                        confidence=(
+                            fallback_confidence
+                        ),
+
+                        x1=block.x1,
+                        y1=block.y1,
+                        x2=block.x2,
+                        y2=block.y2,
+
+                        lines=fallback_lines,
+                    )
 
         # ====================================================
         # FALLBACK TIMING
@@ -1118,6 +1858,27 @@ class RapidOCREngine:
         print(
             f"Fallback calls    : "
             f"{fallback_count}"
+        )
+
+        if skipped_for_budget:
+
+            print(
+                f"Skipped (budget)  : "
+                f"{skipped_for_budget}"
+            )
+
+        if self._native_retry_attempts:
+
+            print(
+                f"Native retries    : "
+                f"{self._native_retry_attempts} "
+                f"({self._native_retry_failures} failed)"
+            )
+
+        print(
+            f"Total time        : "
+            f"{time.perf_counter() - overall_start:6.2f} sec "
+            f"(budget {time_budget_seconds:.0f}s)"
         )
 
         print("=" * 60)

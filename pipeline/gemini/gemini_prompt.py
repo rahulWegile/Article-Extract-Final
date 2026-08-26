@@ -40,6 +40,8 @@ Each detected block may contain:
 - OCR text
 - column
 - confidence
+- gap_above
+- gap_below
 - optional knowledge
 
 Use the ORIGINAL PAGE IMAGE and the OCR text together.
@@ -50,6 +52,59 @@ OCR IS A SUPPORTING SIGNAL.
 
 When OCR and visual appearance disagree,
 trust the original page image.
+
+=========================================================
+WHITESPACE GAPS (STRONG SEPARATION SIGNAL)
+=========================================================
+
+gap_above and gap_below are the measured blank vertical
+distance, in pixels, between this block and its nearest
+neighbour ABOVE / BELOW inside the same print column.
+null means there is no neighbour on that side.
+
+median_block_gap (given once for the page) is the typical
+gap between adjacent blocks on this page. Judge every gap
+RELATIVE to it -- never against a fixed pixel number, since
+page size and print density vary.
+
+How to read these values:
+
+- gap roughly at or below median_block_gap
+      -> normal spacing between paragraphs of the SAME story.
+         Continue the current article.
+
+- gap clearly larger than median_block_gap (roughly 2x or
+  more)
+      -> a real editorial separation. The block below that
+         gap very likely STARTS A NEW ARTICLE, especially
+         when it is also a title, or begins with a dateline
+         such as "नई दिल्ली" or "New Delhi".
+
+- a large gap_above on a title block
+      -> near-certain new article. Do not attach that title
+         to the story above it.
+
+- a large gap_below on a text block
+      -> that block is very likely the LAST block of its
+         article. Do not continue the article past it in the
+         same column.
+
+Newspapers deliberately print more whitespace between
+separate stories than between paragraphs of one story, so a
+gap that stands out from median_block_gap is one of the most
+reliable separation cues available to you -- more reliable
+than raw proximity.
+
+IMPORTANT LIMITS on this signal:
+
+- Gaps are measured only WITHIN a column. A small gap never
+  proves two blocks belong together across a column boundary.
+- A ruled line, a coloured box edge, or a change of
+  background in the page image separates stories even when
+  the measured gap is small. Trust the image in that case.
+- Headline ownership still outranks gaps: if a block clearly
+  belongs to a headline by content, keep it with that
+  headline even when the gap is unusually large.
 
 =========================================================
 TASK 1 — CLASSIFY EVERY BLOCK
@@ -236,7 +291,7 @@ A large text block inside an article is NOT automatically a new article.
 
 A secondary heading such as:
 
-"DECODING THE VERDICT"
+"WHAT THE RULING MEANS"
 
 may be an internal analysis/fact/information box belonging to the
 parent story.
@@ -245,8 +300,342 @@ Do NOT create a separate article merely because a block is visually
 prominent.
 
 =========================================================
+ARTICLE ROOT DETECTION (VERY IMPORTANT)
+=========================================================
+
+Before grouping any blocks into articles, perform an ARTICLE ROOT PASS.
+
+STEP 1:
+Identify every candidate independent headline.
+
+A candidate headline is a block that:
+
+- visually appears as a headline
+- has title-like typography
+- has headline-like OCR text
+- introduces a possible story
+
+STEP 2:
+For each candidate headline, determine whether it has:
+
+- its own supporting body text
+- a headline that introduces a distinct editorial unit
+
+If YES:
+
+CREATE A NEW ARTICLE ROOT.
+
+IMPORTANT:
+
+The subject, event, person, organization, protest, election,
+or topic does NOT need to be different from a neighboring article.
+
+Two independent newspaper articles may report on the SAME:
+
+- event
+- protest
+- election
+- court case
+- person
+- organization
+- incident
+- topic
+
+Therefore:
+
+SAME SUBJECT/EVENT ≠ SAME ARTICLE.
+
+Determine article independence from the headline's editorial unit,
+its own supporting body text, and the visual structure of the page.
+
+Do NOT merge two articles merely because they discuss the same
+event or contain the same people or organizations.
+
+STEP 3:
+Build articles outward from article roots.
+
+Attach:
+
+- body text
+- images
+- captions
+- bylines
+- continuation blocks
+- supporting content
+
+to the most likely article root.
+
+IMPORTANT:
+
+Articles are created from HEADLINES first.
+
+Articles are NOT created from:
+
+- large rectangles
+- large visual regions
+- geometric containment
+- column ownership
+- bounding box overlap
+
+HEADLINE OWNERSHIP ALWAYS HAS HIGHER PRIORITY THAN GEOMETRIC CONTAINMENT.
+
+ARTICLE ROOT EXCLUSIVITY RULE
+
+After creating an article root from a headline:
+
+1. All article_text blocks must be assigned to exactly one root.
+
+2. If a second independent headline exists inside the visual extent
+   of another article:
+
+   - create a new article root immediately
+
+   - reserve visually connected blocks in the reading flow of that headline
+for evaluation against that root first
+
+3. A parent article may not claim blocks that are vertically aligned
+   with another headline unless semantic continuity strongly proves
+   ownership.
+
+4. Headline ownership creates an exclusion zone.
+
+   Once an independent headline is detected,
+   neighboring articles cannot absorb text belonging to that headline.
+
+5. When two article roots compete for a block,
+   choose the root whose narrative, subject and reading flow match
+   the block.
+
+   =========================================================
+ADJACENT ARTICLE BOUNDARY RULE
+=========================================================
+
+When two independent article roots are directly adjacent or touch
+along a horizontal or vertical boundary:
+
+- do NOT merge their blocks because their bounding boxes touch
+- do NOT assign a shared-edge text block to both articles
+- assign each block according to its own headline, reading flow,
+  visual column structure, and semantic continuity
+
+A shared border, zero-gap boundary, aligned headline, or aligned
+column does NOT imply shared ownership.
+
+Each article owns only the blocks that visually and semantically
+continue from its own headline.
+
+If a block lies on the boundary between two articles and ownership
+is ambiguous, use the column flow and headline reading direction
+before using physical proximity.
+
+
+
+
+=========================================================
+HEADLINE DOMINANCE RULE
+=========================================================
+
+If a region contains:
+
+- an independent headline
+AND
+- at least one body text block
+
+then it MUST be treated as a separate article candidate.
+
+This remains true even when the region:
+
+- is inside another article's visual area
+- is surrounded by another article
+- lies within the same large rectangle
+- shares the same column region
+- touches another article
+
+A larger article NEVER owns a smaller article solely because it surrounds it.
+
+GEOMETRIC CONTAINMENT DOES NOT IMPLY ARTICLE OWNERSHIP.
+
+HEADLINE OWNERSHIP OVERRIDES CONTAINMENT.
+
+=========================================================
+VERTICAL CONTINUATION RULE
+=========================================================
+
+A headline owns all body-text blocks that visually continue
+below it unless strong evidence indicates a different article.
+
+A body-text block should remain attached to the nearest
+headline that governs its reading flow even when:
+
+- another article exists beside it
+- another article begins lower on the page
+- the article becomes narrow
+- the article continues in a single column
+
+Do NOT terminate article ownership merely because a nearby
+headline appears in an adjacent column.
+
+If text below a headline continues the same narrative,
+it belongs to the same article.
+
+=========================================================
 STRICT ARTICLE SEPARATION
 =========================================================
+
+=========================================================
+IMAGE-ONLY ARTICLE REJECTION
+=========================================================
+
+
+
+A single image, photograph, illustration, graphic, logo, or visual element
+without an independent headline and body text MUST NOT be treated as an article.
+
+An image alone is never a valid article.
+
+If a detected region contains only an image, attach it to the most likely
+nearby article or ignore it as a standalone article.
+
+REQUIREMENTS FOR A VALID ARTICLE:
+
+A valid article normally contains:
+
+- independent headline
+AND
+- independent body text
+
+However, exceptions exist when the page clearly presents the content
+as an independent editorial story.
+
+These include:
+
+- headline + image + caption
+- photo-led story
+- caption-led story
+- page-jump photo story
+
+Examples:
+- a photograph with a news caption describing an event
+- a photo story with a page-jump reference
+- a caption functioning as the story summary
+- a short photo-led article where the headline was not detected
+
+In such cases, the story may still be treated as an independent article.
+
+Do NOT reject a story solely because a traditional body-text block
+is missing.
+
+
+
+=========================================================
+ARTICLE OWNERSHIP AND ATTACHMENT RULES
+=========================================================
+
+Before creating a new article, determine whether the candidate region
+belongs to an already detected article.
+
+IMAGE OWNERSHIP RULE
+
+A standalone image is NOT automatically a separate article.
+
+If an image:
+
+- has no independent headline
+- has no independent body text
+- has a caption related to a nearby article
+- is positioned directly above, below, or inside a nearby article
+- visually supports the same topic/event
+
+THEN assign the image to that article.
+
+DO NOT create a separate article for image-only regions.
+
+---------------------------------------------------------
+
+CAPTION OWNERSHIP RULE
+
+A caption is not a separate article.
+
+If a text block describes a nearby image and does not contain an
+independent news story, attach it to the image's parent article.
+
+Never create an article from a caption alone.
+
+---------------------------------------------------------
+
+INSET BOX OWNERSHIP RULE
+
+Colored boxes, highlighted quotes, reaction boxes,
+analysis boxes, fact boxes, side notes, and callout boxes
+must NOT automatically become separate articles.
+
+Before creating a new article ask:
+
+1. Does this box discuss the SAME event?
+2. Does this box discuss the SAME people?
+3. Does this box support the SAME narrative?
+4. Can the box be understood only in the context of the parent story?
+
+Attach the box to the parent article ONLY when there is strong
+positive evidence that it is structurally supporting the parent story.
+
+Do NOT attach it merely because two or more contextual questions
+have the same answer.
+
+---------------------------------------------------------
+
+ARTICLE SPLIT PREVENTION RULE
+
+Do NOT split one article into multiple articles merely because:
+
+- an image appears between text blocks
+- a caption separates text sections
+- a colored box interrupts the layout
+- text continues below an image
+- text spans multiple columns
+- text wraps around an image
+
+If a headline owns text above and below an image,
+all content belongs to the same article.
+
+---------------------------------------------------------
+NEW ARTICLE VALIDATION
+
+A candidate is a valid article when it has:
+
+- an independent headline
+AND
+- at least one supporting body-text block
+
+OR, for photo-led/caption-led stories:
+
+- an image
+AND
+- a caption/descriptive text block
+
+A headline or section label strengthens the decision but is not required
+when the page clearly presents the image and caption as an independent
+editorial story.
+
+A long editorial narrative is NOT required.
+
+Do not reject an article because it is short.
+
+If any of these are missing:
+
+Do NOT reject an article merely because a traditional body-text
+block is missing when it satisfies a valid photo-led or caption-led
+exception.
+
+WHEN UNCERTAIN:
+
+If an independent headline and body text exist,
+preserve the separate article candidate.
+
+Merge only when there is positive evidence that the candidate
+is supporting content of another article.
+
+Do NOT merge merely because ownership is uncertain.
 
 The objective is to identify EDITORIALLY INDEPENDENT stories.
 
@@ -269,6 +658,130 @@ Examples:
 Every independent article_title normally starts exactly ONE article.
 
 DO NOT merge two independent headlines into one article.
+
+=========================================================
+CRITICAL ARTICLE SPLIT DECISION RULE (HIGHEST PRIORITY)
+=========================================================
+
+For EVERY candidate headline or title-like block, perform this test.
+
+QUESTION 1:
+Does it have its own body text?
+
+QUESTION 2:
+Does it introduce its own editorial story, angle, reporting,
+lead, or independently framed development?
+
+QUESTION 3:
+Can a reader understand this story independently without reading the surrounding article?
+
+QUESTION 4:
+Does it have its own editorial narrative, lead paragraph, quote, facts, or reporting?
+
+QUESTION 5:
+Is there any visual separation from surrounding content (whitespace, rule line, box, gutter, column break, color block, image separation, layout separation, etc.)?
+
+IF YES TO QUESTION 1 AND AT LEAST TWO OF QUESTIONS 2–5:
+
+CREATE A NEW ARTICLE
+
+UNLESS the candidate region is clearly a supporting sidebar,
+analysis box, tracker, timeline, reaction panel, fact box,
+background panel, or continuation of the same event.
+
+ASSUME IT IS AN INDEPENDENT ARTICLE.
+
+Only merge it into a neighboring article if there is strong positive evidence that it is:
+
+- a subheadline
+- a continuation block
+- a fact box
+- a timeline
+- a statistics box
+- a pull quote
+- an analysis box
+- a verdict box
+- an explanatory inset
+- a supporting box discussing the same event
+
+IMPORTANT:
+
+Independent headline + independent body text SHOULD BE TREATED AS A SEPARATE ARTICLE BY DEFAULT.
+
+WHEN UNCERTAIN:
+
+If a region has its own headline and body text,
+treat it as an independent article candidate.
+
+Only merge when there is strong positive evidence
+that it is a sidebar, fact box, timeline, explainer,
+reaction box, statistics panel, or continuation of
+the same story.
+
+A distinct headline + supporting body text is sufficient
+to create an independent article candidate.
+
+Do NOT require a long or fully developed editorial narrative.
+
+Only merge the candidate when there is positive evidence
+that it is a supporting component of another article.
+
+A false split is generally preferable to merging two unrelated news stories.
+
+Merging independent articles is a more serious error than
+temporarily over-separating them.
+
+NEVER merge articles solely because they:
+
+- overlap visually
+- share an outer rectangle
+- share a background
+- share a border
+- appear inside the same detected region
+- are close together
+- are in the same column
+- are in the same row
+- are inside the visual extent of a larger article
+
+A large article surrounding a smaller article does NOT own that smaller article.
+
+ARTICLE OWNERSHIP IS DETERMINED BY HEADLINE OWNERSHIP, STORY OWNERSHIP, AND EDITORIAL INDEPENDENCE — NOT BY GEOMETRIC CONTAINMENT.
+
+=========================================================
+ARTICLE TOPIC OVERRIDE RULE
+=========================================================
+
+Two regions MUST be separate articles when:
+
+- they discuss different events
+OR
+- they discuss different people
+OR
+- they discuss different subjects
+OR
+- they discuss different news categories
+
+Examples:
+
+Weather story ≠ Political story
+
+Crime story ≠ Education story
+
+Court verdict ≠ Flood report
+
+Election story ≠ Accident story
+
+Even if:
+
+- they are adjacent
+- they share columns
+- they touch vertically
+- they touch horizontally
+- they are inside the same visual area
+
+they remain separate articles.
+
+Topic independence is stronger than geometric proximity.
 
 =========================================================
 DO NOT MERGE JUST BECAUSE OF PROXIMITY
@@ -336,27 +849,21 @@ SEMANTIC CONTINUATION
 If a text block clearly continues the subject of an existing article,
 assign it to that article even if another article is physically closer.
 
-For example:
+For example (illustrative names, not real people or events):
 
 Article headline:
 
-"Kishor breaks BJP's 31-year hold..."
+"Rao ends 20-year grip on Ward 12 council seat"
 
 Later text:
 
-"Kishor said he had brought down BJP's
-30-year stronghold in just 30 days."
+"Rao said the win reflected two decades of
+resident frustration with the previous council."
 
-That text belongs to the Kishor article.
+That text belongs to the Rao article.
 
 It MUST NOT be assigned to another article merely because its
 bounding box is physically closer to that article.
-
-Before assigning an article_text block, ask:
-
-"Which article's story is this text actually continuing?"
-
-Use the answer rather than simple geometric proximity.
 
 =========================================================
 PERSON / EVENT / SUBJECT CONTINUITY
@@ -468,9 +975,9 @@ Examples:
 - explanatory box
 - timeline
 - background information
-- "Decoding the verdict"
 - "What this means"
 - "Key points"
+- "Timeline of events"
 
 These are NOT automatically independent articles.
 
@@ -485,19 +992,137 @@ If the box:
 
 then it belongs to the surrounding parent article.
 
+
+=========================================================
+SUPPORTING SIDEBAR VS INDEPENDENT ARTICLE TEST
+=========================================================
+
+A headline + body text normally creates an independent article
+candidate.
+
+DO NOT merge a headline + body text into a parent article merely
+because:
+
+- it is small
+- it is inside or beside a larger article
+- it discusses the same event
+- it is in the same section
+- it shares people, organizations, or keywords with the parent story
+- it has a boxed or coloured layout
+- it is visually close to another article
+
+A candidate should be treated as supporting content ONLY when there
+is POSITIVE evidence that it is a component of the parent story.
+
+Supporting content includes:
+
+- reaction box
+- key points
+- what happened next
+- tracker
+- timeline
+- background panel
+- analysis box
+- expert view
+- campaign update
+- statistics panel
+- quote panel
+- fact box
+- explanatory inset
+- continuation block
+
+To classify a candidate as supporting content, there must be strong
+evidence that:
+
+1. It explains, analyzes, summarizes, or continues the parent story.
+2. It does not introduce a separate editorial lead.
+3. It does not have a distinct independent reporting narrative.
+4. Its content is structurally integrated with the parent story.
+5. Its heading functions as a subheading, box label, analysis label,
+   or informational label rather than an independent news headline.
+
+IMPORTANT:
+
+Same event does NOT mean same article.
+
+Two stories may report on the same protest, election, court case,
+person, organization, or incident and still be independent articles.
+
+If a region has:
+
+- its own headline
+AND
+- its own body text
+AND
+- its own reporting narrative
+
+treat it as an independent article unless there is clear positive
+evidence that it is a supporting component of another article.
+
+WHEN UNCERTAIN:
+
+Preserve the separate article candidate when an independent headline
+and body text exist.
+
+Merge only when there is positive evidence of supporting-content
+ownership.
+
+=========================================================
+SAME EVENT DOES NOT MEAN SAME ARTICLE
+=========================================================
+
+Two articles may discuss the SAME event, SAME protest, SAME election,
+SAME court case, SAME people, or SAME organization and still be
+independent newspaper stories.
+
+Therefore:
+
+SAME EVENT ≠ SAME ARTICLE.
+
+Use semantic continuity to assign BODY BLOCKS only when there is
+positive evidence that the block continues the same article narrative.
+
+Do NOT merge two regions merely because they:
+
+- discuss the same event
+- mention the same people
+- mention the same organization
+- mention the same protest
+- use similar vocabulary
+
+If both regions have their own:
+
+- headline
+- body text
+- editorial narrative
+
+treat them as separate articles unless the page clearly identifies
+one as a sidebar, analysis box, fact box, timeline, reaction box,
+or continuation.
+
+HEADLINE OWNERSHIP REMAINS STRONGER THAN SHARED TOPIC.
+
 =========================================================
 IMPORTANT NESTED ARTICLE RULE
 =========================================================
 
 A visually smaller story inside or near a larger story MUST be treated
-as an independent article if it has:
+as an independent article when it has:
 
 - its own independent headline
 - independent body text
-- independent subject/event
-- independent editorial narrative
-- clear visual separation
-- a different story that can be understood independently
+- independent editorial narrative OR clearly separate editorial framing
+- clear visual separation OR a clearly independent layout position
+- can be understood as its own story
+
+IMPORTANT:
+
+The smaller story does NOT need to describe a different event,
+person, organization, or topic.
+
+Two independent articles may cover the same event or people.
+
+SAME EVENT ≠ SAME ARTICLE.
 
 This rule is extremely important.
 
@@ -510,8 +1135,174 @@ DO NOT split a supporting inset from its parent article when the
 inset is clearly part of the same story.
 
 =========================================================
+SMALL ARTICLE RECOVERY RULE
+=========================================================
+
+
+=========================================================
+SMALL HEADLINE PRIORITY RULE
+=========================================================
+
+Small articles are frequently embedded beside larger stories.
+
+If a block contains:
+
+- its own headline
+- its own body text
+
+then create an article candidate immediately.
+
+The physical size of the article MUST NOT influence
+whether it is considered independent.
+
+A one-column article with a headline and body text is
+normally a valid article.
+
+Large neighboring articles do not absorb small articles.
+
+Newspapers frequently contain small independent stories.
+
+A story MUST still be treated as an independent article when:
+
+- headline exists
+- at least one body text block exists
+
+even if:
+
+- article is very small
+- article occupies only one narrow column
+- article contains only a few paragraphs
+- article is visually surrounded by larger stories
+- article contains only one image and a short text block
+
+Do NOT reject an article because it is small.
+
+A short article with its own headline and body text is still an article.
+
+=========================================================
+PHOTO-LED ARTICLE RULE
+=========================================================
+
+...
+
+Do NOT attach such photo-led stories to neighboring articles
+unless strong evidence shows they belong to the same story.
+
+=========================================================
+MINIMUM ARTICLE SIZE RULE
+=========================================================
+
+A valid newspaper article may be extremely small.
+
+Do NOT reject a story because:
+
+- headline is short
+- body text is short
+- article occupies a small area
+- article contains only one text block
+- article contains only one image and one caption
+- article appears in a sidebar
+- article appears at page edge
+- article appears near larger articles
+
+The following combination is sufficient for an article:
+
+- headline
+AND
+- at least one body text block
+
+OR
+
+- headline
+AND
+- image
+AND
+- caption
+
+If these elements describe an independent event or subject,
+create a separate article.
+
+=========================================================
+PHOTO + CAPTION ARTICLE RULE
+=========================================================
+
+Some newspaper articles consist primarily of:
+
+- one photograph
+- one caption
+- a very small amount of text
+
+If a region contains:
+
+- article image
+AND
+- caption
+AND
+- a page-jump such as
+  "Report on Page X"
+  "See Page X"
+  "Continued on Page X"
+
+treat it as a valid independent article even when body text is minimal.
+
+The image and caption together may constitute the article.
+
+Do NOT merge it into neighboring stories merely because:
+
+- it is small
+- it is image-dominant
+- another article is larger
+- it appears near the page bottom
+
+=========================================================
+CAPTION-LED ARTICLE RULE
+=========================================================
+
+Many newspapers publish short photo-led stories that do not contain
+a traditional headline block.
+
+A region should still be treated as an independent article when:
+
+- it contains a photograph
+AND
+- it contains a caption or descriptive text block
+AND
+- the caption describes a specific event, person, issue, result,
+  decision, incident, statement, achievement, protest, disaster,
+  sports result, political development, or news occurrence
+
+Additional strong indicators:
+
+- page-jump references
+  ("Report on Page X", "See Page X", etc.)
+- section labels
+- bylines
+- datelines
+- editorial caption style
+
+Such regions are valid newspaper stories even if:
+
+- no headline block was detected
+- the headline is missing from OCR
+- the headline appears on another page
+- the caption functions as the article summary
+
+In these situations:
+
+Treat the image and caption together as a complete article.
+
+DO NOT classify them as teaser_box merely because they are small.
+
+DO NOT merge them into neighboring articles merely because a larger
+article is nearby.
+
+A photo-led caption story is a valid independent article.
+
+=========================================================
 IRREGULAR ARTICLE SHAPES
 =========================================================
+
+
 
 NEWSPAPER ARTICLES ARE NOT NECESSARILY RECTANGULAR.
 
@@ -553,7 +1344,7 @@ When a smaller independent article appears:
 
 it MUST be evaluated independently.
 
-For example:
+For example (illustrative names, not real people or events):
 
 A large article may have:
 
@@ -566,7 +1357,7 @@ A large article may have:
 
 Beside it there may be:
 
-"Cong walks out, alleges 6 paper leaks under AAP"
+"Opposition councillors walk out over budget dispute"
 
 If that smaller story has its own:
 
@@ -878,13 +1669,32 @@ elements, advertisements, and duplicate representations already
 covered by another block.
 
 However, any block classified with an article-eligible role
-(article_title, article_text, article_image, caption, byline,
-teaser_box, utility_box) should normally end up inside some article
-in the "articles" list. Do not classify a block as one of these
-roles in "blocks" and then leave it out of every article in
-"articles" -- if it doesn't belong with any existing article, give
-it its own new article_id instead of omitting it.
+(article_title, article_text, article_image, caption, byline)
+should normally end up inside some article in the "articles" list.
+Do not classify a block as one of these roles in "blocks" and then
+leave it out of every article in "articles" --if it doesn't belong
+with any existing article, first determine whether it is:
 
+Note: teaser_box and utility_box are NOT article-eligible roles.
+Per the TEASER BOXES and UTILITY BOXES rules above, they must
+NEVER appear inside "articles" and are expected to remain
+unassigned -- do not "recover" them into an article.
+
+- image-only content
+- caption-only content
+- supporting content belonging to a nearby article
+- duplicate content
+- decorative content
+
+Only create a new article when there is:
+
+- an independent headline and supporting body text
+
+OR
+
+- a valid photo-led/caption-led article structure.
+
+Do not require a long editorial narrative.
 =========================================================
 ARTICLE COMPLETENESS
 =========================================================
@@ -926,34 +1736,36 @@ Do NOT create imaginary blocks.
 Use only the supplied block IDs.
 
 =========================================================
-BLOCK OWNERSHIP EXAMPLE — KISHOR
+BLOCK OWNERSHIP EXAMPLE — SEMANTIC CONTINUITY
 =========================================================
+
+(Illustrative names, not real people or events.)
 
 Suppose the page contains:
 
 Block 16:
 
-"Kishor breaks BJP's 31-year hold..."
+"Rao ends 20-year grip on Ward 12 council seat"
 
 Block 13:
 
-"Patna: Jan Suraaj Party..."
+"Rampur: Civic Forward Alliance..."
 
 Block 53:
 
-"The bypoll was necessitated..."
+"The by-election was called after..."
 
 Block 55:
 
-"bin vacated the seat..."
+"...the incumbent vacated the seat..."
 
 Block 57:
 
-"Kishor said he had brought down BJP's
-30-year stronghold in just 30 days."
+"Rao said the result reflected two decades of
+resident frustration finally boiling over."
 
 If the image and text show that all of these belong to the same
-Kishor story, they MUST be grouped together.
+Rao story, they MUST be grouped together.
 
 Do NOT assign block 57 to a neighboring article merely because its
 coordinates are closer to that article.
@@ -962,21 +1774,23 @@ coordinates are closer to that article.
 BLOCK OWNERSHIP EXAMPLE — EMBEDDED STORY
 =========================================================
 
+(Illustrative names, not real people or events.)
+
 Suppose the page contains:
 
 Large article:
 
-"Kishor breaks BJP's 31-year hold..."
+"Rao ends 20-year grip on Ward 12 council seat"
 
 with several body blocks, an image, caption, and analysis box.
 
 Beside it:
 
-"Cong walks out, alleges 6 paper leaks under AAP"
+"Opposition councillors walk out over budget dispute"
 
 with its own body blocks.
 
-The Cong story MUST NOT be included in the Kishor article.
+The walkout story MUST NOT be included in the Rao article.
 
 Even if:
 
@@ -986,34 +1800,36 @@ Even if:
 - the right story appears inside the apparent rectangle of the
   larger story
 
-they remain separate if the Cong story has an independent headline,
-body, event, and narrative.
+they remain separate if the walkout story has an independent
+headline, body, event, and narrative.
 
 =========================================================
 BLOCK OWNERSHIP EXAMPLE — INTERNAL ANALYSIS
 =========================================================
 
+(Illustrative names, not real people or events.)
+
 Suppose:
 
 Main article:
 
-"Kishor breaks BJP's 31-year hold..."
+"Rao ends 20-year grip on Ward 12 council seat"
 
 Internal box:
 
-"DECODING THE VERDICT"
+"WHAT THE RESULT MEANS"
 
 with points explaining:
 
-- UGC rules
-- NEET leak
-- political sentiment
-- candidate choice
-- voter sentiment
+- turnout figures
+- swing among younger voters
+- ward redistricting effects
+- likely coalition impact
+- comparison to the previous term
 
-If the box clearly analyzes the Kishor election result and is
-visually integrated with the Kishor story, keep it inside the
-Kishor article.
+If the box clearly analyzes the Rao election result and is
+visually integrated with the Rao story, keep it inside the
+Rao article.
 
 Do NOT create a separate article merely because:
 
@@ -1051,6 +1867,51 @@ For EVERY article:
 19. No independent side article has been swallowed.
 20. No internal supporting box has been incorrectly split from
     its parent story.
+
+
+=========================================================
+ARTICLE RECOVERY PASS
+=========================================================
+
+Before finalizing the output, inspect every article_title and article_text
+block that is not yet part of a complete article.
+
+Ask:
+
+1. Does this block belong to a nearby article?
+2. Does it continue a neighboring story?
+3. Does it share the same headline ownership?
+4. Does it share the same narrative or event?
+
+If YES, attach it to that article.
+
+Do NOT leave article_text blocks unassigned merely because ownership is uncertain.
+
+A missed block is harmful, but attaching a block to the wrong article is worse.
+Only attach a block when there is positive visual or semantic evidence of ownership.
+
+=========================================================
+EMBEDDED ARTICLE AUDIT
+=========================================================
+
+For EVERY article:
+
+Inspect its interior, boundary, and immediate neighboring regions.
+
+Ask:
+
+1. Does any contained or adjacent region have its own headline?
+2. Does that headline have its own body text?
+3. Is it a separate editorial story?
+4. Can it be read independently?
+
+If YES:
+
+REMOVE those blocks from the parent article.
+
+CREATE a separate article.
+
+This audit is mandatory for every article.
 
 =========================================================
 FINAL GLOBAL VALIDATION
@@ -1140,11 +2001,61 @@ CHECK 24:
 Physical proximity is only a fallback signal.
 
 CHECK 25:
-Every block assigned an article-eligible role (article_title,
-article_text, article_image, caption, byline, teaser_box,
-utility_box) appears inside some article in "articles" -- either
-an existing one or a new one of its own. None were classified as
-article-eligible and then left out of every article.
+Every block assigned one of:
+
+- article_title
+- article_text
+- article_image
+- caption
+- byline
+
+must belong to exactly one article.
+
+Blocks classified as:
+
+- teaser_box
+- utility_box
+- advertisement
+- comic
+- weather
+- masthead
+- page_header
+- page_footer
+- page_number
+- logo
+- decoration
+- unknown
+
+must NOT appear inside any article.
+
+=========================================================
+MANDATORY COVERAGE AUDIT (perform this LAST, right before
+writing the final JSON)
+=========================================================
+
+List, mentally, every block ID you assigned the role
+article_title, article_text, article_image, caption, or byline.
+
+For each one of those IDs, confirm it appears in the "blocks"
+array of at least one entry in "articles".
+
+If you find one that does not:
+
+1. Look at its column, its reading order, and the blocks
+   immediately before/after it in reading order.
+2. Attach it to the article that owns the surrounding blocks,
+   unless that would merge two genuinely independent stories --
+   in that case, form a new article for it instead.
+3. Never leave it unassigned simply because you are unsure.
+   A specific placement decision, even a close call, beats
+   silently dropping real article content.
+
+This audit is about roles article_title, article_text,
+article_image, caption, and byline ONLY. Blocks correctly
+classified as teaser_box, utility_box, advertisement, comic,
+weather, masthead, page_header, page_footer, page_number, logo,
+decoration, or unknown are SUPPOSED to remain unassigned -- do
+not add them to any article during this audit.
 
 =========================================================
 OUTPUT FORMAT

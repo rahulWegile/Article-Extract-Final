@@ -1,17 +1,25 @@
 import json
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 
 from backend.core.settings import DOCUMENTS_DIR
 from backend.services.document_manager import DocumentManager
+from backend.services import boundary_editor
 
 from backend.models.document import (
     DocumentSummary,
     DocumentDetail,
     PageResponse,
+    PageBoundariesResponse,
+    BoundaryUpdateRequest,
+    BoundaryUpdateResponse,
+    BoundaryDeleteResponse,
 )
 
 from pipeline.database.delete_document import delete_document_from_db
+from pipeline.export.pdf_export import export_document_pdf
 
 
 router = APIRouter()
@@ -131,6 +139,11 @@ def get_page(
         f"page_{page_number:03d}_final_boundaries.png"
     )
 
+    plain_image_url = (
+        f"/documents/{document_id}/pages/"
+        f"page_{page_number:03d}.png"
+    )
+
     return {
 
         "document_id": document_id,
@@ -143,7 +156,137 @@ def get_page(
 
         "image": image_url,
 
+        "plain_image": plain_image_url,
+
     }
+
+
+@router.get(
+    "/documents/{document_id}/page/{page_number}/boundaries",
+    response_model=PageBoundariesResponse,
+)
+def get_page_boundaries(
+    document_id: str,
+    page_number: int,
+):
+
+    document_dir = DOCUMENTS_DIR / document_id
+
+    if not document_dir.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    boundaries = boundary_editor.list_page_boundaries(
+        document_dir,
+        page_number,
+    )
+
+    return {
+        "document_id": document_id,
+        "page": page_number,
+        "boundaries": boundaries,
+    }
+
+
+@router.post(
+    "/documents/{document_id}/page/{page_number}/boundaries",
+    response_model=BoundaryUpdateResponse,
+)
+def update_page_boundary(
+    document_id: str,
+    page_number: int,
+    payload: BoundaryUpdateRequest,
+):
+
+    document_dir = DOCUMENTS_DIR / document_id
+
+    if not document_dir.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    try:
+
+        result = boundary_editor.save_boundary_and_reextract(
+            document_dir=document_dir,
+            document_id=document_id,
+            page_number=page_number,
+            article_id=payload.article_id,
+            bbox=payload.bbox.model_dump(),
+        )
+
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return result
+
+
+@router.delete(
+    "/documents/{document_id}/page/{page_number}/boundaries/{article_id}",
+    response_model=BoundaryDeleteResponse,
+)
+def delete_page_boundary(
+    document_id: str,
+    page_number: int,
+    article_id: str,
+):
+
+    document_dir = DOCUMENTS_DIR / document_id
+
+    if not document_dir.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    try:
+
+        result = boundary_editor.delete_boundary(
+            document_dir=document_dir,
+            document_id=document_id,
+            page_number=page_number,
+            article_id=article_id,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return result
+
+
+@router.get("/documents/{document_id}/export/pdf")
+def export_pdf(document_id: str):
+
+    document_dir = DOCUMENTS_DIR / document_id
+
+    if not document_dir.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    metadata_file = document_dir / "document.json"
+
+    if not metadata_file.exists():
+        raise HTTPException(status_code=404, detail="Metadata not found")
+
+    with open(
+        metadata_file,
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        metadata = json.load(f)
+
+    try:
+        pdf_path = export_document_pdf(document_dir)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    pdf_name = Path(metadata["pdf_name"]).stem
+
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename=f"{pdf_name}_boundaries.pdf",
+    )
 
 
 @router.delete("/documents/{document_id}")

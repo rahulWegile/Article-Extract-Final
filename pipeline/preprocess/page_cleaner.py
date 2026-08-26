@@ -206,6 +206,22 @@ class PageCleaner:
             "DECCAN CHRONICLE",
         ]
 
+        # Devanagari has no case, so these are matched against the
+        # raw (non-uppercased) text below instead of `.upper()`.
+        mastheads_devanagari = [
+            "दैनिक भास्कर",
+            "दैनिक जागरण",
+            "अमर उजाला",
+            "नवभारत टाइम्स",
+            "हिंदुस्तान",
+            "हिन्दुस्तान",
+            "राजस्थान पत्रिका",
+            "पंजाब केसरी",
+            "जनसत्ता",
+            "नई दुनिया",
+            "पत्रिका",
+        ]
+
         top_limit = page_height * 0.12
 
         detected = 0
@@ -230,11 +246,13 @@ class PageCleaner:
             ):
                 block.column = -1
 
-            text = getattr(
+            raw_text = getattr(
                 block,
                 "text",
                 "",
-            ).upper()
+            )
+
+            text = raw_text.upper()
 
             #
             # Masthead must be near top.
@@ -246,6 +264,9 @@ class PageCleaner:
             if any(
                 name in text
                 for name in mastheads
+            ) or any(
+                name in raw_text
+                for name in mastheads_devanagari
             ):
 
                 block.type = "masthead"
@@ -315,6 +336,41 @@ class PageCleaner:
             "DEC",
         ]
 
+        # Devanagari equivalents. Checked against the raw text
+        # (case-insensitivity doesn't apply to this script).
+        keywords_devanagari = [
+            "सोमवार",
+            "मंगलवार",
+            "बुधवार",
+            "गुरुवार",
+            "शुक्रवार",
+            "शनिवार",
+            "रविवार",
+
+            "मूल्य",
+            "कीमत",
+            "पृष्ठ",
+            "अंक",
+            "वर्ष",
+            "संस्करण",
+
+            "जनवरी",
+            "फरवरी",
+            "मार्च",
+            "अप्रैल",
+            "मई",
+            "जून",
+            "जुलाई",
+            "अगस्त",
+            "सितंबर",
+            "सितम्बर",
+            "अक्टूबर",
+            "नवंबर",
+            "नवम्बर",
+            "दिसंबर",
+            "दिसम्बर",
+        ]
+
         top_limit = page_height * 0.15
 
         detected = 0
@@ -355,6 +411,15 @@ class PageCleaner:
             r"\bEDITION\b",
         ]
 
+        # Devanagari equivalents (checked against the raw text).
+        metadata_patterns_devanagari = [
+            r"मूल्य\s*[:₹]?\s*\d+",
+            r"कीमत\s*[:₹]?\s*\d+",
+            r"पृष्ठ\s+\d+",
+            r"अंक\s*\d+",
+            r"वर्ष\s*\d+",
+        ]
+
         #
         # Standalone date/day patterns.
         #
@@ -383,6 +448,32 @@ class PageCleaner:
                 OCT(?:OBER)?|
                 NOV(?:EMBER)?|
                 DEC(?:EMBER)?
+            )
+            (
+                \s+\d{1,2}
+            )?
+            (
+                \s*,?\s+\d{4}
+            )?
+            \s*
+            $
+            """,
+            re.VERBOSE,
+        )
+
+        # Devanagari equivalent (day and/or month name, optionally
+        # followed by a day number and/or year). Devanagari has no
+        # case, so this is matched against the raw text, not upper().
+        standalone_day_or_date_devanagari = re.compile(
+            r"""
+            ^
+            \s*
+            (
+                सोमवार|मंगलवार|बुधवार|गुरुवार|
+                शुक्रवार|शनिवार|रविवार|
+                जनवरी|फरवरी|मार्च|अप्रैल|मई|जून|
+                जुलाई|अगस्त|सितंबर|सितम्बर|
+                अक्टूबर|नवंबर|नवम्बर|दिसंबर|दिसम्बर
             )
             (
                 \s+\d{1,2}
@@ -547,6 +638,9 @@ class PageCleaner:
             matched_keyword = any(
                 word in text_upper
                 for word in keywords
+            ) or any(
+                word in text
+                for word in keywords_devanagari
             )
 
             if not matched_keyword:
@@ -564,6 +658,12 @@ class PageCleaner:
                     text_upper,
                 )
                 for pattern in metadata_patterns
+            ) or any(
+                re.search(
+                    pattern,
+                    text,
+                )
+                for pattern in metadata_patterns_devanagari
             )
 
             #
@@ -573,6 +673,10 @@ class PageCleaner:
             standalone_match = bool(
                 standalone_day_or_date.fullmatch(
                     text_upper
+                )
+            ) or bool(
+                standalone_day_or_date_devanagari.fullmatch(
+                    text
                 )
             )
 
@@ -666,6 +770,13 @@ class PageCleaner:
             r"^[A-Z ]+\s+\d+$"
         )
 
+        # Devanagari has no uppercase, so the Latin-only pattern
+        # above never matches a Hindi section header (e.g. "खेल 4").
+        # Matched against the raw text instead of `.upper()`.
+        pattern_devanagari = re.compile(
+            r"^[ऀ-ॿ ]+\s*\d+$"
+        )
+
         detected = 0
 
         for block in blocks:
@@ -688,6 +799,8 @@ class PageCleaner:
 
             if pattern.match(
                 text.upper()
+            ) or pattern_devanagari.match(
+                text
             ):
 
                 block.type = (
@@ -745,12 +858,29 @@ class PageCleaner:
                 r"^IMAGE\s*:",
             ]
 
+            # Devanagari equivalents, checked against the raw text.
+            caption_patterns_devanagari = [
+                r"^फोटो\s*:",
+                r"^फ़ोटो\s*:",
+                r"^फाइल\s*फोटो",
+                r"^तस्वीर\s*:",
+                r"^चित्र\s*:",
+                r"^सौजन्य\s*:",
+                r"^तस्वीर\s*सौजन्य",
+            ]
+
             is_caption = any(
                 re.search(
                     pattern,
                     text_upper,
                 )
                 for pattern in caption_patterns
+            ) or any(
+                re.search(
+                    pattern,
+                    text,
+                )
+                for pattern in caption_patterns_devanagari
             )
 
             if is_caption:

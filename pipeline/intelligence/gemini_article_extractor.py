@@ -256,7 +256,8 @@ class GeminiArticleExtractor:
 
         batches = (
             self._make_page_batches(
-                pages
+                pages,
+                page_inventory,
             )
         )
 
@@ -817,10 +818,70 @@ class GeminiArticleExtractor:
                 )
 
         if not article_manifest:
-            raise RuntimeError(
-                "No article crops found for "
-                f"pages {page_numbers}"
+
+            # A batch with zero article crops is a normal outcome for
+            # pages that are entirely advertisements/masthead/chrome
+            # (no editorial content at all), not a pipeline failure --
+            # skip this batch instead of aborting the whole document.
+            # Pending continuations pass through unchanged: nothing in
+            # an empty batch could resolve or create any.
+
+            print()
+            print(
+                f"⚠ No article crops for pages {page_numbers} "
+                "(likely all-advertisement/chrome pages) -- "
+                "skipping this batch."
             )
+
+            result = {
+                "batch_id": f"batch_{batch_index:03d}",
+                "pages": page_numbers,
+                "model": self.model,
+                "requested_article_count": 0,
+                "returned_article_count": 0,
+                "pending_entering_batch": 0,
+                "continuation_links": [],
+                "pending_continuations": pending_continuations,
+                "validation": {
+                    "expected": 0,
+                    "returned": 0,
+                    "missing": [],
+                    "unexpected": [],
+                    "duplicates": [],
+                    "complete": True,
+                },
+                "continuation_validation": {
+                    "valid": True,
+                    "errors": [],
+                    "valid_links": [],
+                },
+                "pending_validation": {
+                    "valid": True,
+                    "errors": [],
+                },
+                "articles": [],
+                "skipped": True,
+            }
+
+            output_path = (
+                output_root
+                / f"batch_{batch_index:03d}.json"
+            )
+
+            with open(
+                output_path,
+                "w",
+                encoding="utf-8",
+            ) as f:
+
+                json.dump(
+                    result,
+                    f,
+                    indent=4,
+                    ensure_ascii=False,
+                )
+
+            return result
 
         # ====================================================
         # PENDING CONTINUATION INFORMATION
@@ -2983,28 +3044,92 @@ Return JSON only.
     # CREATE PAGE BATCHES
     # ========================================================
 
+    # Defense-in-depth safety margin, not a documented platform limit.
+    # A 47-crop batch was observed failing with a connection error and
+    # a 61-crop/~29MB batch with a 400 (on the OpenAI side); these
+    # caps sit comfortably below both while the timeout increase
+    # elsewhere separately addresses the likely slow-upload cause.
+    MAX_CROPS_PER_BATCH = 25
+    MAX_BATCH_BYTES = 15 * 1024 * 1024
+
     def _make_page_batches(
         self,
         pages: list[int],
+        page_inventory: dict[int, list[dict[str, Any]]] | None = None,
     ) -> list[list[int]]:
 
-        batches = []
+        if not page_inventory:
+            # No crop-size information available -- fall back to the
+            # original fixed page-count chunking.
+            batches = []
+            for start in range(
+                0, len(pages), self.pages_per_batch
+            ):
+                batches.append(
+                    pages[start:start + self.pages_per_batch]
+                )
+            return batches
 
-        for start in range(
-            0,
-            len(pages),
-            self.pages_per_batch,
-        ):
+        def _page_stats(page_number: int) -> tuple[int, int]:
+            articles = page_inventory.get(page_number, [])
+            crop_count = len(articles)
+            total_bytes = 0
+            for article in articles:
+                try:
+                    total_bytes += (
+                        Path(article["image_path"]).stat().st_size
+                    )
+                except OSError:
+                    pass
+            return crop_count, total_bytes
 
-            batch = pages[
-                start:
-                start
-                + self.pages_per_batch
-            ]
+        batches: list[list[int]] = []
+        current_batch: list[int] = []
+        current_crops = 0
+        current_bytes = 0
 
-            batches.append(
-                batch
+        for page_number in pages:
+
+            page_crops, page_bytes = _page_stats(page_number)
+
+            would_exceed = (
+                current_batch
+                and (
+                    len(current_batch) >= self.pages_per_batch
+                    or current_crops + page_crops > self.MAX_CROPS_PER_BATCH
+                    or current_bytes + page_bytes > self.MAX_BATCH_BYTES
+                )
             )
+
+            if would_exceed:
+                batches.append(current_batch)
+                current_batch = []
+                current_crops = 0
+                current_bytes = 0
+
+            current_batch.append(page_number)
+            current_crops += page_crops
+            current_bytes += page_bytes
+
+            if (
+                len(current_batch) == 1
+                and (
+                    page_crops > self.MAX_CROPS_PER_BATCH
+                    or page_bytes > self.MAX_BATCH_BYTES
+                )
+            ):
+                print(
+                    f"WARNING: page {page_number} alone has "
+                    f"{page_crops} crops ({page_bytes / 1024 / 1024:.1f} MB), "
+                    f"already over the per-batch safety margin "
+                    f"({self.MAX_CROPS_PER_BATCH} crops / "
+                    f"{self.MAX_BATCH_BYTES / 1024 / 1024:.0f} MB) -- "
+                    "sending it alone anyway since a page's crops "
+                    "can't be split across batches."
+                )
+
+        if current_batch:
+            batches.append(current_batch)
 
         return batches
 

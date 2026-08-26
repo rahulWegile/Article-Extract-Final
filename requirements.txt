@@ -9,6 +9,15 @@ pillow==10.3.0
 tqdm==4.67.3
 python-dotenv==1.2.2
 rapidocr==3.9.2
+
+# Optional: only used by rapidocr_engine.py's native-paddle
+# low-confidence Devanagari line retry, gated behind
+# OCR_NATIVE_PADDLE_RETRY=1 (disabled by default). The lazy-load
+# path degrades gracefully if these are missing -- not a hard
+# dependency for the rest of the pipeline.
+paddlepaddle==3.3.1
+paddlex==3.7.2
+
 sentence-transformers==5.7.0
 google-genai==2.10.0
 openai==2.20.0

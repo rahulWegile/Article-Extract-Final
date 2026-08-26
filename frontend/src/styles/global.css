@@ -409,6 +409,36 @@ body{
 
 }
 
+.save-pdf-button{
+
+    flex-shrink:0;
+
+    text-decoration:none;
+
+    color:#ffffff;
+
+    font-weight:600;
+
+    font-size:14px;
+
+    background:#2563eb;
+
+    padding:8px 14px;
+
+    border-radius:999px;
+
+    white-space:nowrap;
+
+    transition:background .2s;
+
+}
+
+.save-pdf-button:hover{
+
+    background:#1d4ed8;
+
+}
+
 .image-container{
 
     position:relative;
@@ -534,15 +564,87 @@ body{
 
 }
 
+.zoom-slider{
+
+    -webkit-appearance:none;
+
+    appearance:none;
+
+    width:120px;
+
+    height:4px;
+
+    border-radius:2px;
+
+    background:#c7d2e8;
+
+    cursor:pointer;
+
+}
+
+.zoom-slider::-webkit-slider-thumb{
+
+    -webkit-appearance:none;
+
+    appearance:none;
+
+    width:16px;
+
+    height:16px;
+
+    border-radius:50%;
+
+    background:#2563eb;
+
+    border:2px solid white;
+
+    box-shadow:0 1px 3px rgba(0,0,0,.3);
+
+    cursor:pointer;
+
+}
+
+.zoom-slider::-moz-range-thumb{
+
+    width:16px;
+
+    height:16px;
+
+    border-radius:50%;
+
+    background:#2563eb;
+
+    border:2px solid white;
+
+    box-shadow:0 1px 3px rgba(0,0,0,.3);
+
+    cursor:pointer;
+
+}
+
+.zoom-slider::-moz-range-track{
+
+    height:4px;
+
+    border-radius:2px;
+
+    background:#c7d2e8;
+
+}
+
 .boundary-image{
 
-    max-width:100%;
-
-    max-height:100%;
+    /* No max-width/max-height/object-fit here on purpose: those
+       forced the image to fit the container at the CSS layout
+       level, completely independent of react-zoom-pan-pinch's own
+       scale -- which is what made every newly opened page look
+       "auto-zoomed" regardless of the TransformWrapper's own
+       initialScale/centerOnInit settings. The image now renders at
+       its natural pixel size; .image-container's overflow:hidden
+       clips whatever doesn't fit, and panning/zooming via the
+       toolbar or gestures is the only thing that moves it. */
 
     display:block;
-
-    object-fit:contain;
 
     user-select:none;
 
@@ -653,5 +755,613 @@ body{
     font-weight:700;
 
     color:#1e293b;
+
+}
+
+/* =======================================
+   Manual boundary editing
+======================================= */
+
+.add-boundary-toggle{
+
+    flex-shrink:0;
+
+    border:none;
+
+    color:#ffffff;
+
+    font-weight:600;
+
+    font-size:14px;
+
+    background:#16a34a;
+
+    padding:8px 14px;
+
+    border-radius:999px;
+
+    white-space:nowrap;
+
+    cursor:pointer;
+
+    transition:background .2s;
+
+}
+
+.add-boundary-toggle:hover{
+
+    background:#15803d;
+
+}
+
+.add-boundary-toggle.active{
+
+    background:#dc2626;
+
+}
+
+.add-boundary-toggle.active:hover{
+
+    background:#b91c1c;
+
+}
+
+.add-boundary-toggle:disabled{
+
+    background:#94a3b8;
+
+    cursor:not-allowed;
+
+}
+
+.edit-boundary-toggle{
+
+    flex-shrink:0;
+
+    border:none;
+
+    color:#ffffff;
+
+    font-weight:600;
+
+    font-size:14px;
+
+    background:#2563eb;
+
+    padding:8px 14px;
+
+    border-radius:999px;
+
+    white-space:nowrap;
+
+    cursor:pointer;
+
+    transition:background .2s;
+
+}
+
+.edit-boundary-toggle:hover{
+
+    background:#1d4ed8;
+
+}
+
+.edit-boundary-toggle.active{
+
+    background:#dc2626;
+
+}
+
+.edit-boundary-toggle.active:hover{
+
+    background:#b91c1c;
+
+}
+
+.boundary-editor-frame{
+
+    position:relative;
+
+    display:inline-block;
+
+    line-height:0;
+
+}
+
+.boundary-overlay-svg{
+
+    position:absolute;
+
+    inset:0;
+
+    width:100%;
+
+    height:100%;
+
+    touch-action:none;
+
+}
+
+.boundary-overlay-svg.add-mode{
+
+    cursor:crosshair;
+
+}
+
+.boundary-draw-catcher{
+
+    fill:transparent;
+
+    cursor:crosshair;
+
+}
+
+.boundary-box{
+
+    fill:rgba(37,99,235,.08);
+
+    stroke:#2563eb;
+
+    stroke-width:3;
+
+    vector-effect:non-scaling-stroke;
+
+    cursor:move;
+
+}
+
+.boundary-box:hover{
+
+    fill:rgba(37,99,235,.18);
+
+}
+
+.boundary-box.not-editable{
+
+    pointer-events:none;
+
+    cursor:default;
+
+}
+
+.boundary-box.multi-page{
+
+    fill:rgba(100,116,139,.05);
+
+    stroke:#94a3b8;
+
+    stroke-dasharray:14 10;
+
+    cursor:not-allowed;
+
+}
+
+.boundary-box.selected{
+
+    fill:rgba(22,163,74,.12);
+
+    stroke:#16a34a;
+
+    stroke-width:4;
+}
+
+.boundary-box.pending-new{
+
+    stroke:#7c3aed;
+
+}
+
+.boundary-box.pending-new:not(.selected){
+
+    fill:rgba(124,58,237,.1);
+
+}
+
+.boundary-box.pending-edited:not(.selected){
+
+    stroke:#d97706;
+
+    fill:rgba(217,119,6,.1);
+
+}
+
+.boundary-handle{
+
+    fill:#16a34a;
+
+    stroke:#ffffff;
+
+    stroke-width:2;
+
+    vector-effect:non-scaling-stroke;
+
+}
+
+.boundary-hint{
+
+    position:absolute;
+
+    top:15px;
+
+    left:15px;
+
+    z-index:1000;
+
+    background:rgba(15,23,42,.85);
+
+    color:#ffffff;
+
+    padding:8px 16px;
+
+    border-radius:999px;
+
+    font-size:14px;
+
+    font-weight:600;
+
+}
+
+.boundary-select-panel{
+
+    position:absolute;
+
+    bottom:75px;
+
+    left:15px;
+
+    z-index:1000;
+
+    background:#ffffff;
+
+    border-radius:12px;
+
+    padding:14px 18px;
+
+    box-shadow:0 5px 20px rgba(0,0,0,.18);
+
+    max-width:340px;
+
+    display:flex;
+
+    align-items:center;
+
+    gap:14px;
+
+}
+
+.boundary-edit-title{
+
+    margin:0;
+
+    font-size:15px;
+
+    font-weight:700;
+
+    color:#1e293b;
+
+    white-space:nowrap;
+
+}
+
+.boundary-edit-warning{
+
+    margin:0 0 10px;
+
+    font-size:13px;
+
+    font-weight:600;
+
+    color:#b45309;
+
+}
+
+.boundary-edit-error{
+
+    margin:0 0 10px;
+
+    font-size:13px;
+
+    font-weight:600;
+
+    color:#dc2626;
+
+}
+
+.boundary-delete-button{
+
+    padding:10px 16px;
+
+    border:none;
+
+    border-radius:8px;
+
+    background:#dc2626;
+
+    color:#ffffff;
+
+    font-size:14px;
+
+    font-weight:700;
+
+    cursor:pointer;
+
+    white-space:nowrap;
+
+    transition:background .2s;
+
+}
+
+.boundary-delete-button:hover{
+
+    background:#b91c1c;
+
+}
+
+.boundary-delete-button:disabled{
+
+    background:#94a3b8;
+
+    cursor:not-allowed;
+
+}
+
+.boundary-toolbar{
+
+    position:absolute;
+
+    bottom:15px;
+
+    left:15px;
+
+    right:15px;
+
+    z-index:1000;
+
+    display:flex;
+
+    align-items:center;
+
+    gap:12px;
+
+    background:#ffffff;
+
+    border-radius:12px;
+
+    padding:12px 18px;
+
+    box-shadow:0 5px 20px rgba(0,0,0,.18);
+
+}
+
+.boundary-pending-count{
+
+    flex:1;
+
+    font-size:14px;
+
+    font-weight:600;
+
+    color:#475569;
+
+}
+
+.boundary-undo-button,
+.boundary-discard-button{
+
+    padding:10px 16px;
+
+    border:none;
+
+    border-radius:8px;
+
+    background:#e2e8f0;
+
+    color:#1e293b;
+
+    font-size:14px;
+
+    font-weight:700;
+
+    cursor:pointer;
+
+    white-space:nowrap;
+
+    transition:background .2s;
+
+}
+
+.boundary-undo-button:hover,
+.boundary-discard-button:hover{
+
+    background:#cbd5e1;
+
+}
+
+.boundary-undo-button:disabled,
+.boundary-discard-button:disabled{
+
+    opacity:.5;
+
+    cursor:not-allowed;
+
+}
+
+.boundary-save-all-button{
+
+    padding:10px 20px;
+
+    border:none;
+
+    border-radius:8px;
+
+    background:#16a34a;
+
+    color:#ffffff;
+
+    font-size:14px;
+
+    font-weight:700;
+
+    cursor:pointer;
+
+    white-space:nowrap;
+
+    transition:background .2s;
+
+}
+
+.boundary-save-all-button:hover{
+
+    background:#15803d;
+
+}
+
+.boundary-save-all-button:disabled{
+
+    background:#94a3b8;
+
+    cursor:not-allowed;
+
+}
+
+.boundary-result-panel{
+
+    position:absolute;
+
+    top:15px;
+
+    left:15px;
+
+    z-index:1000;
+
+    background:#ffffff;
+
+    border-radius:12px;
+
+    padding:14px 18px;
+
+    box-shadow:0 5px 20px rgba(0,0,0,.18);
+
+    max-width:380px;
+
+    max-height:60vh;
+
+    overflow-y:auto;
+
+}
+
+.boundary-result-header{
+
+    display:flex;
+
+    align-items:center;
+
+    justify-content:space-between;
+
+    gap:12px;
+
+    margin-bottom:8px;
+
+}
+
+.boundary-result-header strong{
+
+    font-size:14px;
+
+    color:#1e293b;
+
+}
+
+.boundary-result-close{
+
+    border:none;
+
+    background:transparent;
+
+    font-size:20px;
+
+    line-height:1;
+
+    color:#64748b;
+
+    cursor:pointer;
+
+    padding:0 4px;
+
+}
+
+.boundary-result-close:hover{
+
+    color:#1e293b;
+
+}
+
+.boundary-result-headline{
+
+    margin:0 0 8px;
+
+    font-size:14px;
+
+    font-weight:700;
+
+    color:#1e293b;
+
+}
+
+.boundary-result-text{
+
+    margin:0;
+
+    font-size:13px;
+
+    line-height:1.5;
+
+    color:#334155;
+
+    white-space:pre-wrap;
+
+}
+
+.boundary-summary-item{
+
+    padding:10px 0;
+
+    border-top:1px solid #e2e8f0;
+
+}
+
+.boundary-summary-item:first-child{
+
+    border-top:none;
+
+    padding-top:0;
+
+}
+
+.boundary-summary-title{
+
+    margin:0 0 6px;
+
+    font-size:13px;
+
+    font-weight:700;
+
+    color:#1e293b;
+
+}
+
+.boundary-summary-item.failed .boundary-summary-title{
+
+    color:#dc2626;
+
+}
+
+.boundary-summary-error{
+
+    margin:0 0 6px;
+
+    font-size:13px;
+
+    color:#dc2626;
 
 }

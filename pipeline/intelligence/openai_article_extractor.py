@@ -8,6 +8,7 @@ import os
 import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +133,27 @@ class OpenAIArticleExtractor:
         # support until proven otherwise, then remember it for the
         # rest of this instance's calls instead of re-probing every time.
         self._temperature_supported = True
+
+        # Per-article verbatim-text rebuild (_rebuild_article_texts)
+        # and per-article headline verification (_reextract_headlines)
+        # each cost one extra API call PER ARTICLE -- measured on a
+        # real 22-page/139-article document: 278 of the run's ~309
+        # total calls came from these two passes alone. Both were
+        # added to fix real accuracy bugs (batch-read article_text
+        # was getting truncated/hallucinated; headlines were coming
+        # back paraphrased instead of verbatim), but that call volume
+        # is a real, explicit cost tradeoff -- OFF by default, so a
+        # normal run relies purely on the single batch call's own
+        # article_text/headline/subheadline fields, with the known
+        # truncation/paraphrasing risk that implies. Set
+        # OPENAI_PER_ARTICLE_CALLS=1 to bring them back.
+        self._per_article_calls_enabled = (
+            os.getenv(
+                "OPENAI_PER_ARTICLE_CALLS",
+                "0",
+            )
+            == "1"
+        )
 
         print()
         print("=" * 60)
@@ -1217,6 +1239,45 @@ class OpenAIArticleExtractor:
         ):
             articles = []
 
+        # ====================================================
+        # VERBATIM ARTICLE TEXT (PER-BLOCK TRANSCRIPTION)
+        #
+        # The batch call above still supplies the structured
+        # knowledge fields (category, entities, topics, ...),
+        # but its article_text is not trustworthy: reading a
+        # whole downscaled article crop makes the model invent
+        # prose and blend neighbouring articles together. Every
+        # article_text is therefore rebuilt from tight,
+        # full-resolution per-block crops instead.
+        # ====================================================
+
+        if self._per_article_calls_enabled:
+            articles = self._rebuild_article_texts(
+                document_dir=document_dir,
+                articles=articles,
+                article_manifest=article_manifest,
+            )
+
+        # ====================================================
+        # DEDICATED HEADLINE VERIFICATION
+        #
+        # The full 18-field extraction call reliably paraphrases
+        # or "cleans up" the headline into different wording
+        # instead of transcribing it verbatim, even with an
+        # explicit instruction against that in the main prompt.
+        # A narrow, single-purpose call asking for nothing but
+        # the headline/subheadline gets much better literal
+        # transcription, so every article's headline gets
+        # overwritten with this dedicated pass's result.
+        # ====================================================
+
+        if self._per_article_calls_enabled:
+            articles = self._reextract_headlines(
+                document_dir=document_dir,
+                articles=articles,
+                article_manifest=article_manifest,
+            )
+
         continuation_links = (
             parsed.get(
                 "continuation_links",
@@ -1229,6 +1290,13 @@ class OpenAIArticleExtractor:
             list,
         ):
             continuation_links = []
+
+        continuation_links = (
+            self._drop_index_aligned_links(
+                continuation_links,
+                articles,
+            )
+        )
 
         pending_from_gemini = (
             parsed.get(
@@ -1572,6 +1640,1485 @@ class OpenAIArticleExtractor:
         return result
 
     # ========================================================
+    # TRUNCATION CHECK
+    # ========================================================
+    #
+    # article_text length is compared against the OCR text
+    # already collected (during the earlier RapidOCR pass)
+    # for the same crop's blocks. Hindi OCR itself is often
+    # garbled character-by-character, but its rough character
+    # count is still a reasonable proxy for "how much text is
+    # actually in this crop" -- enough to flag article_text
+    # that stops well short of the real ending.
+    # ========================================================
+
+    TRUNCATION_MIN_OCR_CHARS = 80
+    TRUNCATION_RATIO = 0.55
+    MAX_REEXTRACT_ATTEMPTS = 2
+
+    @staticmethod
+    def _estimate_ocr_text_length(
+        document_dir: Path,
+        page_number: int,
+        block_ids: list,
+    ) -> int:
+
+        if not block_ids:
+            return 0
+
+        page_json_path = (
+            Path(document_dir)
+            / "page_json"
+            / f"page_{page_number:03d}.json"
+        )
+
+        if not page_json_path.exists():
+            return 0
+
+        try:
+
+            with open(
+                page_json_path,
+                "r",
+                encoding="utf-8",
+            ) as f:
+
+                page_data = json.load(f)
+
+        except Exception:
+
+            return 0
+
+        blocklist = (
+            page_data.get("blocks", [])
+            if isinstance(page_data, dict)
+            else page_data
+        )
+
+        id_set = {
+            int(bid)
+            for bid in block_ids
+            if isinstance(bid, (int, str))
+            and str(bid).lstrip("-").isdigit()
+        }
+
+        total = 0
+
+        for block in blocklist:
+
+            if block.get("id") in id_set:
+
+                total += len(
+                    (block.get("text") or "").strip()
+                )
+
+        return total
+
+    TRUNCATION_RETRY_CONCURRENCY = 6
+
+    def _reextract_truncated_articles(
+        self,
+        document_dir: Path,
+        articles: list[dict[str, Any]],
+        article_manifest: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+
+        manifest_by_key = {
+            (
+                int(item["page"]),
+                str(item["article_id"]),
+            ): item
+            for item in article_manifest
+        }
+
+        # ----------------------------------------------------
+        # Phase 1: detect which articles look truncated. This
+        # is pure local computation (OCR text already on disk),
+        # no API calls yet.
+        # ----------------------------------------------------
+
+        to_retry = []
+
+        for index, article in enumerate(articles):
+
+            page_number = article.get("page")
+            article_id = article.get("article_id")
+
+            if page_number is None or article_id is None:
+                continue
+
+            manifest_item = manifest_by_key.get(
+                (int(page_number), str(article_id))
+            )
+
+            if manifest_item is None:
+                continue
+
+            crop_metadata = (
+                manifest_item.get("crop_metadata") or {}
+            )
+
+            block_ids = (
+                crop_metadata.get("block_ids") or []
+            )
+
+            expected_length = (
+                self._estimate_ocr_text_length(
+                    document_dir,
+                    int(page_number),
+                    block_ids,
+                )
+            )
+
+            if expected_length < self.TRUNCATION_MIN_OCR_CHARS:
+                continue
+
+            current_text = str(
+                article.get("article_text") or ""
+            ).strip()
+
+            if len(current_text) >= expected_length * self.TRUNCATION_RATIO:
+                continue
+
+            to_retry.append(
+                (
+                    index,
+                    article,
+                    manifest_item,
+                    crop_metadata,
+                    expected_length,
+                    len(current_text),
+                )
+            )
+
+        checked_count = len(to_retry)
+        fixed_count = 0
+
+        # ----------------------------------------------------
+        # Phase 2: the flagged articles are independent of each
+        # other, so their (up to MAX_REEXTRACT_ATTEMPTS-deep)
+        # retry chains run concurrently instead of one after
+        # another.
+        # ----------------------------------------------------
+
+        if to_retry:
+
+            with ThreadPoolExecutor(
+                max_workers=min(
+                    self.TRUNCATION_RETRY_CONCURRENCY,
+                    len(to_retry),
+                ),
+            ) as executor:
+
+                futures = {
+                    executor.submit(
+                        self._retry_truncated_article,
+                        item,
+                    ): item[0]
+                    for item in to_retry
+                }
+
+                for future in as_completed(futures):
+
+                    index = futures[future]
+
+                    try:
+                        best_article, best_length, improved = (
+                            future.result()
+                        )
+                    except Exception as exc:
+                        print(
+                            "  WARNING: truncation retry "
+                            f"raised an exception: {exc}"
+                        )
+                        continue
+
+                    if improved:
+
+                        articles[index] = best_article
+                        fixed_count += 1
+
+                        print(
+                            f"  -> re-extraction improved "
+                            f"length to {best_length} chars"
+                        )
+
+                    else:
+
+                        print(
+                            "  -> re-extraction did not "
+                            f"improve on original "
+                            f"({best_length} chars)"
+                        )
+
+        if checked_count:
+
+            print(
+                f"Truncation check: {checked_count} "
+                f"article(s) checked, {fixed_count} "
+                "re-extracted successfully"
+            )
+
+        return articles
+
+    def _retry_truncated_article(
+        self,
+        item: tuple,
+    ) -> tuple[dict[str, Any], int, bool]:
+
+        (
+            _index,
+            article,
+            manifest_item,
+            crop_metadata,
+            expected_length,
+            current_length,
+        ) = item
+
+        page_number = article.get("page")
+        article_id = article.get("article_id")
+
+        print(
+            f"⚠ Possible truncation: page {page_number} "
+            f"{article_id} (article_text="
+            f"{current_length} chars, ocr_estimate="
+            f"{expected_length} chars) -- re-extracting"
+        )
+
+        best_article = article
+        best_length = current_length
+
+        for attempt in range(
+            1,
+            self.MAX_REEXTRACT_ATTEMPTS + 1,
+        ):
+
+            retried = self._extract_single_article(
+                page_number=int(page_number),
+                article_id=str(article_id),
+                image_path=manifest_item["image"],
+                crop_metadata=crop_metadata,
+            )
+
+            if retried is None:
+                continue
+
+            retried = dict(retried)
+            retried["page"] = page_number
+            retried["article_id"] = article_id
+
+            retried_text = str(
+                retried.get("article_text") or ""
+            ).strip()
+
+            if len(retried_text) > best_length:
+
+                best_length = len(retried_text)
+                best_article = retried
+
+            if best_length >= expected_length * self.TRUNCATION_RATIO:
+                break
+
+        return (
+            best_article,
+            best_length,
+            best_article is not article,
+        )
+
+    def _extract_single_article(
+        self,
+        page_number: int,
+        article_id: str,
+        image_path: str,
+        crop_metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+
+        image_path = Path(image_path)
+
+        manifest_item = {
+            "page": page_number,
+            "article_id": article_id,
+            "image": str(image_path),
+            "crop_metadata": crop_metadata,
+        }
+
+        contents: list[Any] = []
+
+        contents.append(
+            {
+                "type": "text",
+                "text": (
+                    "\n"
+                    "================================================\n"
+                    "VERIFIED ARTICLE CROP\n"
+                    f"PAGE: {page_number}\n"
+                    f"ARTICLE_ID: {article_id}\n"
+                    f"IMAGE: {image_path.name}\n"
+                    "================================================\n"
+                ),
+            }
+        )
+
+        metadata = {
+            "page": page_number,
+            "article_id": article_id,
+            "bbox": crop_metadata.get("bbox"),
+            "width": crop_metadata.get("width"),
+            "height": crop_metadata.get("height"),
+            "source_width": crop_metadata.get("source_width"),
+            "source_height": crop_metadata.get("source_height"),
+            "boundary_source": crop_metadata.get("boundary_source"),
+        }
+
+        contents.append(
+            {
+                "type": "text",
+                "text": (
+                    "Verified crop metadata:\n"
+                    + json.dumps(metadata, ensure_ascii=False)
+                ),
+            }
+        )
+
+        try:
+
+            image_bytes = image_path.read_bytes()
+
+        except Exception as exc:
+
+            print(
+                "  WARNING: could not read crop image "
+                f"for re-extraction: {exc}"
+            )
+
+            return None
+
+        contents.append(
+            self._image_content(image_bytes)
+        )
+
+        prompt = self._build_prompt(
+            page_numbers=[page_number],
+            article_manifest=[manifest_item],
+            pending_continuations=[],
+            known_pages=[page_number],
+        )
+
+        contents.insert(
+            0,
+            {"type": "text", "text": prompt},
+        )
+
+        contents.insert(
+            1,
+            {
+                "type": "text",
+                "text": (
+                    "\nSINGLE-ARTICLE RE-EXTRACTION PASS\n"
+                    "This is a focused retry for ONE article crop\n"
+                    "that appeared truncated on the first pass.\n"
+                    "Transcribe article_text completely and\n"
+                    "verbatim, from the first word to the very\n"
+                    "last word visible in the crop. Do not stop\n"
+                    "early and do not summarize.\n"
+                ),
+            },
+        )
+
+        MAX_RETRIES = 3
+        RETRY_DELAY = 5
+
+        response = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+
+            try:
+
+                kwargs = {
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": contents,
+                        }
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "article_batch_extraction",
+                            "schema": self._response_schema(),
+                            "strict": True,
+                        },
+                    },
+                }
+
+                if self._temperature_supported:
+                    kwargs["temperature"] = 0
+
+                response = (
+                    self.client.chat.completions.create(**kwargs)
+                )
+
+                break
+
+            except (APIStatusError, APIConnectionError) as exc:
+
+                if (
+                    self._temperature_supported
+                    and isinstance(exc, APIStatusError)
+                    and exc.status_code == 400
+                    and isinstance(exc.body, dict)
+                    and exc.body.get("param") == "temperature"
+                ):
+                    self._temperature_supported = False
+                    continue
+
+                retryable = (
+                    isinstance(exc, APIConnectionError)
+                    or getattr(exc, "status_code", None)
+                    in (429, 500, 502, 503, 504)
+                )
+
+                if not retryable or attempt == MAX_RETRIES:
+
+                    print(
+                        "  WARNING: single-article "
+                        f"re-extraction failed: {exc}"
+                    )
+
+                    return None
+
+                time.sleep(RETRY_DELAY)
+
+        if response is None:
+            return None
+
+        response_text = (
+            response.choices[0].message.content or ""
+        ).strip()
+
+        if not response_text:
+            return None
+
+        try:
+
+            parsed = self._parse_json(response_text)
+
+        except Exception as exc:
+
+            print(
+                "  WARNING: could not parse re-extraction "
+                f"response: {exc}"
+            )
+
+            return None
+
+        result_articles = parsed.get("articles", [])
+
+        if not isinstance(result_articles, list) or not result_articles:
+            return None
+
+        for candidate in result_articles:
+
+            if str(candidate.get("article_id")) == str(article_id):
+                return candidate
+
+        return result_articles[0]
+
+    # ========================================================
+    # DEDICATED HEADLINE VERIFICATION
+    # ========================================================
+
+    @staticmethod
+    def _headline_schema() -> dict[str, Any]:
+
+        return {
+            "type": "object",
+            "additionalProperties": False,
+
+            "properties": {
+
+                "headline": {
+                    "type": "string"
+                },
+
+                "subheadline": {
+                    "type": ["string", "null"],
+                },
+            },
+
+            "required": [
+                "headline",
+                "subheadline",
+            ],
+        }
+
+    HEADLINE_VERIFICATION_CONCURRENCY = 6
+
+    HEADLINE_CROP_PADDING = 25
+    HEADLINE_CROP_BOTTOM_PADDING = 180
+
+    # ========================================================
+    # PER-BLOCK VERBATIM TRANSCRIPTION
+    # ========================================================
+    #
+    # Sending a whole article crop for transcription reads badly:
+    # the vision API downscales a large image until small Devanagari
+    # body text is no longer legible, and the model then fills the
+    # gap with plausible-sounding invented prose (observed inventing
+    # names, dates and entire extra paragraphs, and splicing in other
+    # articles' headlines).
+    #
+    # The same paragraph cropped tightly at full page resolution
+    # transcribes exactly. So each of an article's text blocks is
+    # cropped individually from the full-resolution page image and
+    # transcribed in reading order, then joined. One request per
+    # article keeps cost close to the batch approach while giving the
+    # model only legible images, and keeps articles isolated from
+    # each other so their text cannot blend.
+    # ========================================================
+
+    # "title" is deliberately excluded: the headline and subheadline
+    # are extracted into their own fields by the dedicated headline
+    # pass, so including title blocks here only duplicates them into
+    # the body -- and a body block the layout detector mislabelled as
+    # a title tends to be a neighbouring sidebar heading, which then
+    # leaks another story's words into this article's text.
+    TEXT_BLOCK_CLASSES = {
+        "plain text",
+        "figure_caption",
+    }
+
+    BLOCK_CROP_PADDING = 6
+    BLOCK_TRANSCRIBE_CONCURRENCY = 5
+    MAX_BLOCKS_PER_TRANSCRIBE_CALL = 14
+
+    @staticmethod
+    def _paragraphs_schema() -> dict[str, Any]:
+
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "paragraphs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["paragraphs"],
+        }
+
+    def _load_page_blocks(
+        self,
+        document_dir: Path,
+        page_number: int,
+    ) -> dict:
+
+        page_json_path = (
+            Path(document_dir)
+            / "page_json"
+            / f"page_{page_number:03d}.json"
+        )
+
+        if not page_json_path.exists():
+            return {}
+
+        try:
+            data = json.loads(
+                page_json_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            return {}
+
+        blocks = (
+            data.get("blocks", [])
+            if isinstance(data, dict)
+            else data
+        )
+
+        return {b["id"]: b for b in blocks if "id" in b}
+
+    def _transcribe_article_blocks(
+        self,
+        document_dir: Path,
+        page_number: int,
+        block_ids: list,
+    ) -> str | None:
+        """
+        Transcribe an article's text blocks verbatim, in reading
+        order, by cropping each one tightly from the full-resolution
+        page image. Returns None when nothing could be transcribed.
+        """
+
+        if not block_ids:
+            return None
+
+        by_id = self._load_page_blocks(document_dir, page_number)
+
+        if not by_id:
+            return None
+
+        wanted = [
+            by_id[int(b)]
+            for b in block_ids
+            if str(b).lstrip("-").isdigit()
+            and int(b) in by_id
+        ]
+
+        text_blocks = [
+            b
+            for b in wanted
+            if b.get("class") in self.TEXT_BLOCK_CLASSES
+            and (b.get("bbox") or {}).get("x1") is not None
+        ]
+
+        if not text_blocks:
+            return None
+
+        text_blocks.sort(
+            key=lambda b: (
+                b.get("reading_order", 0),
+                b["bbox"]["y1"],
+                b["bbox"]["x1"],
+            )
+        )
+
+        # Very large articles are split across sequential requests so
+        # no single request carries so many images that the model
+        # starts skipping or conflating them.
+        chunks = [
+            text_blocks[i:i + self.MAX_BLOCKS_PER_TRANSCRIBE_CALL]
+            for i in range(
+                0,
+                len(text_blocks),
+                self.MAX_BLOCKS_PER_TRANSCRIBE_CALL,
+            )
+        ]
+
+        page_image_path = (
+            Path(document_dir)
+            / "pages"
+            / f"page_{page_number:03d}.png"
+        )
+
+        if not page_image_path.exists():
+            return None
+
+        try:
+            from PIL import Image
+            import io
+        except Exception:
+            return None
+
+        collected: list[str] = []
+
+        try:
+            source = Image.open(page_image_path)
+        except Exception as exc:
+            print(
+                "  WARNING: could not open page image for "
+                f"per-block transcription: {exc}"
+            )
+            return None
+
+        with source:
+
+            width, height = source.size
+
+            for chunk in chunks:
+
+                images: list[bytes] = []
+
+                for block in chunk:
+
+                    bbox = block["bbox"]
+                    pad = self.BLOCK_CROP_PADDING
+
+                    box = (
+                        max(0, int(bbox["x1"]) - pad),
+                        max(0, int(bbox["y1"]) - pad),
+                        min(width, int(bbox["x2"]) + pad),
+                        min(height, int(bbox["y2"]) + pad),
+                    )
+
+                    if box[2] <= box[0] or box[3] <= box[1]:
+                        images.append(b"")
+                        continue
+
+                    buffer = io.BytesIO()
+                    source.crop(box).save(buffer, format="PNG")
+                    images.append(buffer.getvalue())
+
+                paragraphs = self._transcribe_block_images(
+                    [img for img in images if img]
+                )
+
+                if paragraphs:
+                    collected.extend(paragraphs)
+
+        cleaned = [p.strip() for p in collected if p and p.strip()]
+
+        if not cleaned:
+            return None
+
+        return "\n\n".join(cleaned)
+
+    def _transcribe_block_images(
+        self,
+        images: list[bytes],
+    ) -> list[str] | None:
+
+        if not images:
+            return None
+
+        prompt = (
+            "Each image below is ONE tightly-cropped block of text "
+            "from a single Hindi newspaper article, given in reading "
+            "order.\n\n"
+            "Transcribe every image EXACTLY as printed, verbatim, "
+            "character for character.\n\n"
+            "Return a JSON object with a \"paragraphs\" array holding "
+            f"exactly {len(images)} strings -- one per image, in the "
+            "same order they are given.\n\n"
+            "Rules:\n"
+            "- Transcribe only what is actually printed in that "
+            "image. Never invent, complete, summarize or paraphrase.\n"
+            "- Never carry text from one image into another.\n"
+            "- Preserve names, numbers, dates and quotes exactly.\n"
+            "- If an image has no readable text, use an empty "
+            "string for it.\n"
+            "- Join words broken across printed lines back into "
+            "normal running text; do not add line breaks."
+        )
+
+        contents: list[Any] = [{"type": "text", "text": prompt}]
+
+        for index, image_bytes in enumerate(images, start=1):
+            contents.append(
+                {
+                    "type": "text",
+                    "text": f"--- IMAGE {index} ---",
+                }
+            )
+            contents.append(self._image_content(image_bytes))
+
+        MAX_RETRIES = 3
+        RETRY_DELAY = 5
+
+        response = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+
+            try:
+
+                kwargs = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "user", "content": contents}
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "block_transcription",
+                            "schema": self._paragraphs_schema(),
+                            "strict": True,
+                        },
+                    },
+                }
+
+                if self._temperature_supported:
+                    kwargs["temperature"] = 0
+
+                response = (
+                    self.client.chat.completions.create(**kwargs)
+                )
+
+                break
+
+            except (APIStatusError, APIConnectionError) as exc:
+
+                if (
+                    self._temperature_supported
+                    and isinstance(exc, APIStatusError)
+                    and exc.status_code == 400
+                    and isinstance(exc.body, dict)
+                    and exc.body.get("param") == "temperature"
+                ):
+                    self._temperature_supported = False
+                    continue
+
+                retryable = (
+                    isinstance(exc, APIConnectionError)
+                    or getattr(exc, "status_code", None)
+                    in (429, 500, 502, 503, 504)
+                )
+
+                if not retryable or attempt == MAX_RETRIES:
+                    print(
+                        "  WARNING: per-block transcription "
+                        f"failed: {exc}"
+                    )
+                    return None
+
+                time.sleep(RETRY_DELAY)
+
+        if response is None:
+            return None
+
+        raw = (response.choices[0].message.content or "").strip()
+
+        if not raw:
+            return None
+
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return None
+
+        paragraphs = parsed.get("paragraphs")
+
+        if not isinstance(paragraphs, list):
+            return None
+
+        return [str(p) for p in paragraphs]
+
+    # A real "continued on page N" pointer as printed in the paper.
+    CONTINUATION_MARKER = re.compile(
+        r"(?:\bP\s?0?\d{1,3}\b)|पृष्ठ|पेज|शेष|जारी",
+        re.IGNORECASE,
+    )
+
+    MIN_CONTINUATION_OVERLAP = 0.20
+
+    @staticmethod
+    def _significant_tokens(text: str) -> set:
+        # Devanagari words of 4+ characters: long enough to be
+        # content-bearing (names, places, subjects) rather than
+        # grammatical filler shared by any two Hindi paragraphs.
+        return set(re.findall(r"[ऀ-ॿ]{4,}", text or ""))
+
+    @classmethod
+    def _vocabulary_overlap(cls, source_text, target_text) -> float:
+
+        source_tokens = cls._significant_tokens(source_text)
+        target_tokens = cls._significant_tokens(target_text)
+
+        if not source_tokens or not target_tokens:
+            return 0.0
+
+        shared = source_tokens & target_tokens
+
+        return len(shared) / min(
+            len(source_tokens),
+            len(target_tokens),
+        )
+
+    @classmethod
+    def _drop_index_aligned_links(
+        cls,
+        continuation_links: list[dict[str, Any]],
+        articles: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Require every cross-page continuation link to be backed by
+        evidence, and drop the ones that are not.
+
+        The model invents continuations confidently. Two failure
+        shapes were observed, both reported at ~0.9-0.95 confidence
+        with fluent but fabricated reasons:
+
+        - Index alignment: article_id values are positional ordinals
+          assigned per page ("article_001" is just the first crop on
+          that page) and carry no cross-page meaning, yet the model
+          emits whole runs of page1/article_00N -> page2/article_00N.
+        - Topic guessing: a one-line "building collapse" teaser
+          linked to an unrelated page-2 story simply because both
+          could be described the same way.
+
+        Left in, these merge unrelated stories wholesale (observed
+        collapsing 36 real article groups down to 20).
+
+        Real continuations leave physical evidence in the newspaper
+        that the model cannot fabricate, so each link must show BOTH:
+
+        1. the source article actually prints a continuation pointer
+           ("शेष", "जारी", "पृष्ठ", "P06"), and
+        2. the two texts share enough content vocabulary to plausibly
+           be one story.
+
+        Requirement 2 is what rejects a teaser that happens to print
+        an unrelated page pointer ("P 18") for a different story, and
+        a headline that merely contains the word "पेज".
+
+        Same-page links are left untouched -- this is about
+        cross-page continuation only.
+        """
+
+        if not continuation_links:
+            return continuation_links
+
+        text_by_key = {
+            (
+                article.get("page"),
+                str(article.get("article_id")),
+            ): (article.get("article_text") or "")
+            for article in articles
+        }
+
+        kept = []
+        dropped = 0
+
+        for link in continuation_links:
+
+            if link.get("source_page") == link.get("target_page"):
+                kept.append(link)
+                continue
+
+            source_text = text_by_key.get(
+                (
+                    link.get("source_page"),
+                    str(link.get("source_article_id")),
+                ),
+                "",
+            )
+
+            target_text = text_by_key.get(
+                (
+                    link.get("target_page"),
+                    str(link.get("target_article_id")),
+                ),
+                "",
+            )
+
+            has_marker = bool(
+                cls.CONTINUATION_MARKER.search(source_text)
+            )
+
+            overlap = cls._vocabulary_overlap(
+                source_text,
+                target_text,
+            )
+
+            if (
+                has_marker
+                and overlap >= cls.MIN_CONTINUATION_OVERLAP
+            ):
+                kept.append(link)
+            else:
+                dropped += 1
+
+        if dropped:
+            print(
+                f"Continuation guard: dropped {dropped} cross-page "
+                "link(s) lacking a printed continuation marker "
+                f"and/or shared vocabulary; {len(kept)} link(s) kept"
+            )
+
+        return kept
+
+    def _rebuild_article_texts(
+        self,
+        document_dir: Path,
+        articles: list[dict[str, Any]],
+        article_manifest: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Replace every article's article_text with a verbatim
+        per-block transcription (see TEXT_BLOCK_CLASSES notes).
+        """
+
+        manifest_by_key = {
+            (int(i["page"]), str(i["article_id"])): i
+            for i in article_manifest
+        }
+
+        jobs = []
+
+        for index, article in enumerate(articles):
+
+            page_number = article.get("page")
+            article_id = article.get("article_id")
+
+            if page_number is None or article_id is None:
+                continue
+
+            item = manifest_by_key.get(
+                (int(page_number), str(article_id))
+            )
+
+            if item is None:
+                continue
+
+            block_ids = (
+                (item.get("crop_metadata") or {}).get("block_ids")
+                or []
+            )
+
+            if not block_ids:
+                continue
+
+            jobs.append((index, int(page_number), block_ids))
+
+        if not jobs:
+            return articles
+
+        rebuilt = 0
+
+        with ThreadPoolExecutor(
+            max_workers=min(
+                self.BLOCK_TRANSCRIBE_CONCURRENCY,
+                len(jobs),
+            ),
+        ) as executor:
+
+            futures = {
+                executor.submit(
+                    self._transcribe_article_blocks,
+                    document_dir,
+                    page_number,
+                    block_ids,
+                ): index
+                for index, page_number, block_ids in jobs
+            }
+
+            for future in as_completed(futures):
+
+                index = futures[future]
+
+                try:
+                    text = future.result()
+                except Exception as exc:
+                    print(
+                        "  WARNING: per-block transcription "
+                        f"raised: {exc}"
+                    )
+                    continue
+
+                if not text:
+                    continue
+
+                article = dict(articles[index])
+                article["article_text"] = text
+                articles[index] = article
+                rebuilt += 1
+
+        print(
+            f"Per-block transcription: {len(jobs)} article(s) "
+            f"processed, {rebuilt} article_text rebuilt verbatim"
+        )
+
+        return articles
+
+    def _build_headline_crop_bytes(
+        self,
+        document_dir: Path,
+        page_number: int,
+        block_ids: list,
+    ) -> bytes | None:
+
+        # ----------------------------------------------------
+        # Sending the whole article crop for a headline-only
+        # read wastes most of the model's effective resolution
+        # on body-text pixels it doesn't need. Cropping tightly
+        # to just the headline's own block(s) on the full-
+        # resolution page image gives it a much larger, more
+        # legible view of exactly the text in question.
+        # ----------------------------------------------------
+
+        if not block_ids:
+            return None
+
+        page_json_path = (
+            Path(document_dir)
+            / "page_json"
+            / f"page_{page_number:03d}.json"
+        )
+
+        if not page_json_path.exists():
+            return None
+
+        try:
+
+            with open(
+                page_json_path,
+                "r",
+                encoding="utf-8",
+            ) as f:
+
+                page_data = json.load(f)
+
+        except Exception:
+
+            return None
+
+        blocklist = (
+            page_data.get("blocks", [])
+            if isinstance(page_data, dict)
+            else page_data
+        )
+
+        id_set = {
+            int(bid)
+            for bid in block_ids
+            if isinstance(bid, (int, str))
+            and str(bid).lstrip("-").isdigit()
+        }
+
+        title_blocks = [
+            block
+            for block in blocklist
+            if block.get("id") in id_set
+            and block.get("class") == "title"
+            and (block.get("bbox") or {}).get("y1") is not None
+        ]
+
+        if not title_blocks:
+            return None
+
+        # The layout detector sometimes misclassifies an unrelated
+        # element (e.g. a bold photo caption) as "title" too. The
+        # real headline is always the topmost element of an
+        # article, so only the single topmost title-class block is
+        # used -- unioning every title-class block would pull in
+        # that unrelated element's position as well.
+
+        headline_block = min(
+            title_blocks,
+            key=lambda block: block["bbox"]["y1"],
+        )
+
+        bbox = headline_block["bbox"]
+
+        try:
+
+            x1 = bbox["x1"]
+            y1 = bbox["y1"]
+            x2 = bbox["x2"]
+            y2 = bbox["y2"]
+
+        except (KeyError, ValueError):
+
+            return None
+
+        page_image_path = (
+            Path(document_dir)
+            / "pages"
+            / f"page_{page_number:03d}.png"
+        )
+
+        if not page_image_path.exists():
+            return None
+
+        try:
+
+            from PIL import Image
+            import io
+
+            with Image.open(page_image_path) as img:
+
+                width, height = img.size
+                pad = self.HEADLINE_CROP_PADDING
+
+                # A subheadline block sits immediately below the
+                # headline block and is classed "plain text", not
+                # "title", so it's not part of title_blocks above --
+                # extending downward well past the headline's own
+                # bottom edge is what actually pulls it into frame.
+                bottom_pad = self.HEADLINE_CROP_BOTTOM_PADDING
+
+                crop_box = (
+                    max(0, int(x1) - pad),
+                    max(0, int(y1) - pad),
+                    min(width, int(x2) + pad),
+                    min(height, int(y2) + bottom_pad),
+                )
+
+                cropped = img.crop(crop_box)
+
+                buffer = io.BytesIO()
+                cropped.save(buffer, format="PNG")
+
+                return buffer.getvalue()
+
+        except Exception as exc:
+
+            print(
+                "  WARNING: could not build headline "
+                f"crop: {exc}"
+            )
+
+            return None
+
+    def _reextract_headlines(
+        self,
+        document_dir: Path,
+        articles: list[dict[str, Any]],
+        article_manifest: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+
+        manifest_by_key = {
+            (
+                int(item["page"]),
+                str(item["article_id"]),
+            ): item
+            for item in article_manifest
+        }
+
+        # ----------------------------------------------------
+        # Figure out which indices need a headline call, and
+        # what image bytes to send for each -- a tight crop of
+        # just the headline block when one can be found, else
+        # the full article crop as a fallback. The actual calls
+        # run concurrently below since each one is independent.
+        # ----------------------------------------------------
+
+        pending_indices = []
+
+        for index, article in enumerate(articles):
+
+            page_number = article.get("page")
+            article_id = article.get("article_id")
+
+            if page_number is None or article_id is None:
+                continue
+
+            manifest_item = manifest_by_key.get(
+                (int(page_number), str(article_id))
+            )
+
+            if manifest_item is None:
+                continue
+
+            crop_metadata = (
+                manifest_item.get("crop_metadata") or {}
+            )
+
+            block_ids = (
+                crop_metadata.get("block_ids") or []
+            )
+
+            image_bytes = (
+                self._build_headline_crop_bytes(
+                    document_dir,
+                    int(page_number),
+                    block_ids,
+                )
+            )
+
+            if image_bytes is None:
+
+                try:
+                    image_bytes = (
+                        Path(manifest_item["image"])
+                        .read_bytes()
+                    )
+                except Exception as exc:
+                    print(
+                        "  WARNING: could not read crop "
+                        f"image for headline verification: "
+                        f"{exc}"
+                    )
+                    continue
+
+            pending_indices.append(
+                (index, image_bytes)
+            )
+
+        fixed_count = 0
+        checked_count = len(pending_indices)
+
+        if pending_indices:
+
+            with ThreadPoolExecutor(
+                max_workers=min(
+                    self.HEADLINE_VERIFICATION_CONCURRENCY,
+                    len(pending_indices),
+                ),
+            ) as executor:
+
+                futures = {
+                    executor.submit(
+                        self._extract_headline_only,
+                        image_bytes=image_bytes,
+                    ): index
+                    for index, image_bytes in pending_indices
+                }
+
+                for future in as_completed(futures):
+
+                    index = futures[future]
+
+                    try:
+                        verified = future.result()
+                    except Exception as exc:
+                        print(
+                            "  WARNING: headline verification "
+                            f"raised an exception: {exc}"
+                        )
+                        continue
+
+                    if verified is None:
+                        continue
+
+                    new_headline = str(
+                        verified.get("headline") or ""
+                    ).strip()
+
+                    if not new_headline:
+                        continue
+
+                    article = dict(articles[index])
+                    article["headline"] = new_headline
+
+                    new_subheadline = verified.get("subheadline")
+
+                    if isinstance(new_subheadline, str):
+                        new_subheadline = (
+                            new_subheadline.strip() or None
+                        )
+
+                    article["subheadline"] = new_subheadline
+
+                    articles[index] = article
+                    fixed_count += 1
+
+        if checked_count:
+
+            print(
+                f"Headline verification: {checked_count} "
+                f"article(s) checked, {fixed_count} "
+                "headline(s) verified"
+            )
+
+        return articles
+
+    def _extract_headline_only(
+        self,
+        image_bytes: bytes,
+    ) -> dict[str, Any] | None:
+
+        prompt = """
+You are reading a close-up crop of the TOP of ONE
+newspaper article -- its headline, and, if printed,
+its subheadline directly beneath it. It may not show
+any body text.
+
+Your ONLY task is to transcribe the headline (and
+subheadline, if one is printed) EXACTLY as printed --
+word for word, character for character.
+
+Do NOT rewrite, shorten, paraphrase, summarize, or
+"clean up" the wording. Do NOT invent a headline that
+merely captures the same topic in different words.
+
+If the headline spans multiple printed lines, join them
+with a single space, in reading order, without adding or
+dropping any words.
+
+If there is no separate subheadline printed beneath the
+main headline, subheadline must be null. Do not invent one.
+
+Do not substitute a similar-looking word for the actual
+printed word. If a word is genuinely unclear, look again
+at the image rather than guessing a plausible replacement.
+
+Return JSON only, matching the schema exactly.
+""".strip()
+
+        contents: list[Any] = [
+            {"type": "text", "text": prompt},
+            self._image_content(image_bytes),
+        ]
+
+        MAX_RETRIES = 3
+        RETRY_DELAY = 5
+
+        response = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+
+            try:
+
+                kwargs = {
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": contents,
+                        }
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "headline_verification",
+                            "schema": self._headline_schema(),
+                            "strict": True,
+                        },
+                    },
+                }
+
+                if self._temperature_supported:
+                    kwargs["temperature"] = 0
+
+                response = (
+                    self.client.chat.completions.create(**kwargs)
+                )
+
+                break
+
+            except (APIStatusError, APIConnectionError) as exc:
+
+                if (
+                    self._temperature_supported
+                    and isinstance(exc, APIStatusError)
+                    and exc.status_code == 400
+                    and isinstance(exc.body, dict)
+                    and exc.body.get("param") == "temperature"
+                ):
+                    self._temperature_supported = False
+                    continue
+
+                retryable = (
+                    isinstance(exc, APIConnectionError)
+                    or getattr(exc, "status_code", None)
+                    in (429, 500, 502, 503, 504)
+                )
+
+                if not retryable or attempt == MAX_RETRIES:
+
+                    print(
+                        "  WARNING: headline verification "
+                        f"failed: {exc}"
+                    )
+
+                    return None
+
+                time.sleep(RETRY_DELAY)
+
+        if response is None:
+            return None
+
+        response_text = (
+            response.choices[0].message.content or ""
+        ).strip()
+
+        if not response_text:
+            return None
+
+        try:
+
+            return json.loads(response_text)
+
+        except Exception as exc:
+
+            print(
+                "  WARNING: could not parse headline "
+                f"verification response: {exc}"
+            )
+
+            return None
+
+    # ========================================================
     # PROMPT
     # ========================================================
 
@@ -1779,12 +3326,84 @@ Do NOT read horizontally across unrelated columns.
 ARTICLE TEXT
 ============================================================
 
-article_text must contain the actual readable
-article text.
+article_text must be a COMPLETE, VERBATIM transcription of
+EVERY sentence of body text visible in the crop, from the
+very first word to the very last word -- across ALL columns
+and ALL paragraphs, including the final paragraph.
 
 Do NOT summarize article_text.
 
-The summary is a separate field.
+Do NOT paraphrase, condense, or merge multiple sentences into
+one.
+
+Do NOT stop early after the first paragraph or two just
+because the article is long or the crop is dense with text.
+
+Do NOT drop specific details: names, titles, designations,
+numbers, section/law references, quotes, and place names must
+all be preserved exactly as written.
+
+This requirement does NOT change when many article crops are
+being processed in the same request. Every article in this
+batch gets the same full, complete transcription -- writing a
+shorter article_text for some items to save space is wrong.
+
+The summary field is where a short summary belongs. article_text
+is not that field.
+
+Before moving to the next article, compare article_text against
+the crop: if the crop clearly shows more paragraphs or columns
+of body text than you transcribed, go back and add the missing
+text instead of submitting a partial transcription.
+
+NEVER INVENT TEXT THAT IS NOT PRINTED IN THE CROP.
+
+article_text must contain ONLY words that are physically
+visible in that crop image. This matters most when a crop is
+small or incomplete:
+
+- If the crop contains a headline but NO body paragraphs,
+  article_text MUST be an empty string "".
+- If the crop contains only a headline and a caption,
+  article_text MUST be an empty string "".
+- Do NOT reconstruct, guess, or continue an article from your
+  own knowledge of the topic, from the headline's wording, or
+  from other crops in this batch.
+- Do NOT invent names, ages, designations, place names, dates,
+  case numbers, or quotes. Fabricating plausible-sounding
+  newspaper prose is a serious failure -- an empty
+  article_text is strictly better than an invented one.
+
+The same rule applies to author, location, and date: leave
+them null rather than guessing.
+
+============================================================
+HEADLINE AND SUBHEADLINE
+============================================================
+
+headline must be the EXACT text of the main headline exactly as
+printed in the crop -- word for word, character for character.
+
+Do NOT rewrite, shorten, paraphrase, or "clean up" the headline
+into your own words.
+
+Do NOT invent a new headline that merely captures the same
+topic. If the printed headline says "X", headline must be "X",
+not your summary of X.
+
+If the headline spans multiple lines in print, join the lines
+with a single space, in reading order, without adding or
+dropping any words.
+
+subheadline follows the exact same rule when one is present:
+transcribe it exactly as printed. Do not substitute a similar-
+looking word for the actual printed word (for example, do not
+turn "अज्ञात" into "अदालत" or any other near-miss) -- if a word
+is genuinely unreadable, keep looking at the image rather than
+guessing a plausible-sounding replacement.
+
+summary is where your own paraphrase belongs. headline and
+subheadline are not that field.
 
 ============================================================
 STRUCTURED KNOWLEDGE
@@ -4572,6 +6191,15 @@ Return JSON only.
             "unresolved": unresolved,
             "repairs": repairs,
         }
+
+        # This pass can ADD cross-page links of its own from text
+        # similarity, so they go through the same evidence check the
+        # model's links do -- otherwise a link rejected earlier can
+        # simply reappear here.
+        clean_links = cls._drop_index_aligned_links(
+            clean_links,
+            articles,
+        )
 
         return clean_links, final_pending, report
 

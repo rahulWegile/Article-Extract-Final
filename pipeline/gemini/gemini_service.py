@@ -130,6 +130,119 @@ class GeminiService:
             schema=schema,
         )
 
+    # ========================================================
+    # COLUMN-NEIGHBOUR GAP MEASUREMENT
+    #
+    # Ported from pipeline/openai/openai_service.py -- kept
+    # byte-for-byte identical so both engines give the grouping
+    # prompt the same separation signal. Without this, a boxed
+    # sidebar separated from its neighbour by less blank space than
+    # an ordinary paragraph gap (confirmed on a real page: as little
+    # as 17px, below that page's own 23px median) has no way to be
+    # recognized as a new article, and its body text gets silently
+    # absorbed into whichever story is above it.
+    # ========================================================
+
+    @staticmethod
+    def _annotate_gaps(compact_blocks: list[dict[str, Any]]) -> float | None:
+        """
+        Annotate each block with the whitespace gap to its nearest
+        neighbour above and below within the same print column, plus
+        return the page's median gap for scale.
+
+        Newspapers separate stories with visibly more whitespace than
+        they put between paragraphs of the same story, so the size of
+        a gap relative to the page's normal gap is one of the
+        strongest available separation signals. The model previously
+        received only raw bounding boxes and had to re-derive this
+        itself for every block, which it did inconsistently on dense
+        pages.
+
+        Column neighbours are found by horizontal overlap rather than
+        by the 6-slot column index, because a wide block (a spanning
+        headline, a photo) belongs to several index slots at once.
+        """
+
+        boxes = []
+
+        for block in compact_blocks:
+
+            bbox = block.get("bbox") or {}
+
+            if None in (
+                bbox.get("x1"),
+                bbox.get("y1"),
+                bbox.get("x2"),
+                bbox.get("y2"),
+            ):
+                boxes.append(None)
+                continue
+
+            boxes.append(bbox)
+
+        gaps: list[float] = []
+
+        for index, bbox in enumerate(boxes):
+
+            if bbox is None:
+                continue
+
+            width = max(1.0, float(bbox["x2"] - bbox["x1"]))
+
+            gap_above = None
+            gap_below = None
+
+            for other_index, other in enumerate(boxes):
+
+                if other is None or other_index == index:
+                    continue
+
+                other_width = max(1.0, float(other["x2"] - other["x1"]))
+
+                overlap = min(bbox["x2"], other["x2"]) - max(
+                    bbox["x1"], other["x1"]
+                )
+
+                # Same print column only.
+                if max(0.0, overlap) / min(width, other_width) < 0.5:
+                    continue
+
+                if other["y2"] <= bbox["y1"]:
+                    distance = float(bbox["y1"] - other["y2"])
+                    if gap_above is None or distance < gap_above:
+                        gap_above = distance
+
+                elif bbox["y2"] <= other["y1"]:
+                    distance = float(other["y1"] - bbox["y2"])
+                    if gap_below is None or distance < gap_below:
+                        gap_below = distance
+
+            compact_blocks[index]["gap_above"] = (
+                None if gap_above is None else round(gap_above)
+            )
+
+            compact_blocks[index]["gap_below"] = (
+                None if gap_below is None else round(gap_below)
+            )
+
+            for value in (gap_above, gap_below):
+                if value is not None and value > 0:
+                    gaps.append(value)
+
+        if not gaps:
+            return None
+
+        gaps.sort()
+
+        middle = len(gaps) // 2
+
+        if len(gaps) % 2:
+            median = gaps[middle]
+        else:
+            median = (gaps[middle - 1] + gaps[middle]) / 2.0
+
+        return round(median, 1)
+
     @staticmethod
     def _compact_blocks_payload(json_path: str) -> str:
         with open(json_path, "r", encoding="utf-8") as f:
@@ -150,10 +263,18 @@ class GeminiService:
                 "category": knowledge.get("category") or None,
             })
 
+        median_gap = GeminiService._annotate_gaps(compact_blocks)
+
         compact_page = {
             "page": page.get("page"),
             "page_width": page.get("page_width"),
             "page_height": page.get("page_height"),
+            # Scale reference for gap_above/gap_below: the typical
+            # spacing between adjacent blocks on THIS page, so the
+            # model can tell an article break from a paragraph break
+            # without hardcoding pixel thresholds that vary by
+            # publication, page size and render DPI.
+            "median_block_gap": median_gap,
             "blocks": compact_blocks,
         }
 
