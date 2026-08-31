@@ -1072,6 +1072,13 @@
     cursor: not-allowed;
 }
 
+.load-more-button {
+    display: block;
+    margin: 24px auto 0;
+    background: #111827;
+    color: #ffffff;
+}
+
 .archive-clear-button {
     height: 42px;
     padding: 0 16px;

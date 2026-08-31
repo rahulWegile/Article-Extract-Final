@@ -16,7 +16,10 @@ from pipeline.export.gemini_page_exporter import (
 )
 
 from pipeline.gemini.gemini_service import GeminiService
-from pipeline.gemini.gemini_prompt import ARTICLE_GROUP_PROMPT
+from pipeline.gemini.gemini_prompt import (
+    ARTICLE_GROUP_PROMPT,
+    ARTICLE_GROUP_PROMPT_ENGLISH,
+)
 from pipeline.openai.openai_service import OpenAIService
 
 from pipeline.gemini.gemini_boundary_pipeline import (
@@ -321,7 +324,7 @@ def run_openai(page_path, json_path):
         service.analyze_page(
             image_path=page_path,
             json_path=json_path,
-            prompt=ARTICLE_GROUP_PROMPT,
+            prompt=ARTICLE_GROUP_PROMPT_ENGLISH,
         )
     )
 
@@ -380,7 +383,7 @@ def run_local(page_path, json_path):
 # FINISH PAGE (everything after the network call)
 # =========================================================
 
-def finish_page(prep, gemini_response, gemini_elapsed):
+def finish_page(prep, gemini_response, gemini_elapsed, is_hindi: bool = True):
 
     page_number = prep["page_number"]
     page_path = prep["page_path"]
@@ -482,6 +485,7 @@ def finish_page(prep, gemini_response, gemini_elapsed):
             output_path=str(
                 output_path
             ),
+            is_hindi=is_hindi,
         )
     )
 
@@ -726,11 +730,11 @@ def process_page(
         document_dir=document_dir,
     )
 
-    run_page_llm = (
-        run_gemini
-        if os.getenv("LLM_PROVIDER", "openai").strip().lower() == "gemini"
-        else run_openai
+    is_hindi = (
+        os.getenv("LLM_PROVIDER", "openai").strip().lower() == "gemini"
     )
+
+    run_page_llm = run_gemini if is_hindi else run_openai
 
     llm_response, llm_elapsed = run_page_llm(
         page_path=page_path,
@@ -741,4 +745,5 @@ def process_page(
         prep,
         llm_response,
         llm_elapsed,
+        is_hindi=is_hindi,
     )

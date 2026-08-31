@@ -144,6 +144,41 @@ class GeminiService:
     # ========================================================
 
     @staticmethod
+    def _has_intervening_block(
+        boxes: list[dict[str, Any] | None],
+        self_index: int,
+        y_start: float,
+        y_end: float,
+        bbox: dict[str, Any],
+    ) -> bool:
+        """
+        True when some OTHER block's y-range falls inside (y_start,
+        y_end) and it has ANY horizontal overlap with `bbox` at all --
+        not just the stricter 50% same-column overlap used to find a
+        gap neighbour. Such a block sits visually inside the measured
+        gap, so the gap is not clean whitespace.
+        """
+
+        lo, hi = min(y_start, y_end), max(y_start, y_end)
+
+        for other_index, other in enumerate(boxes):
+
+            if other is None or other_index == self_index:
+                continue
+
+            if other["y1"] >= hi or other["y2"] <= lo:
+                continue
+
+            overlap = min(bbox["x2"], other["x2"]) - max(
+                bbox["x1"], other["x1"]
+            )
+
+            if overlap > 0:
+                return True
+
+        return False
+
+    @staticmethod
     def _annotate_gaps(compact_blocks: list[dict[str, Any]]) -> float | None:
         """
         Annotate each block with the whitespace gap to its nearest
@@ -191,6 +226,8 @@ class GeminiService:
 
             gap_above = None
             gap_below = None
+            above_neighbor_y = None
+            below_neighbor_y = None
 
             for other_index, other in enumerate(boxes):
 
@@ -211,11 +248,35 @@ class GeminiService:
                     distance = float(bbox["y1"] - other["y2"])
                     if gap_above is None or distance < gap_above:
                         gap_above = distance
+                        above_neighbor_y = other["y2"]
 
                 elif bbox["y2"] <= other["y1"]:
                     distance = float(other["y1"] - bbox["y2"])
                     if gap_below is None or distance < gap_below:
                         gap_below = distance
+                        below_neighbor_y = other["y1"]
+
+            # The same-column search above can skip straight past some
+            # OTHER block sitting visually in the gap (e.g. an inset
+            # photo of a different width, which fails the 50%
+            # column-overlap test and gets silently passed over) and
+            # report the distance across it as if it were plain
+            # whitespace. That number then gets handed to the model as
+            # a "this looks like a new article" signal even though the
+            # gap is actually occupied by unrelated content, not empty.
+            # When any block -- regardless of column overlap -- sits
+            # inside the measured span, the measurement isn't trustworthy
+            # as a whitespace gap, so drop it rather than report a
+            # number that can be silently wrong.
+            if gap_above is not None and GeminiService._has_intervening_block(
+                boxes, index, above_neighbor_y, bbox["y1"], bbox
+            ):
+                gap_above = None
+
+            if gap_below is not None and GeminiService._has_intervening_block(
+                boxes, index, bbox["y2"], below_neighbor_y, bbox
+            ):
+                gap_below = None
 
             compact_blocks[index]["gap_above"] = (
                 None if gap_above is None else round(gap_above)

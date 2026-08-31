@@ -8,7 +8,13 @@ import {
 } from "react-zoom-pan-pinch";
 
 const MIN_BOX_SIZE = 10;
-const MIN_SCALE = 0.4;
+
+// The image is already sized to fit the viewer at scale 1 (via
+// object-fit: contain on .boundary-image), so anything below 1 would
+// just shrink it smaller than the viewer -- there's no reason to zoom
+// out past the fit size for a single page.
+const MIN_SCALE = 1;
+
 const MAX_SCALE = 10;
 const MAX_HISTORY = 100;
 
@@ -150,7 +156,14 @@ function Viewer() {
     const [saveProgress, setSaveProgress] = useState(null);
     const [resultSummary, setResultSummary] = useState(null);
 
-    const [scale, setScale] = useState(1);
+    // TransformWrapper drives pan/zoom imperatively for performance and
+    // doesn't re-render its render-prop children on every change, so the
+    // slider needs its own state kept in sync via onTransform below.
+    const [transform, setTransformState] = useState({
+        scale: 1,
+        positionX: 0,
+        positionY: 0,
+    });
 
     const svgRef = useRef(null);
     const dragRef = useRef(null);
@@ -792,16 +805,24 @@ function Viewer() {
 
                     centerZoomedOut={true}
 
-                    limitToBounds={false}
+                    // Keeps the page from being panned completely off-screen
+                    // (into blank space) at any zoom level.
+                    limitToBounds={true}
 
                     wheel={{
                         step: 0.15,
-                        // A two-finger trackpad scroll arrives as a wheel
-                        // event with no ctrlKey, same as a mouse wheel --
-                        // disable zooming on it so it's free to pan below.
-                        // An actual pinch gesture sets ctrlKey and is
-                        // unaffected, so pinch-to-zoom still works.
+
+                        // Two-finger trackpad scroll fires the same
+                        // wheel event as a mouse wheel, so it would
+                        // zoom by default. Disable that and let
+                        // trackPadPanning below turn it into page
+                        // scrolling instead. Pinch-to-zoom (which
+                        // browsers report as ctrl+wheel) still zooms.
                         wheelDisabled: true,
+                    }}
+
+                    trackPadPanning={{
+                        disabled: addMode,
                     }}
 
                     doubleClick={{
@@ -817,19 +838,17 @@ function Viewer() {
                         disabled: false,
                     }}
 
-                    trackPadPanning={{
-                        disabled: addMode,
-                    }}
-
                     alignmentAnimation={{
                         disabled: true,
                     }}
 
-                    onTransform={(_ref, state) => setScale(state.scale)}
+                    onTransform={(_ref, state) =>
+                        setTransformState(state)
+                    }
 
                 >
 
-                    {({ zoomIn, zoomOut, resetTransform, setTransform, instance }) => (
+                    {({ zoomIn, zoomOut, resetTransform, centerView }) => (
 
                         <>
 
@@ -840,27 +859,23 @@ function Viewer() {
                                 </button>
 
                                 <input
-                                    type="range"
                                     className="zoom-slider"
+                                    type="range"
                                     title="Zoom"
                                     min={MIN_SCALE}
                                     max={MAX_SCALE}
-                                    step={0.01}
-                                    value={scale}
-                                    onChange={(event) => {
-
-                                        const nextScale = Number(event.target.value);
-
-                                        setScale(nextScale);
-
-                                        setTransform(
-                                            instance.state.positionX,
-                                            instance.state.positionY,
-                                            nextScale,
-                                            0
-                                        );
-
-                                    }}
+                                    step={0.1}
+                                    value={transform.scale}
+                                    onChange={(event) =>
+                                        // centerView (rather than setTransform) recomputes a
+                                        // centered position for the new scale, so the page can
+                                        // never end up scaled into a corner or off-screen after
+                                        // panning around at a different zoom level.
+                                        centerView(
+                                            Number(event.target.value),
+                                            0,
+                                        )
+                                    }
                                 />
 
                                 <button title="Zoom in" onClick={() => zoomIn()}>
@@ -876,7 +891,7 @@ function Viewer() {
                             <TransformComponent
                                 wrapperStyle={{
                                     width: "100%",
-                                    height: "82vh",
+                                    height: "100%",
                                 }}
                                 contentStyle={{
                                     width: "100%",
@@ -932,7 +947,7 @@ function Viewer() {
                                                     height={item.bbox.y2 - item.bbox.y1}
                                                     className={
                                                         "boundary-box" +
-                                                        (item.is_multi_page ? " multi-page" : "") +
+                                                        // (item.is_multi_page ? " multi-page" : "") +
                                                         (!editMode || addMode ? " not-editable" : "") +
                                                         (item.key === selectedKey ? " selected" : "") +
                                                         (item.isNew ? " pending-new" : "") +
@@ -1035,46 +1050,6 @@ function Viewer() {
 
                 )}
 
-                <div className="boundary-toolbar">
-
-                    <span className="boundary-pending-count">
-                        {pendingCount > 0
-                            ? `${pendingCount} unsaved change${pendingCount === 1 ? "" : "s"}`
-                            : "No unsaved changes"}
-                    </span>
-
-                    <button
-                        type="button"
-                        className="boundary-undo-button"
-                        onClick={handleUndo}
-                        disabled={!canUndo || saving}
-                        title="Undo (Ctrl+Z)"
-                    >
-                        ↶ Undo
-                    </button>
-
-                    <button
-                        type="button"
-                        className="boundary-discard-button"
-                        onClick={handleDiscardAll}
-                        disabled={pendingCount === 0 || saving}
-                    >
-                        Discard changes
-                    </button>
-
-                    <button
-                        type="button"
-                        className="boundary-save-all-button"
-                        onClick={handleSaveAll}
-                        disabled={pendingCount === 0 || saving}
-                    >
-                        {saving
-                            ? `Saving ${saveProgress ? saveProgress.done : 0}/${saveProgress ? saveProgress.total : pendingCount}…`
-                            : `Save & extract (${pendingCount})`}
-                    </button>
-
-                </div>
-
                 {resultSummary && (
 
                     <div className="boundary-result-panel">
@@ -1141,6 +1116,50 @@ function Viewer() {
                     </div>
 
                 )}
+
+            </div>
+
+            {/* Lives outside .image-container (in normal document flow,
+                not overlaid on top of it) so it never covers part of the
+                page -- a page's last articles are often near the bottom
+                edge, right where this bar would otherwise sit. */}
+            <div className="boundary-toolbar">
+
+                <span className="boundary-pending-count">
+                    {pendingCount > 0
+                        ? `${pendingCount} unsaved change${pendingCount === 1 ? "" : "s"}`
+                        : "No unsaved changes"}
+                </span>
+
+                <button
+                    type="button"
+                    className="boundary-undo-button"
+                    onClick={handleUndo}
+                    disabled={!canUndo || saving}
+                    title="Undo (Ctrl+Z)"
+                >
+                    ↶ Undo
+                </button>
+
+                <button
+                    type="button"
+                    className="boundary-discard-button"
+                    onClick={handleDiscardAll}
+                    disabled={pendingCount === 0 || saving}
+                >
+                    Discard changes
+                </button>
+
+                <button
+                    type="button"
+                    className="boundary-save-all-button"
+                    onClick={handleSaveAll}
+                    disabled={pendingCount === 0 || saving}
+                >
+                    {saving
+                        ? `Saving ${saveProgress ? saveProgress.done : 0}/${saveProgress ? saveProgress.total : pendingCount}…`
+                        : `Save & extract (${pendingCount})`}
+                </button>
 
             </div>
 

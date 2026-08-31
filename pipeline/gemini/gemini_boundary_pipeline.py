@@ -1,11 +1,17 @@
 import json
 
+import cv2
+
 from pipeline.block_parser import LayoutBlock
 
 from pipeline.gemini.gemini_parser import GeminiParser
 
 from pipeline.article.article_grouper import (
     ArticleGrouper,
+)
+
+from pipeline.article.article_splitter import (
+    split_oversized_articles,
 )
 
 from pipeline.article.boundary_builder import (
@@ -81,6 +87,7 @@ class GeminiBoundaryPipeline:
         page_json_path,
         gemini_response_path,
         output_path,
+        is_hindi: bool = True,
     ):
 
         print()
@@ -134,7 +141,34 @@ class GeminiBoundaryPipeline:
 
             blocks,
 
+            is_hindi=is_hindi,
+
         )
+
+        #
+        # Split any article the model over-merged: re-checks any
+        # article containing more than one title block against
+        # local_grouper's own geometric root-detection, splitting it
+        # only when that algorithm actually finds separate stories
+        # (never touches ArticleGrouper's or the LLM's own decision
+        # otherwise -- see article_splitter.py).
+        #
+        # Hindi-only: the reference English pipeline has no
+        # equivalent step, so English keeps the model's own grouping
+        # as-is here.
+        #
+
+        if is_hindi:
+
+            try:
+                page_image = cv2.imread(str(image_path))
+            except Exception:
+                page_image = None
+
+            articles = split_oversized_articles(
+                articles,
+                page_image,
+            )
 
         #
         # Build boundaries

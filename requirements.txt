@@ -10,11 +10,11 @@ tqdm==4.67.3
 python-dotenv==1.2.2
 rapidocr==3.9.2
 
-# Optional: only used by rapidocr_engine.py's native-paddle
-# low-confidence Devanagari line retry, gated behind
-# OCR_NATIVE_PADDLE_RETRY=1 (disabled by default). The lazy-load
-# path degrades gracefully if these are missing -- not a hard
-# dependency for the rest of the pipeline.
+# Optional: only used by rapidocr_engine.py's per-block Devanagari
+# script-detection retry (native PaddleOCR devanagari_PP-OCRv5_mobile_rec),
+# gated behind OCR_NATIVE_PADDLE_RETRY (on by default -- set to 0 to
+# disable). The lazy-load path degrades gracefully if these are
+# missing -- not a hard dependency for the rest of the pipeline.
 paddlepaddle==3.3.1
 paddlex==3.7.2
 

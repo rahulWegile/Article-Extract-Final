@@ -21,18 +21,14 @@ between paragraphs of one story, so the gap above a block is the
 primary signal here:
 
 1. Every "title" block is a CANDIDATE article root.
-2. A candidate becomes a real root when EITHER:
-   - the blank space above it clearly exceeds the page's normal
-     block spacing, which is what stops a bold photo caption or an
-     inline crosshead -- both of which the layout detector happily
-     labels "title" -- from splitting one story into several, OR
-   - the pixels directly above it show a printed rule line or a
-     colored box background, which is how a newspaper marks a
-     boxed sidebar story that sits closer than the whitespace rule
-     alone would accept (see _has_visual_separator).
-3. Every remaining content block joins the nearest root ABOVE it that
-   shares its column span, which is how newspaper columns actually
-   read.
+2. A candidate becomes a real root when it clearly governs body text
+   below it, OR when gap/separator evidence indicates a genuine story
+   break.
+3. Caption-like titles immediately under images are protected from
+   separator-based false positives.
+4. Every remaining content block joins the latest eligible root ABOVE
+   it that shares its column span, so a later headline acts as an
+   ownership boundary for that visual lane.
 
 KNOWN LIMITATIONS vs the LLM path
 ---------------------------------
@@ -57,13 +53,19 @@ TEXT_CLASSES = {"plain text", "title", "figure_caption"}
 # Layout-detector classes that are pictures.
 IMAGE_CLASSES = {"figure", "image", "object", "photo", "picture"}
 
-# A title needs at least this much more blank space above it than the
-# page's median block gap before it is accepted as a new article root.
+# A title with its own body text below it is a strong article-root candidate,
+# so root detection must not depend on a large blank gap above the title.
+# Gap/separator evidence remains useful for distinguishing captions and
+# inline crossheads that the detector may label as titles.
 ROOT_GAP_FACTOR = 2.0
 
-# Floor for the above, so a page whose median gap is tiny does not turn
-# every stray title into a root.
+# Floor for the gap-based signal.
 ROOT_GAP_MINIMUM = 25.0
+
+# Minimum vertical distance below a title before a text block can be
+# considered its supporting body text. This prevents a title from
+# claiming text that overlaps its own bbox due to detector slop.
+TITLE_BODY_MIN_GAP = 2.0
 
 # Fraction of the narrower block's width that must overlap
 # horizontally for two blocks to count as sharing a column.
@@ -82,6 +84,72 @@ def _overlap_ratio(a, b):
     width_b = max(1.0, float(b["x2"] - b["x1"]))
     overlap = min(a["x2"], b["x2"]) - max(a["x1"], b["x1"])
     return max(0.0, overlap) / min(width_a, width_b)
+
+
+def _find_next_root_below(box, candidate_roots):
+    """
+    The NEAREST root BELOW `box` (smallest y1 among roots that start
+    at or after this box ends) that shares its column.
+
+    Used only for orphan-root cleanup, never for ordinary content
+    attachment: a kicker/eyebrow line that ends up governing nothing
+    of its own naturally belongs to the main headline that FOLLOWS
+    it in print, not to whatever happens to sit above it (there may
+    be nothing above it at all -- it can be the very first element
+    in its column, as a kicker line always is).
+    """
+
+    best_root = None
+    best_distance = None
+
+    for root in candidate_roots:
+
+        root_box = _bbox(root)
+
+        if root_box["y1"] < box["y2"]:
+            continue
+
+        if _overlap_ratio(box, root_box) < COLUMN_OVERLAP:
+            continue
+
+        distance = float(root_box["y1"] - box["y2"])
+
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_root = root
+
+    return best_root
+
+
+def _find_owning_root(box, candidate_roots):
+    """
+    The LATEST root ABOVE `box` (largest y1, i.e. nearest above) that
+    shares its column, or None if no candidate root qualifies.
+
+    Shared by the main content-attachment pass and the orphan-root
+    cleanup pass below, so both use exactly the same "which root does
+    this block belong to" rule -- see build's own inline version this
+    was extracted from for the ownership-boundary rationale.
+    """
+
+    eligible_roots = []
+
+    for root in candidate_roots:
+
+        root_box = _bbox(root)
+
+        if root_box["y1"] > box["y1"]:
+            continue
+
+        if _overlap_ratio(box, root_box) < COLUMN_OVERLAP:
+            continue
+
+        eligible_roots.append(root)
+
+    if not eligible_roots:
+        return None
+
+    return max(eligible_roots, key=lambda root: _bbox(root)["y1"])
 
 
 def _role_for(block):
@@ -180,6 +248,53 @@ def _annotate_gaps(blocks):
         return float(gaps[middle])
 
     return (gaps[middle - 1] + gaps[middle]) / 2.0
+
+
+def _has_body_below(title, content, roles):
+    """
+    Return True when a title has at least one article-text block
+    immediately below it in the same visual column/lane.
+
+    This is intentionally a conservative local test. A title should
+    become a root when it clearly governs real body text below it, even
+    when the newspaper leaves very little whitespace above the title.
+    """
+
+    title_box = _bbox(title)
+    if title_box is None:
+        return False
+
+    candidates = []
+
+    for block in content:
+        if block is title:
+            continue
+
+        if roles.get(block["id"]) != "article_text":
+            continue
+
+        box = _bbox(block)
+        if box is None:
+            continue
+
+        # Body must begin below the title, with only a small allowance
+        # for detector/rendering alignment noise.
+        if box["y1"] < title_box["y2"] + TITLE_BODY_MIN_GAP:
+            continue
+
+        # It must occupy the same column/lane as the headline.
+        overlap = _overlap_ratio(title_box, box)
+        if overlap < COLUMN_OVERLAP:
+            continue
+
+        distance = float(box["y1"] - title_box["y2"])
+        candidates.append((distance, box["y1"], block))
+
+    if not candidates:
+        return False
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return True
 
 
 # ----------------------------------------------------------------
@@ -341,6 +456,11 @@ def _has_vertical_separator(page_image, x1, x2, y1, y2):
 def build_local_response(page_json_path, page_image_path=None):
     """
     Group one page's blocks into articles without any model call.
+
+    Thin file-loading wrapper -- the actual grouping logic lives in
+    group_blocks() so it can also be reused as a sanity-check/splitter
+    over an ALREADY-GROUPED set of blocks (see article_splitter.py),
+    not just as the primary local-mode grouper.
     """
 
     page = json.loads(
@@ -348,6 +468,28 @@ def build_local_response(page_json_path, page_image_path=None):
     )
 
     blocks = page.get("blocks", []) if isinstance(page, dict) else page
+
+    page_image = None
+
+    if page_image_path is not None:
+
+        try:
+            page_image = cv2.imread(str(page_image_path))
+        except Exception:
+            page_image = None
+
+    return group_blocks(blocks, page_image)
+
+
+def group_blocks(blocks, page_image=None):
+    """
+    Group an already-loaded list of block dicts into articles.
+
+    Each block dict must have "id", "class", "bbox" -- the same
+    shape page_json blocks already have. `page_image` is an already-
+    loaded (cv2.imread) BGR array, or None to skip the visual-
+    separator checks (gap/width signals still work without it).
+    """
 
     if not blocks:
         return {"blocks": [], "articles": []}
@@ -360,15 +502,6 @@ def build_local_response(page_json_path, page_image_path=None):
         ROOT_GAP_MINIMUM,
         median_gap * ROOT_GAP_FACTOR,
     )
-
-    page_image = None
-
-    if page_image_path is not None:
-
-        try:
-            page_image = cv2.imread(str(page_image_path))
-        except Exception:
-            page_image = None
 
     # ----------------------------------------------------------
     # Choose article roots
@@ -392,6 +525,14 @@ def build_local_response(page_json_path, page_image_path=None):
             continue
 
         gap = block.get("_gap_above")
+        has_own_body = _has_body_below(block, content, roles)
+
+        # A title that clearly governs body text below it is an article
+        # root even when the whitespace ABOVE the title is small.
+        # This is the primary fix for small/stacked newspaper stories.
+        if has_own_body:
+            roots.append(block)
+            continue
 
         # No neighbour above means this is the first thing in its
         # column, which is where a headline normally sits.
@@ -402,24 +543,15 @@ def build_local_response(page_json_path, page_image_path=None):
         # A photo is inherently non-uniform and often colorful, so a
         # caption sitting directly under one would otherwise look
         # exactly like a colored separator box to the pixel check
-        # below (confirmed: this false-positived on a real photo
-        # caption, sampling the photo's own bottom edge as if it
-        # were a box border). A caption's relationship is to the
-        # image above it, never to a rule line, so the visual check
-        # is skipped entirely in that situation rather than tuned
-        # around it.
-
+        # below. A caption's relationship is to the image above it,
+        # never to a rule line, so skip the visual separator test here.
         if block.get("_neighbor_above_class") in IMAGE_CLASSES:
             continue
 
         # The gap alone did not clear the threshold, but a boxed
-        # sidebar can be printed closer than that (confirmed as low
-        # as 17px on a page with a 23px median gap) because the
-        # newspaper is using a border or a colored background to
-        # mark the split instead of blank space. Check the pixels
-        # directly above this title for that border before deciding
-        # it is not a new article.
-
+        # sidebar can be printed closer than that because the
+        # newspaper uses a border or colored background to mark the
+        # split. Check the pixels directly above this title.
         box = _bbox(block)
 
         probe_height = max(gap, SEPARATOR_MIN_BAND_HEIGHT)
@@ -433,12 +565,7 @@ def build_local_response(page_json_path, page_image_path=None):
         )
 
         # Some layouts print several short items in one row,
-        # divided from each other by a vertical bar instead of
-        # being stacked with a gap -- confirmed on a real page: a
-        # row of three tag-style items ("अवसर" | title | "आदेश")
-        # where only the outer two have a colored box background,
-        # so the middle one is invisible to the horizontal check
-        # even though it is printed as its own bounded item.
+        # divided by a vertical bar instead of a horizontal gap.
         has_vertical_separator = _has_vertical_separator(
             page_image,
             box["x1"],
@@ -474,25 +601,12 @@ def build_local_response(page_json_path, page_image_path=None):
 
         box = _bbox(block)
 
-        best_root = None
-        best_distance = None
-
-        for root in roots:
-
-            root_box = _bbox(root)
-
-            # A headline governs what reads BELOW it.
-            if root_box["y1"] > box["y1"]:
-                continue
-
-            if _overlap_ratio(box, root_box) < COLUMN_OVERLAP:
-                continue
-
-            distance = float(box["y1"] - root_box["y1"])
-
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best_root = root
+        # The latest root ABOVE the block in the same lane wins -- see
+        # _find_owning_root. This makes article roots behave like
+        # ownership anchors: a later headline cuts off the earlier
+        # root for that lane, rather than every block falling back to
+        # whichever headline is physically closest.
+        best_root = _find_owning_root(box, roots)
 
         if best_root is None:
             # No headline governs this block in its own column.
@@ -517,6 +631,69 @@ def build_local_response(page_json_path, page_image_path=None):
             continue
 
         articles[id(best_root)]["blocks"].append(block["id"])
+
+    # ----------------------------------------------------------
+    # Orphan-root cleanup
+    #
+    # A title can become a root (has_own_body / gap / separator) and
+    # still end up governing nothing: the content directly below it
+    # can independently qualify as ITS OWN root instead of attaching
+    # as this one's body (e.g. a kicker/eyebrow line immediately
+    # above a main headline that itself has real body text -- the
+    # main headline becomes its own root, leaving the kicker with
+    # nothing attached). That leaves a lone title-only entry, which
+    # the final filter below drops -- silently losing a real,
+    # genuine heading rather than just mis-attributing it.
+    #
+    # So: any root that ended up governing nothing is offered back to
+    # the SAME nearest-owning-root search ordinary content already
+    # uses (excluding itself) -- exactly what would have happened had
+    # it never become a root. Only if no OTHER root can plausibly own
+    # it either does it fall back to standing alone (and still get
+    # dropped by the filter below if it's a lone title) -- matching
+    # the pre-existing "no root found" behaviour precisely, just
+    # tried as a last resort instead of a first one.
+    # ----------------------------------------------------------
+
+    orphan_roots = [
+        root
+        for root in roots
+        if (
+            roles.get(root["id"]) == "article_title"
+            and len(articles[id(root)]["blocks"]) == 1
+        )
+    ]
+
+    for root in orphan_roots:
+
+        other_roots = [
+            candidate
+            for candidate in roots
+            if id(candidate) != id(root)
+        ]
+
+        box = _bbox(root)
+
+        fallback_root = _find_owning_root(
+            box, other_roots,
+        )
+
+        if fallback_root is None:
+            # Nothing above it (it may be the very first element in
+            # its column, as a kicker/eyebrow line always is) -- try
+            # the headline that follows it instead.
+            fallback_root = _find_next_root_below(
+                box, other_roots,
+            )
+
+        if fallback_root is None:
+            continue
+
+        del articles[id(root)]
+        roots.remove(root)
+        root_ids.discard(id(root))
+
+        articles[id(fallback_root)]["blocks"].append(root["id"])
 
     # ----------------------------------------------------------
     # Emit the LLM-compatible response

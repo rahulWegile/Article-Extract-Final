@@ -14,6 +14,7 @@ import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 
 
 # ============================================================
@@ -1167,25 +1168,28 @@ class GeminiArticleExtractor:
 
                 break
 
-            except Exception as exc:
+            except (APIError, httpx.TimeoutException, httpx.ConnectError) as exc:
 
-                error_text = str(exc)
-
-                # Retry temporary Gemini unavailable errors, plus a
-                # stalled/timed-out connection (no timeout configured
-                # on the client previously meant these hung forever
-                # instead of ever reaching this except block).
+                # Retry temporary Gemini unavailable errors (checked via
+                # the structured .code attribute, same as gemini_service.py
+                # -- a 504/DEADLINE_EXCEEDED response is a completed HTTP
+                # response, not a socket-level timeout/connect failure, so
+                # it never matched a string search and always raised on
+                # the first attempt), plus a stalled/timed-out connection
+                # (no timeout configured on the client previously meant
+                # these hung forever instead of ever reaching this
+                # except block).
                 is_timeout = isinstance(
                     exc,
                     (httpx.TimeoutException, httpx.ConnectError),
                 )
 
-                if (
-                    not is_timeout
-                    and "503" not in error_text
-                    and "UNAVAILABLE" not in error_text
-                    and "unavailable" not in error_text
-                ):
+                retryable = (
+                    is_timeout
+                    or getattr(exc, "code", None) in (429, 500, 502, 503, 504)
+                )
+
+                if not retryable:
                     raise
 
                 print()
@@ -3045,12 +3049,13 @@ Return JSON only.
     # ========================================================
 
     # Defense-in-depth safety margin, not a documented platform limit.
-    # A 47-crop batch was observed failing with a connection error and
-    # a 61-crop/~29MB batch with a 400 (on the OpenAI side); these
-    # caps sit comfortably below both while the timeout increase
-    # elsewhere separately addresses the likely slow-upload cause.
-    MAX_CROPS_PER_BATCH = 25
-    MAX_BATCH_BYTES = 15 * 1024 * 1024
+    # NOTE: a 47-crop batch was previously observed failing with a
+    # connection error and a 61-crop/~29MB batch with a 400 (on the
+    # OpenAI side). These caps were raised past the 47-crop failure
+    # point on request; the separate timeout increase is what's
+    # expected to absorb the likely slow-upload cause instead.
+    MAX_CROPS_PER_BATCH = 50
+    MAX_BATCH_BYTES = 40 * 1024 * 1024
 
     def _make_page_batches(
         self,

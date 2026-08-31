@@ -68,11 +68,25 @@ class ArticleGrouper:
         a_width = max(1.0, float(block_a.x2 - block_a.x1))
         b_width = max(1.0, float(block_b.x2 - block_b.x1))
 
-        overlap_x = min(block_a.x2, block_b.x2) - max(
-            block_a.x1, block_b.x1
+        overlap_x = max(
+            0.0,
+            min(block_a.x2, block_b.x2) - max(block_a.x1, block_b.x1),
         )
 
-        overlap_ratio = max(0.0, overlap_x) / min(a_width, b_width)
+        # IoU-style overlap (over the UNION of both widths), not over
+        # the narrower block's width alone. Normalizing by the
+        # narrower width gives a column-spanning block (a wide photo,
+        # a banner headline) an overlap_ratio near 1.0 against almost
+        # any narrower block it happens to contain horizontally, even
+        # when that narrower block sits in one specific sub-column
+        # unrelated to the spanning block's own story -- collapsing
+        # column_penalty to ~0 exactly when it should be discriminating
+        # most. IoU still gives ~1.0 for the common case (two similarly
+        # -sized blocks stacked in the same column), but correctly
+        # drops for a large size mismatch.
+        union_width = a_width + b_width - overlap_x
+
+        overlap_ratio = overlap_x / union_width if union_width > 0 else 0.0
 
         if block_a.y2 <= block_b.y1:
             vertical_gap = float(block_b.y1 - block_a.y2)
@@ -122,12 +136,27 @@ class ArticleGrouper:
 
         resolved = {}
 
+        # A geometric alternative must beat the model's OWN first
+        # claim by more than this margin before it overrides that
+        # claim. The model read the block's actual text and made a
+        # semantic call; pure column/vertical-gap geometry should
+        # correct that only when it is clearly wrong, not second-guess
+        # a near-tie caused by one stray nearby element or a slightly
+        # -off gap measurement. Below this margin, the first article to
+        # claim the block in the model's own response order wins --
+        # matching the safer "first claim wins" default this arbitration
+        # only exists to improve on for clear-cut cases.
+        ARBITRATION_MARGIN = 50.0
+
         for block_id in contested:
 
             block = block_lookup.get(block_id)
 
             if block is None:
                 continue
+
+            first_claim_article_id = None
+            first_claim_distance = None
 
             best_article_id = None
             best_distance = None
@@ -161,6 +190,10 @@ class ArticleGrouper:
 
                 distance = min(distances)
 
+                if first_claim_article_id is None:
+                    first_claim_article_id = article["article_id"]
+                    first_claim_distance = distance
+
                 # Ties broken by article_id so the result is stable.
                 if (
                     best_distance is None
@@ -173,15 +206,216 @@ class ArticleGrouper:
                     best_distance = distance
                     best_article_id = article["article_id"]
 
-            if best_article_id is not None:
+            if (
+                best_article_id is not None
+                and first_claim_article_id is not None
+                and first_claim_article_id != best_article_id
+                and first_claim_distance is not None
+                and first_claim_distance <= best_distance + ARBITRATION_MARGIN
+            ):
+                resolved[block_id] = first_claim_article_id
+
+            elif best_article_id is not None:
                 resolved[block_id] = best_article_id
 
         return resolved
+
+    @classmethod
+    def _reassign_orphan_blocks(cls, response_articles, block_lookup):
+        """
+        Reassign a block that is geometrically inconsistent with
+        every other block in the one article that claims it, when
+        some OTHER article's blocks fit it far better.
+
+        Distinct from _resolve_contested_blocks: that resolves a
+        block claimed by MULTIPLE articles (an ownership dispute).
+        This handles a block claimed by exactly one article, where
+        the claim itself doesn't hold up geometrically -- observed
+        case: the model attributed a body paragraph to the wrong one
+        of two topically-similar articles sharing adjacent columns,
+        with no other article ever contesting the same block. Left
+        uncorrected, that single block's bbox drags its article's
+        boundary across the neighboring article's entire column.
+
+        Both thresholds below are deliberately conservative (a large
+        gap between them, not a hair-trigger margin): a legitimately
+        wide, multi-column article's own blocks are never anywhere
+        near ORPHAN_ISOLATION_FLOOR apart from ALL of their siblings
+        at once (see the ArticleGrouper docstring examples), so this
+        should only ever fire on a genuine mismatch.
+
+        Returns {block_id: new_article_id} for blocks to move. Any
+        block absent from the result keeps its original article.
+        """
+
+        # A block's own claim is trusted at face value below this --
+        # only when it shares essentially NO horizontal overlap with
+        # ANY other block in its own article (column_penalty alone
+        # is already 90% of _layout_distance's max) does its claim
+        # even become a candidate for reassignment.
+        ORPHAN_ISOLATION_FLOOR = 90000.0
+
+        # An alternative article only qualifies as a genuine home if
+        # the block sits in real column proximity to it -- comfortably
+        # below the column_penalty scale, not merely "less isolated"
+        # than its own article.
+        ORPHAN_ALTERNATIVE_CEILING = 10000.0
+
+        claim_counts = {}
+
+        for article in response_articles:
+            for block_id in article["blocks"]:
+                claim_counts[block_id] = (
+                    claim_counts.get(block_id, 0) + 1
+                )
+
+        # Contested blocks are a separate mechanism (see above) --
+        # excluded both as candidates here and as reference points,
+        # since their own ownership isn't settled yet.
+        contested = {
+            block_id
+            for block_id, count in claim_counts.items()
+            if count > 1
+        }
+
+        reassignments = {}
+
+        for article in response_articles:
+
+            own_id = article["article_id"]
+
+            sibling_ids = [
+                block_id
+                for block_id in article["blocks"]
+                if block_id not in contested
+                and block_id in block_lookup
+            ]
+
+            for block_id in article["blocks"]:
+
+                if block_id in contested:
+                    continue
+
+                block = block_lookup.get(block_id)
+
+                if block is None:
+                    continue
+
+                own_reference_ids = [
+                    other_id
+                    for other_id in sibling_ids
+                    if other_id != block_id
+                ]
+
+                if not own_reference_ids:
+                    # Only block in its article -- no sibling to
+                    # judge consistency against, so trust the claim.
+                    continue
+
+                own_distance = min(
+                    cls._layout_distance(
+                        block,
+                        block_lookup[other_id],
+                    )
+                    for other_id in own_reference_ids
+                )
+
+                if own_distance < ORPHAN_ISOLATION_FLOOR:
+                    continue
+
+                best_article_id = None
+                best_distance = None
+
+                for other_article in response_articles:
+
+                    if other_article["article_id"] == own_id:
+                        continue
+
+                    candidate_ids = [
+                        other_id
+                        for other_id in other_article["blocks"]
+                        if other_id not in contested
+                        and other_id in block_lookup
+                    ]
+
+                    if not candidate_ids:
+                        continue
+
+                    distance = min(
+                        cls._layout_distance(
+                            block,
+                            block_lookup[other_id],
+                        )
+                        for other_id in candidate_ids
+                    )
+
+                    if (
+                        best_distance is None
+                        or distance < best_distance
+                        or (
+                            distance == best_distance
+                            and other_article["article_id"]
+                            < best_article_id
+                        )
+                    ):
+                        best_distance = distance
+                        best_article_id = other_article["article_id"]
+
+                if (
+                    best_article_id is not None
+                    and best_distance < ORPHAN_ALTERNATIVE_CEILING
+                ):
+                    reassignments[block_id] = best_article_id
+
+        return reassignments
+
+    @staticmethod
+    def _apply_orphan_reassignments(response_articles, reassignments):
+        """
+        Move each reassigned block from its original article's
+        "blocks" list to its new one, leaving every other article
+        untouched. See _reassign_orphan_blocks for how targets are
+        chosen.
+        """
+
+        if not reassignments:
+            return response_articles
+
+        additions = {}
+
+        for block_id, target_article_id in reassignments.items():
+            additions.setdefault(target_article_id, []).append(
+                block_id
+            )
+
+        updated = []
+
+        for article in response_articles:
+
+            kept_blocks = [
+                block_id
+                for block_id in article["blocks"]
+                if block_id not in reassignments
+            ]
+
+            kept_blocks.extend(
+                additions.get(article["article_id"], [])
+            )
+
+            updated.append(
+                {
+                    **article,
+                    "blocks": kept_blocks,
+                }
+            )
+
+        return updated
 
     def build(
         self,
         parsed_response,
         blocks,
+        is_hindi: bool = True,
     ):
 
         #
@@ -221,9 +455,34 @@ class ArticleGrouper:
         # abuts it.
         #
 
-        resolved_owner = self._resolve_contested_blocks(
+        # Orphan-block reassignment runs for BOTH languages, unlike
+        # the contested-block arbitration below: it corrects a block
+        # that is geometrically inconsistent with the one article
+        # that (uniquely) claims it, which is a raw model mistake in
+        # either extraction path, not an English/Hindi policy
+        # difference.
+        orphan_reassignments = self._reassign_orphan_blocks(
             parsed_response["articles"],
             block_lookup,
+        )
+
+        response_articles = self._apply_orphan_reassignments(
+            parsed_response["articles"],
+            orphan_reassignments,
+        )
+
+        # English documents use repo B's original policy here: first
+        # claim wins, no layout-distance arbitration -- an empty
+        # resolved_owner map means the ownership check below never
+        # overrides the natural first-claim-wins order the
+        # claimed_block_ids loop already provides on its own.
+        resolved_owner = (
+            self._resolve_contested_blocks(
+                response_articles,
+                block_lookup,
+            )
+            if is_hindi
+            else {}
         )
 
         claimed_block_ids = set()
@@ -232,7 +491,7 @@ class ArticleGrouper:
         # Build each article
         #
 
-        for article in parsed_response["articles"]:
+        for article in response_articles:
 
             article_blocks = []
 
@@ -405,6 +664,16 @@ class ArticleGrouper:
                 f"WARNING: Dropped {duplicate_conflicts} duplicate "
                 "block claim(s) -- model assigned block(s) to more "
                 "than one article."
+            )
+
+        if orphan_reassignments:
+
+            print(
+                f"WARNING: Reassigned {len(orphan_reassignments)} "
+                "orphan block(s) -- claimed by one article but "
+                "geometrically inconsistent with it, moved to a "
+                "far-better-fitting article instead: "
+                f"{orphan_reassignments}"
             )
 
         print()

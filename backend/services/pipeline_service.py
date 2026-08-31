@@ -47,6 +47,18 @@ from pipeline.intelligence.openai_article_extractor import (
     OpenAIArticleExtractor,
 )
 
+from pipeline.intelligence.gemini_document_order_extractor import (
+    GeminiDocumentOrderExtractor,
+)
+
+from pipeline.intelligence.reconcile import (
+    reconcile_articles,
+)
+
+from pipeline.intelligence.heading_repair import (
+    repair_missing_headings,
+)
+
 from pipeline.intelligence.local.local_article_extractor import (
     LocalArticleExtractor,
 )
@@ -1266,6 +1278,78 @@ class PipelineService:
             )
 
             # =================================================
+            # STREAM B: DOCUMENT-ORDER EXTRACTION
+            #
+            # Fired now, off the raw rendered page images only --
+            # no dependency on OCR/layout/boundary detection or
+            # Stream A's article crops, so it runs concurrently with
+            # the rest of the pipeline instead of waiting on it. Has
+            # to wait for `document_llm_provider` specifically (just
+            # determined above) so it can route to the SAME provider
+            # as Stream A -- gpt-5.6-luna cannot read Devanagari, so
+            # a Hindi document must use Gemini here too, exactly like
+            # Stream A's boundary/extraction calls already do.
+            #
+            # Results are only collected and reconciled once Stream
+            # A's article extraction (below) has finished -- nothing
+            # here blocks anything else. Skipped entirely in local
+            # mode (no API calls at all).
+            #
+            # Off by default (DOCUMENT_ORDER_RECONCILE=1 to enable):
+            # this is a new, unvalidated accuracy layer with a real
+            # per-document cost, not a bug fix -- see reconcile.py
+            # for the merge policy (Stream A stays authoritative).
+            #
+            # Hindi-only: the reference English pipeline has no
+            # Stream B at all, so English never runs it regardless
+            # of the env flag -- only a Hindi-routed document can
+            # enable it.
+            # =================================================
+
+            document_order_enabled = (
+                document_llm_provider == "gemini"
+                and os.getenv(
+                    "DOCUMENT_ORDER_RECONCILE",
+                    "0",
+                )
+                == "1"
+            )
+
+            document_order_executor = None
+            document_order_futures = []
+
+            if document_order_enabled:
+
+                document_order_executor = (
+                    ThreadPoolExecutor(
+                        max_workers=int(
+                            os.getenv(
+                                "DOCUMENT_ORDER_CONCURRENCY",
+                                "4",
+                            )
+                        ),
+                    )
+                )
+
+                # document_order_enabled already requires
+                # document_llm_provider == "gemini" (English has no
+                # Stream B, matching the reference pipeline), so
+                # this is always the Gemini/Hindi extractor.
+                document_order_futures = (
+                    GeminiDocumentOrderExtractor().submit_batches(
+                        document_order_executor,
+                        pages,
+                    )
+                )
+
+                print(
+                    f"Document-order extraction (Stream B, "
+                    f"{document_llm_provider}): "
+                    f"{len(document_order_futures)} batch(es) "
+                    "submitted in background"
+                )
+
+            # =================================================
             # STEP 3
             # Create Document
             # =================================================
@@ -1407,10 +1491,26 @@ class PipelineService:
                 )
             )
 
+            # OCR/prepare concurrency: RapidOCR + YOLO both release
+            # the GIL during their actual compute (ONNX Runtime /
+            # torch inference), so a small thread pool here gives a
+            # real speedup instead of the "no benefit from threading
+            # it" situation pure-Python CPU work would have. Bounded
+            # low (default 2) since this machine has 6 physical
+            # cores shared with everything else the user has open --
+            # see OCR_PAGE_CONCURRENCY to change it.
+            prepare_concurrency = int(
+                os.getenv(
+                    "OCR_PAGE_CONCURRENCY",
+                    "2",
+                )
+            )
+
             print()
             print("=" * 60)
             print(
-                f"PIPELINED PAGE PREPARE + "
+                f"PIPELINED PAGE PREPARE "
+                f"(concurrency={prepare_concurrency}) + "
                 f"{document_llm_provider.upper()} "
                 f"(concurrency={gemini_concurrency})"
             )
@@ -1421,53 +1521,71 @@ class PipelineService:
 
             with ThreadPoolExecutor(
                 max_workers=max(1, gemini_concurrency),
-            ) as executor:
+            ) as executor, ThreadPoolExecutor(
+                max_workers=max(1, prepare_concurrency),
+            ) as prepare_executor:
 
                 futures = {}
 
-                for page_number, page_path in enumerate(
-                    pages,
-                    start=1,
-                ):
-
-                    print()
-                    print("=" * 60)
-
-                    print(
-                        f"PREPARING PAGE "
-                        f"{page_number}/{len(pages)}"
-                    )
-
-                    print("=" * 60)
-
-                    _report(
-                        f"Preparing page {page_number}/{len(pages)}",
-                        11 + round(24 * (page_number - 1) / len(pages)),
-                    )
-
-                    prep = prepare_page(
+                prepare_futures = {
+                    prepare_executor.submit(
+                        prepare_page,
                         page_number=page_number,
                         page_path=page_path,
                         detector=self.detector,
                         ocr_engine=active_ocr_engine,
                         document_id=document_id,
                         document_dir=document_dir,
+                    ): page_number
+                    for page_number, page_path in enumerate(
+                        pages,
+                        start=1,
                     )
+                }
+
+                print()
+                print("=" * 60)
+                print(
+                    f"PREPARING {len(pages)} PAGE(S) "
+                    f"(up to {prepare_concurrency} at a time)"
+                )
+                print("=" * 60)
+
+                _report(
+                    f"Preparing {len(pages)} page(s)",
+                    11,
+                )
+
+                for prepare_future in as_completed(
+                    prepare_futures,
+                ):
+
+                    page_number = prepare_futures[prepare_future]
+
+                    prep = prepare_future.result()
 
                     preps.append(prep)
 
+                    print(
+                        f"✓ Page {page_number}/{len(pages)} prepared"
+                    )
+
+                    _report(
+                        f"Prepared page {page_number}/{len(pages)}",
+                        11 + round(24 * len(preps) / len(pages)),
+                    )
+
                     # ---------------------------------------------
                     # Submit this page's LLM call NOW -- it runs in
-                    # the background while the loop immediately
-                    # continues preparing the next page, instead of
-                    # waiting for every page to finish preparing
-                    # first.
+                    # the background while prepare keeps going on
+                    # other pages, instead of waiting for every page
+                    # to finish preparing first.
                     # ---------------------------------------------
 
                     print(
                         f"→ Submitting {document_llm_provider} call "
                         f"for page {page_number} (runs in "
-                        f"background while later pages are "
+                        f"background while other pages are "
                         f"prepared)"
                     )
 
@@ -1478,6 +1596,15 @@ class PipelineService:
                             json_path=prep["json_path"],
                         )
                     ] = prep["page_number"]
+
+                # Prepared out of completion order (up to
+                # prepare_concurrency pages in flight at once) --
+                # restore page-number order so every downstream step
+                # that iterates `preps` in sequence behaves exactly
+                # as it did when prepare was strictly sequential.
+                preps.sort(
+                    key=lambda p: p["page_number"],
+                )
 
                 _report(
                     f"All {len(preps)} page(s) prepared -- "
@@ -1537,6 +1664,7 @@ class PipelineService:
                     prep,
                     gemini_response,
                     gemini_elapsed,
+                    is_hindi=(document_llm_provider == "gemini"),
                 )
 
                 # ---------------------------------------------
@@ -1653,6 +1781,73 @@ class PipelineService:
             )
 
             # =================================================
+            # STEP 11.5
+            # BOUNDARY REPAIR FROM STREAM B HEADING INDEX
+            #
+            # Stream B (document_order_extractor.py) has been
+            # reading raw pages independently since right after PDF
+            # rendering, and by now (Stream A's own per-page loop is
+            # completely finished -- this does NOT make Stream A
+            # wait on anything) most or all of its batches are
+            # already done or close to it.
+            #
+            # Each batch is collected via as_completed(), NOT in
+            # submission order, so a heading is repaired as soon as
+            # ITS batch returns rather than waiting for every batch
+            # to finish first. For every heading in a batch: if it
+            # matches a real page_json title block that isn't yet
+            # covered by any article's block_ids, AND that heading
+            # has real matching body text belonging to exactly one
+            # existing article (see heading_repair.py), that
+            # article's block_ids/boundary/crop is corrected in
+            # place -- surgically, one article at a time. Nothing is
+            # ever fabricated: with no clear match, Stream A's
+            # existing boundaries are left exactly as they are.
+            #
+            # This has to happen BEFORE article-level extraction
+            # below, since that stage reads final_articles_crops
+            # from disk -- a heading repaired only afterward would
+            # already have been sent to the vision model without it.
+            #
+            # The sections collected here are reused by the
+            # (unchanged) text-level Stream B reconciliation further
+            # down instead of re-collecting the same futures twice.
+            # =================================================
+
+            document_order_sections = []
+
+            if document_order_enabled:
+
+                print()
+                print("=" * 60)
+                print("BOUNDARY REPAIR FROM STREAM B")
+                print("=" * 60)
+
+                for future in as_completed(document_order_futures):
+
+                    try:
+                        batch_sections = future.result()
+                    except Exception as exc:
+                        print(
+                            "⚠ Document-order batch failed, "
+                            f"skipping: {exc}"
+                        )
+                        continue
+
+                    document_order_sections.extend(batch_sections)
+
+                    repair_missing_headings(
+                        document_dir,
+                        batch_sections,
+                    )
+
+                document_order_executor.shutdown(
+                    wait=True
+                )
+
+                print("=" * 60)
+
+            # =================================================
             # STEP 12
             # ARTICLE-LEVEL EXTRACTION
             # =================================================
@@ -1719,6 +1914,27 @@ class PipelineService:
                     document_dir
                 )
             )
+
+            # =================================================
+            # STREAM B TEXT RECONCILIATION
+            #
+            # Reuses the sections already collected in STEP 11.5
+            # above (every batch was awaited there, before article-
+            # level extraction ran) -- fold in genuine TEXT gaps
+            # only; Stream A's article_text stays authoritative; see
+            # reconcile.py. Boundary/crop-level gaps (a heading
+            # missing from its article) were already handled in STEP
+            # 11.5, separately from this text-only pass.
+            # =================================================
+
+            if document_order_enabled:
+
+                gemini_articles, _unresolved_sections = (
+                    reconcile_articles(
+                        gemini_articles,
+                        document_order_sections,
+                    )
+                )
 
             _report("Article-level extraction completed", 90)
 

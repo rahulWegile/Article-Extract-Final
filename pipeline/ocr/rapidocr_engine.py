@@ -1,5 +1,6 @@
 import cv2
 import os
+import re
 import threading
 import time
 
@@ -7,6 +8,7 @@ from rapidocr import RapidOCR
 from rapidocr.utils.typings import LangRec, ModelType, OCRVersion
 
 from pipeline.ocr.ocr_models import OCRResult
+from pipeline.ocr.layout_gap_recovery import recover_missed_blocks
 
 
 # ============================================================
@@ -45,6 +47,33 @@ class RapidOCREngine:
     # whatever runs after OCR in the same page-processing step.
     DEFAULT_TIME_BUDGET_SECONDS = 25.0
 
+    # Hindi-routed pages get a larger default budget: starting the
+    # native-Devanagari preload before the full-page pass (see
+    # process_blocks) measurably slows that pass down on this
+    # machine (CPU contention between paddlepaddle's cold load and
+    # RapidOCR's own inference -- observed 14.9s -> 39.9s on the
+    # same real page across two runs), which can otherwise exhaust
+    # DEFAULT_TIME_BUDGET_SECONDS before a single retry gets to run
+    # at all. English-routed pages are NOT affected -- they never
+    # start the preload this early, so they keep the original
+    # DEFAULT_TIME_BUDGET_SECONDS untouched (see "preserve current
+    # English performance").
+    NATIVE_DEVANAGARI_TIME_BUDGET_SECONDS = 75.0
+
+    # Per-retry-call cap on how long to wait for the background
+    # preload to finish (see _get_native_devanagari_recognizer's
+    # wait_timeout). Measured cold-load time is 17-27s; a cap well
+    # below that (the original 5.0s) meant the FIRST candidate
+    # block/line to reach this check would almost always give up
+    # before the model was ready and fall through to the same-engine
+    # fallback (useless for real Devanagari content) even when the
+    # overall time budget had plenty of room left -- observed on a
+    # real page: 55s of a 75s budget went unused while every retry
+    # timed out waiting only 5s each. This cap is chosen to cover the
+    # measured cold-load range; the actual wait is still bounded by
+    # whatever's left of the real budget (see remaining_budget).
+    NATIVE_LOAD_WAIT_CAP_SECONDS = 30.0
+
     # Native PaddleOCR runs the SAME Devanagari weights RapidOCR's
     # ONNX export uses (confirmed: neither library ships a larger
     # Devanagari model), but scored measurably higher on real text
@@ -52,18 +81,66 @@ class RapidOCREngine:
     # difference in the two runtimes' pre/post-processing, not model
     # quality. It is recognition-only (no detector -- native
     # PaddleOCR's own detector crashes on this machine), so it is
-    # used ONLY as a per-LINE retry for already-low-confidence lines,
-    # never as the primary pass: unconditional whole-page use both
-    # risks the 25s time budget (extrapolated ~33-42s on a dense
-    # page) and pays its ~660MB load cost (vs RapidOCR's 103MB for
-    # all three of its own models) on every document instead of only
-    # documents that actually need it.
+    # used ONLY as a per-LINE retry for lines flagged as Devanagari
+    # candidates (see _is_devanagari_candidate), never as the primary
+    # pass: unconditional whole-page use both risks the 25s time
+    # budget (extrapolated ~33-42s on a dense page) and pays its
+    # ~660MB load cost (vs RapidOCR's 103MB for all three of its own
+    # models) on every document instead of only documents/pages that
+    # actually turn out to need it -- see _start_native_devanagari_preload
+    # for how that cost stays lazy even now that this runs for
+    # English-routed documents too (not just Hindi-routed ones).
     #
-    # Ships disabled by default -- flip via this env var only after
-    # the manual accuracy spot-check in the project plan has been
-    # done. Confidence-improvement alone does not prove
-    # correctness-improvement.
+    # Manual accuracy spot-check done -- confirmed a real Devanagari
+    # headline crop that gpt-5.6-luna's vision read fabricated text
+    # for reads correctly through this path. On by default; set
+    # OCR_NATIVE_PADDLE_RETRY=0 to fall back to RapidOCR's own retry
+    # only.
     NATIVE_DEVANAGARI_MODEL_NAME = "devanagari_PP-OCRv5_mobile_rec"
+
+    # ========================================================
+    # PER-BLOCK SCRIPT DETECTION
+    #
+    # Deciding whether a block/line is worth a second opinion from
+    # the native Devanagari model, and -- when it is -- deciding
+    # which of the two candidate readings to keep. Both are text-only
+    # (no extra OCR cost to compute), so they gate the expensive part
+    # (an actual native-paddle recognition call) rather than
+    # replacing it.
+    # ========================================================
+
+    # Devanagari Unicode block.
+    _DEVANAGARI_RANGE = re.compile("[ऀ-ॿ]")
+
+    # Characters a genuinely correct reading -- English OR Devanagari
+    # -- is expected to consist almost entirely of. The default
+    # (English/Latin) recognizer's dictionary has no Devanagari
+    # characters in it at all, so when it is pointed at real
+    # Devanagari glyphs (matras, conjuncts) it cannot echo them back
+    # -- it instead emits stray symbols or mismatched Latin
+    # fragments, which show up here as characters outside this set.
+    _CLEAN_CHAR_PATTERN = re.compile("[A-Za-z0-9ऀ-ॿ .,'\"-]")
+
+    # A reading whose share of "garbage" (non-clean) characters meets
+    # or exceeds this is treated as a script-detection candidate
+    # regardless of its reported confidence -- a confidently wrong
+    # reading is exactly the failure mode this exists to catch (see
+    # the project's CONFIDENCE / RESULT SELECTION requirement: engine
+    # confidence values are not comparable across engines/scripts).
+    GARBAGE_RATIO_THRESHOLD = 0.30
+
+    # Above this confidence, a normal (non-title) reading is trusted
+    # without a second opinion -- close to the ~0.95 average already
+    # measured for clean English blocks, so genuinely good English
+    # text is left untouched.
+    CANDIDATE_CONFIDENCE_THRESHOLD = 0.75
+
+    # Headlines are the highest-priority case: large, clear glyphs
+    # can still fool the English recognizer into a confidently wrong
+    # Latin reading of real Devanagari text. Title blocks therefore
+    # get a stricter (higher) confidence bar before being considered
+    # "clean enough, skip the second opinion".
+    TITLE_CANDIDATE_CONFIDENCE_THRESHOLD = 0.90
 
     def __init__(self, lang="en"):
 
@@ -107,11 +184,18 @@ class RapidOCREngine:
 
         self._native_load_thread = None
 
+        # Language-agnostic: an English-routed document can still
+        # contain individual Devanagari blocks (a Hindi quote, a
+        # vernacular sidebar) that the whole-document language
+        # routing in pipeline_service.py never sees, since that
+        # routing picks ONE engine for the entire document. The
+        # per-block candidate check (_is_devanagari_candidate) is
+        # what keeps this cheap for genuinely English-only documents
+        # -- see _start_native_devanagari_preload.
         self._native_retry_enabled = (
-            lang in ("hi", "hindi")
-            and os.getenv(
+            os.getenv(
                 "OCR_NATIVE_PADDLE_RETRY",
-                "0",
+                "1",
             )
             == "1"
         )
@@ -229,7 +313,124 @@ class RapidOCREngine:
         return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
 
     # ========================================================
-    # NATIVE-PADDLE LINE RETRY (Hindi, low-confidence lines only)
+    # SCRIPT DETECTION HELPERS
+    # ========================================================
+
+    @classmethod
+    def _garbage_ratio(cls, text):
+        """
+        Fraction of a reading's non-space characters that fall
+        outside the "clean" set (see _CLEAN_CHAR_PATTERN). High for
+        the kind of stray-symbol/mismatched-Latin noise the English
+        recognizer produces when pointed at real Devanagari glyphs.
+        """
+
+        text = (text or "").strip()
+
+        if not text:
+            return 0.0
+
+        stripped = text.replace(" ", "")
+
+        if not stripped:
+            return 0.0
+
+        clean = len(
+            cls._CLEAN_CHAR_PATTERN.findall(stripped)
+        )
+
+        return 1.0 - (clean / len(stripped))
+
+    @classmethod
+    def _is_devanagari_candidate(
+        cls,
+        text,
+        confidence,
+        is_title=False,
+        doc_is_hindi=False,
+    ):
+        """
+        Cheap, text-only pre-filter deciding whether a block/line is
+        worth a second opinion from the native Devanagari recognizer.
+
+        Hindi-routed documents ONLY (`doc_is_hindi` must be true) --
+        this used to also run on English-routed documents, as a
+        "catch a Devanagari sidebar hiding in an English page" safety
+        net, but that reached further than intended: it returned True
+        unconditionally for any empty-text block regardless of
+        language, which meant the native model's preload was very
+        likely firing on English-only documents too, and its short-
+        reading/garbage-ratio checks could also flag genuine English
+        bylines or punctuation-heavy fragments, sending them through
+        an unnecessary and unvalidated second opinion. Restricted back
+        to Hindi-routed documents, where Devanagari characters in the
+        reading are the normal, expected case and this filter's
+        confidence-threshold/garbage-ratio signals are what they were
+        actually validated against.
+        """
+
+        if not doc_is_hindi:
+            return False
+
+        text = (text or "").strip()
+
+        if not text:
+            return True
+
+        if (
+            cls._garbage_ratio(text)
+            >= cls.GARBAGE_RATIO_THRESHOLD
+        ):
+            return True
+
+        threshold = (
+            cls.TITLE_CANDIDATE_CONFIDENCE_THRESHOLD
+            if is_title
+            else cls.CANDIDATE_CONFIDENCE_THRESHOLD
+        )
+
+        return (confidence or 0.0) < threshold
+
+    @classmethod
+    def _score_reading(cls, text, confidence):
+        """
+        Multi-factor score used to pick between two candidate
+        readings of the same line (the current reading vs. a native-
+        Devanagari retry).
+
+        Deliberately NOT a straight confidence comparison: OCR engine
+        confidence values are not directly comparable across engines/
+        recognizers, and a confidently WRONG Latin misreading of real
+        Devanagari text must still lose to a plausible Devanagari
+        reading. Genuine Devanagari content and a low garbage ratio
+        both add to the score independently of confidence, so a
+        readable Devanagari result can outrank a higher-confidence
+        but corrupted one.
+        """
+
+        text = (text or "").strip()
+
+        if not text:
+            return -1.0
+
+        score = float(confidence or 0.0)
+
+        if cls._DEVANAGARI_RANGE.search(text):
+            score += 0.5
+
+        score -= cls._garbage_ratio(text)
+
+        # A handful of characters is rarely a genuine full reading of
+        # a real text line -- mildly penalize very short outputs so
+        # an empty-ish native reading can't win purely on the bonuses
+        # above.
+        if len(text) <= 2:
+            score -= 0.3
+
+        return score
+
+    # ========================================================
+    # NATIVE-PADDLE LINE RETRY (Devanagari candidates only)
     # ========================================================
 
     def _get_native_devanagari_recognizer(self, wait_timeout=None):
@@ -470,14 +671,23 @@ class RapidOCREngine:
                 continue
 
             # ------------------------------------------------
-            # Only lines that are themselves weak -- a block can
-            # average below threshold while most of its lines
-            # are already fine.
+            # Only lines that themselves look like Devanagari
+            # candidates -- a block can average below threshold
+            # while most of its lines are already fine, and this
+            # is the SAME per-line script-detection check used to
+            # decide whether the block needed a retry at all (see
+            # _is_devanagari_candidate).
             # ------------------------------------------------
 
-            if (
-                line_confidence
-                >= self.LOW_CONFIDENCE_THRESHOLD
+            if not self._is_devanagari_candidate(
+                line.get("text", ""),
+                line_confidence,
+                is_title=(
+                    getattr(block, "cls", None) == "title"
+                ),
+                doc_is_hindi=(
+                    self.lang in ("hi", "hindi")
+                ),
             ):
 
                 new_lines.append(line)
@@ -530,9 +740,18 @@ class RapidOCREngine:
 
             native_text, native_confidence = native_result
 
+            # Multi-factor comparison, not a blind confidence
+            # comparison -- see _score_reading. A readable Devanagari
+            # result should strongly outrank a high-confidence but
+            # corrupted Latin/English result.
             if (
                 native_text
-                and native_confidence > line_confidence
+                and self._score_reading(
+                    native_text, native_confidence,
+                )
+                > self._score_reading(
+                    line.get("text", ""), line_confidence,
+                )
             ):
 
                 any_changed = True
@@ -814,13 +1033,36 @@ class RapidOCREngine:
         overall_start = time.perf_counter()
 
         if time_budget_seconds is None:
-            time_budget_seconds = self.DEFAULT_TIME_BUDGET_SECONDS
 
-        # Start the native-paddle recognizer's cold load now (if
-        # enabled) so its 17-27s one-time cost overlaps with the
-        # full-page OCR pass below instead of landing inside the
-        # retry loop's own budget later.
-        self._start_native_devanagari_preload()
+            time_budget_seconds = (
+                self.NATIVE_DEVANAGARI_TIME_BUDGET_SECONDS
+                if (
+                    self.lang in ("hi", "hindi")
+                    and self._native_retry_enabled
+                )
+                else self.DEFAULT_TIME_BUDGET_SECONDS
+            )
+
+        # A Hindi-routed document already accepted the native
+        # recognizer's cold-load cost before this per-block detection
+        # existed, so it keeps the ORIGINAL full overlap window: start
+        # the load now, before the full-page pass, so its 17-27s cost
+        # overlaps with that pass instead of eating into the fallback
+        # loop's own (much smaller) remaining time budget below --
+        # confirmed necessary by measurement: on a real 14.9s full-
+        # page pass, only ~10s of budget was left afterwards, nowhere
+        # near enough for a cold load started only at that point.
+        #
+        # An English-routed document does NOT get this early start --
+        # see the "NATIVE-PADDLE PRELOAD" section after the full-page
+        # pass below, which starts it only once a block on THIS page
+        # actually looks like a Devanagari candidate. Starting it here
+        # unconditionally for every document (not just Hindi-routed
+        # ones) would load a ~660MB model on English-only documents
+        # that will never use it, violating the "don't initialize
+        # PaddleOCR for English-only documents" requirement.
+        if self.lang in ("hi", "hindi"):
+            self._start_native_devanagari_preload()
 
         # ====================================================
         # READ PAGE ONCE
@@ -1268,6 +1510,135 @@ class RapidOCREngine:
             )
 
         # ====================================================
+        # LAYOUT GAP RECOVERY
+        #
+        # Purely layout-driven -- finds gaps between EXISTING blocks
+        # (never from OCR output) that pass a strict absolute-size
+        # cap and local-density check, then reads only that small
+        # region in its own isolated OCR call (not the busy full
+        # page, which can lose a large bold headline exactly the way
+        # small print gets lost -- confirmed on a real page). See
+        # layout_gap_recovery.py for why this shape specifically.
+        #
+        # `blocks` (the caller's list) and `processed_blocks` are
+        # both mutated in place so every downstream consumer of
+        # either -- the rest of this method's own candidate-
+        # detection/retry loop below, and the caller's own use of
+        # `blocks` after process_blocks returns -- sees the
+        # recovered block exactly like any other.
+        #
+        # Hindi-only: the reference English pipeline has no
+        # equivalent recovery step, so English's blocks are left
+        # exactly as the layout model produced them.
+        # ====================================================
+
+        if self.lang in ("hi", "hindi"):
+
+            next_id = (
+                max((b.id for b in blocks), default=0) + 1
+            )
+
+            recovered = recover_missed_blocks(
+                processed_blocks,
+                image,
+                self.reader,
+                next_id,
+            )
+
+            for (
+                new_block,
+                recovered_text,
+                recovered_confidence,
+                recovered_lines,
+            ) in recovered:
+
+                print(
+                    "Layout gap recovery: promoted a "
+                    f"missed {new_block.cls} block (id="
+                    f"{new_block.id}) from a verified layout gap "
+                    f"-- {recovered_text[:60]!r}"
+                )
+
+                blocks.append(new_block)
+                processed_blocks.append(new_block)
+
+                results[new_block.id] = OCRResult(
+                    text=recovered_text,
+                    confidence=recovered_confidence,
+                    x1=new_block.x1,
+                    y1=new_block.y1,
+                    x2=new_block.x2,
+                    y2=new_block.y2,
+                    lines=recovered_lines,
+                )
+
+        # ====================================================
+        # NATIVE-PADDLE PRELOAD (only if this page needs it)
+        #
+        # Scanning every block's already-computed text/confidence is
+        # free (no OCR call) and tells us whether the fallback loop
+        # below is actually going to want the native recognizer. A
+        # Hindi-routed document is always assumed to need it (same
+        # cost this document type already accepted before this
+        # change); an English-routed one only pays the ~660MB/17-27s
+        # load cost when a block genuinely looks like a Devanagari
+        # candidate. Starting it here (rather than at the very top of
+        # process_blocks) means it overlaps with the rest of this
+        # fallback loop's own work instead of the full-page pass --
+        # a smaller overlap window than before, but the alternative
+        # (starting it unconditionally up front) would load the
+        # model on every English-only document too.
+        # ====================================================
+
+        if self._native_retry_enabled:
+
+            needs_native_preload = (
+                self.lang in ("hi", "hindi")
+                or any(
+                    self._is_devanagari_candidate(
+                        results[block.id].text,
+                        results[block.id].confidence,
+                        is_title=(block.cls == "title"),
+                        doc_is_hindi=(
+                            self.lang in ("hi", "hindi")
+                        ),
+                    )
+                    for block in processed_blocks
+                )
+            )
+
+            if needs_native_preload:
+
+                self._start_native_devanagari_preload()
+
+                # An English-routed page that turns out to have a
+                # real Devanagari candidate needs the SAME headroom a
+                # Hindi-routed page gets by default -- the native
+                # model's 17-27s cold load has no chance to finish (or
+                # even meaningfully start) in whatever's left of a
+                # 25s budget after the full-page pass already used
+                # some of it. This only widens the budget for THIS
+                # page, and only once a candidate has actually been
+                # found on it -- an all-English page never reaches
+                # this branch, so it keeps the original 25s untouched.
+                if (
+                    time_budget_seconds
+                    < self.NATIVE_DEVANAGARI_TIME_BUDGET_SECONDS
+                ):
+
+                    print(
+                        "Devanagari candidate found -- extending "
+                        "OCR time budget from "
+                        f"{time_budget_seconds:.0f}s to "
+                        f"{self.NATIVE_DEVANAGARI_TIME_BUDGET_SECONDS:.0f}s "
+                        "for this page"
+                    )
+
+                    time_budget_seconds = (
+                        self.NATIVE_DEVANAGARI_TIME_BUDGET_SECONDS
+                    )
+
+        # ====================================================
         # TARGETED FALLBACK OCR
         #
         # Only empty OCR blocks are processed again.
@@ -1362,19 +1733,27 @@ class RapidOCREngine:
             # Empty result: always worth retrying (original
             # behaviour, any language).
             #
-            # Low-confidence Devanagari: the mobile Devanagari
-            # model is more sensitive to scan quality than the
-            # default model, and unlike an empty result there IS
-            # already a candidate reading here, so the enhanced
-            # retry's output only replaces it further below if it
-            # actually scores higher -- never blindly.
+            # Devanagari candidate: script-detected via
+            # _is_devanagari_candidate -- not just "low confidence on
+            # a Hindi-routed document" any more, since an English-
+            # routed document can still contain individual Devanagari
+            # blocks that whole-document language routing never
+            # catches. Unlike an empty result there IS already a
+            # candidate reading here, so the retry's output only
+            # replaces it further below if it actually scores higher
+            # (see _score_reading) -- never blindly.
             # ------------------------------------------------
 
             needs_enhancement = (
                 bool(current_text)
-                and self.lang in ("hi", "hindi")
-                and current_confidence
-                < self.LOW_CONFIDENCE_THRESHOLD
+                and self._is_devanagari_candidate(
+                    current_text,
+                    current_confidence,
+                    is_title=(block.cls == "title"),
+                    doc_is_hindi=(
+                        self.lang in ("hi", "hindi")
+                    ),
+                )
             )
 
             if current_text and not needs_enhancement:
@@ -1443,12 +1822,15 @@ class RapidOCREngine:
 
             if needs_enhancement and self._native_retry_enabled:
 
-                # Bounded wait, not an indefinite block: on an
-                # unusually fast full-page pass the background
-                # preload (started at the top of process_blocks)
-                # may not be done yet. Cap the wait well under
-                # whatever budget remains rather than risking most
-                # of it on just waiting for the load.
+                # Bounded wait, not an indefinite block: the
+                # background preload may still be mid-cold-load when
+                # the first candidate block/line reaches this check.
+                # Wait long enough to actually catch it (see
+                # NATIVE_LOAD_WAIT_CAP_SECONDS), but leave a small
+                # safety margin off the real remaining budget so
+                # waiting for the load can't itself consume the
+                # entire budget with nothing left to act on the
+                # result.
                 remaining_budget = (
                     time_budget_seconds
                     - (time.perf_counter() - overall_start)
@@ -1456,7 +1838,10 @@ class RapidOCREngine:
 
                 wait_timeout = max(
                     0.0,
-                    min(remaining_budget, 5.0),
+                    min(
+                        remaining_budget - 3.0,
+                        self.NATIVE_LOAD_WAIT_CAP_SECONDS,
+                    ),
                 )
 
                 recognizer = (
@@ -1714,16 +2099,22 @@ class RapidOCREngine:
 
                 # The empty-result path (needs_enhancement False)
                 # always has nothing to lose, so it always keeps
-                # the fallback. The low-confidence Devanagari retry
-                # DOES already have a candidate reading, so its
-                # enhanced result only replaces it when it actually
-                # scored higher -- an enhanced retry is not
-                # guaranteed to beat the original on every block.
+                # the fallback. The Devanagari-candidate retry DOES
+                # already have a candidate reading, so its enhanced
+                # result only replaces it when it actually scores
+                # higher (see _score_reading, same multi-factor
+                # comparison used for the native-paddle retry) -- an
+                # enhanced retry is not guaranteed to beat the
+                # original on every block.
 
                 keep_fallback = (
                     not needs_enhancement
-                    or fallback_confidence
-                    > current_confidence
+                    or self._score_reading(
+                        fallback_text, fallback_confidence,
+                    )
+                    > self._score_reading(
+                        current_text, current_confidence,
+                    )
                 )
 
                 if keep_fallback:

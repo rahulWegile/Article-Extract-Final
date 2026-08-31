@@ -171,8 +171,10 @@ function Search() {
         }
 
 
+        // ----------------------------------------------------
         // Load publication dates -- scoped to the newspaper if one
         // was supplied, otherwise every date across all newspapers.
+        // ----------------------------------------------------
 
         loadDates(
             urlNewspaper
@@ -200,25 +202,9 @@ function Search() {
 
 
         // ----------------------------------------------------
-        // Newspaper selected without a date -- browse that
-        // newspaper's entire archive.
-        // ----------------------------------------------------
-
-        if (urlNewspaper) {
-
-            performSearch({
-                suppliedQuery: urlQuery,
-                suppliedNewspaper: urlNewspaper,
-            });
-
-            return;
-
-        }
-
-
-        // ----------------------------------------------------
         // Otherwise perform a text search, or -- if nothing was
-        // supplied in the URL at all -- browse the full archive.
+        // supplied in the URL at all -- browse the full archive
+        // so landing on this page always shows every article.
         // ----------------------------------------------------
 
         performSearch({
@@ -525,6 +511,7 @@ function Search() {
         suppliedQuery = null,
         suppliedNewspaper = null,
         suppliedDate = null,
+        append = false,
     } = {}) => {
 
         const value = (
@@ -547,9 +534,17 @@ function Search() {
 
 
         // ----------------------------------------------------
-        // No filters selected means "browse the entire archive" --
-        // fall through and let the backend return every article.
+        // No filters at all means "browse the entire archive" --
+        // the backend already treats an empty query and no
+        // newspaper/date as "match everything", so fetch it
+        // instead of bailing out.
         // ----------------------------------------------------
+
+        const offset =
+            append
+                ? results.length
+                : 0;
+
 
         setLoading(
             true
@@ -564,112 +559,75 @@ function Search() {
 
         try {
 
-            // ----------------------------------------------------
-            // The backend caps `limit` at 100 per request, so a
-            // newspaper/query with more matches than that would be
-            // silently truncated. Page through every result here so
-            // the archive always shows the full set.
-            // ----------------------------------------------------
+            const params = {
 
-            const pageSize = 100;
+                // Empty string is allowed by backend.
+                q: value,
 
-            let allArticles = [];
+                limit: 100,
 
-            let totalCount = 0;
+                offset,
 
-            let pageOffset = 0;
-
-            while (true) {
-
-                const params = {
-
-                    // Empty string is allowed by backend.
-                    q: value,
-
-                    limit: pageSize,
-
-                    offset: pageOffset,
-
-                };
+            };
 
 
-                // ------------------------------------------------
-                // Add newspaper filter.
-                // ------------------------------------------------
+            // ------------------------------------------------
+            // Add newspaper filter.
+            // ------------------------------------------------
 
-                if (newspaper) {
+            if (newspaper) {
 
-                    params.newspaper =
-                        newspaper;
-
-                }
-
-
-                // ------------------------------------------------
-                // Add publication-date filter.
-                // ------------------------------------------------
-
-                if (date) {
-
-                    params.publish_date =
-                        date;
-
-                }
-
-
-                const response =
-                    await api.get(
-                        "/search/articles",
-                        {
-                            params,
-                        }
-                    );
-
-
-                const data =
-                    response.data;
-
-
-                const articles =
-                    data.results || [];
-
-
-                allArticles =
-                    allArticles.concat(
-                        articles
-                    );
-
-
-                totalCount =
-                    data.total || 0;
-
-
-                pageOffset += pageSize;
-
-
-                if (
-                    articles.length === 0 ||
-                    allArticles.length >= totalCount
-                ) {
-
-                    break;
-
-                }
+                params.newspaper =
+                    newspaper;
 
             }
 
 
+            // ------------------------------------------------
+            // Add publication-date filter.
+            // ------------------------------------------------
+
+            if (date) {
+
+                params.publish_date =
+                    date;
+
+            }
+
+
+            const response =
+                await api.get(
+                    "/search/articles",
+                    {
+                        params,
+                    }
+                );
+
+
+            const data =
+                response.data;
+
+
             const articles =
-                allArticles;
+                data.results || [];
+
+
+            const combinedResults =
+                append
+                    ? [
+                        ...results,
+                        ...articles,
+                    ]
+                    : articles;
 
 
             setResults(
-                articles
+                combinedResults
             );
 
 
             setTotal(
-                totalCount
+                data.total || 0
             );
 
 
@@ -689,10 +647,10 @@ function Search() {
                         date || "",
 
                     total:
-                        totalCount,
+                        data.total || 0,
 
                     results:
-                        articles,
+                        combinedResults,
                 })
             );
 
@@ -1419,6 +1377,39 @@ function Search() {
                             )
 
                         )}
+
+
+                        {/* =========================================
+                            LOAD MORE
+                            ========================================= */}
+
+                        {results.length > 0 &&
+                            results.length < total && (
+
+                                <button
+                                    className="archive-filter-button load-more-button"
+                                    onClick={() =>
+                                        performSearch({
+                                            append: true,
+                                        })
+                                    }
+                                    disabled={
+                                        loading
+                                    }
+                                >
+
+                                    {loading
+                                        ? "Loading..."
+                                        : `Load More (${
+                                            results.length
+                                        } of ${
+                                            total
+                                        })`
+                                    }
+
+                                </button>
+
+                            )}
 
                     </section>
 
