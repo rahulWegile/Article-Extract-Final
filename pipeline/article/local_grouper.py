@@ -46,6 +46,12 @@ from pathlib import Path
 
 import cv2
 
+from pipeline.article.visual_separator import (
+    SEPARATOR_MIN_BAND_HEIGHT,
+    has_visual_separator,
+    has_vertical_separator,
+)
+
 
 # Layout-detector classes that carry article text.
 TEXT_CLASSES = {"plain text", "title", "figure_caption"}
@@ -156,7 +162,21 @@ def _role_for(block):
     """
     Map a detector class / cleaner type onto the semantic role
     vocabulary the downstream stages expect.
+
+    A caller that already knows a block is a byline (e.g.
+    article_splitter.py re-running this on a subset the LLM already
+    semantically classified) can set block["role"] = "byline" to
+    short-circuit the class-based inference below. Confirmed on a
+    real page: a byline ("एजेंसी नई दिल्ली") detected with raw class
+    "title" -- a common upstream layout-detector mistake for bold/
+    caps byline text -- was otherwise treated as a legitimate new
+    article root by the class-only inference, splitting a story's
+    byline+continuation text away from its own headline. Offline
+    mode never sets this key, so this is a no-op there.
     """
+
+    if block.get("role") == "byline":
+        return "byline"
 
     block_type = (block.get("type") or "").strip().lower()
 
@@ -297,162 +317,6 @@ def _has_body_below(title, content, roles):
     return True
 
 
-# ----------------------------------------------------------------
-# VISUAL SEPARATOR (rule line / colored box edge)
-# ----------------------------------------------------------------
-#
-# Confirmed against a real page: a boxed sidebar story (a title
-# printed inside a bordered or colored-background box) can sit as
-# close as 17px above the preceding content -- BELOW the page's own
-# 23px median paragraph gap. No gap threshold can distinguish that
-# from an ordinary paragraph break; the newspaper is using a printed
-# border instead of whitespace to mark the split, so the pixels
-# themselves have to be checked for that border.
-
-# A printed rule line or a colored box background is a MOSTLY
-# UNIFORM row of pixels that is not blank paper: low variation across
-# the row (unlike a row of body text, which mixes dark glyphs and
-# white background and so has high variation), but not lit up close
-# to white either.
-SEPARATOR_ROW_STD_MAX = 15.0
-SEPARATOR_ROW_BRIGHTNESS_MAX = 205.0
-
-# A colored tag/box background (the common "अवसर" / "आदेश" style
-# orange or yellow label boxes) can be almost as bright as paper in
-# plain grayscale, so it needs its own check: a saturated row is
-# color, which blank paper and plain body text never are.
-SEPARATOR_ROW_SATURATION_MIN = 45.0
-
-# The probe band is at least this tall even when the measured gap is
-# ~0, so a border drawn flush against the block is still inspected.
-SEPARATOR_MIN_BAND_HEIGHT = 10
-
-
-def _has_visual_separator(page_image, x1, x2, y1, y2):
-    """
-    Look for a printed rule line or colored box edge in the page
-    image, within columns [x1, x2) and rows [y1, y2).
-    """
-
-    if page_image is None:
-        return False
-
-    height, width = page_image.shape[:2]
-
-    x1 = max(0, int(x1))
-    x2 = min(width, int(x2))
-    y1 = max(0, int(y1))
-    y2 = min(height, int(y2))
-
-    if x2 <= x1 or y2 <= y1:
-        return False
-
-    band = page_image[y1:y2, x1:x2]
-
-    if band.size == 0:
-        return False
-
-    gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
-
-    row_std = gray.std(axis=1)
-    row_mean = gray.mean(axis=1)
-    row_saturation = hsv[:, :, 1].mean(axis=1)
-
-    is_rule_line = (
-        (row_std < SEPARATOR_ROW_STD_MAX)
-        & (row_mean < SEPARATOR_ROW_BRIGHTNESS_MAX)
-    )
-
-    is_colored_band = (
-        row_saturation > SEPARATOR_ROW_SATURATION_MIN
-    )
-
-    return bool((is_rule_line | is_colored_band).any())
-
-
-# Width of the strip probed just outside a title's left/right edge.
-VERTICAL_SEPARATOR_PROBE_WIDTH = 20
-
-# A vertical divider bar only needs to be dark/colored for a solid
-# majority of the title's height, not the full height, since OCR
-# bounding boxes are usually a few px tighter than the printed bar.
-VERTICAL_SEPARATOR_MIN_COVERAGE = 0.6
-
-
-def _has_vertical_separator(page_image, x1, x2, y1, y2):
-    """
-    Look for a vertical divider bar immediately to the LEFT or RIGHT
-    of a block -- the pattern used by side-by-side tag/label boxes
-    printed in one row (e.g. three short items separated by thin red
-    bars rather than being stacked with a gap between them, which
-    _has_visual_separator's row-wise horizontal check cannot see at
-    all since there is no horizontal band between such blocks).
-    """
-
-    if page_image is None:
-        return False
-
-    height, width = page_image.shape[:2]
-
-    y1 = max(0, int(y1))
-    y2 = min(height, int(y2))
-
-    if y2 <= y1:
-        return False
-
-    def probe_strip(strip_x1, strip_x2):
-
-        strip_x1 = max(0, int(strip_x1))
-        strip_x2 = min(width, int(strip_x2))
-
-        if strip_x2 <= strip_x1:
-            return False
-
-        strip = page_image[y1:y2, strip_x1:strip_x2]
-
-        if strip.size == 0:
-            return False
-
-        gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
-
-        # Per-pixel ink test (dark OR saturated), then per-COLUMN
-        # coverage of that test down the probe height. A mean/std
-        # summary taken across the whole column was tried first and
-        # rejected: a bar only 1-3px wide sits among ~20px of blank
-        # margin, and a bar that does not run the full probe height
-        # (rendering/alignment slop) mixes with blank rows in the
-        # same column -- both dilute a plain average toward "blank"
-        # even directly on top of a real, visible bar. Coverage
-        # fraction is not fooled by either: the bar's OWN column
-        # still shows high ink coverage regardless of how much blank
-        # margin surrounds it or how much of the full height it
-        # covers.
-        ink = (
-            (gray < SEPARATOR_ROW_BRIGHTNESS_MAX)
-            | (hsv[:, :, 1] > SEPARATOR_ROW_SATURATION_MIN)
-        )
-
-        coverage = ink.mean(axis=0)
-
-        return bool(
-            (coverage >= VERTICAL_SEPARATOR_MIN_COVERAGE).any()
-        )
-
-    left = probe_strip(
-        x1 - VERTICAL_SEPARATOR_PROBE_WIDTH,
-        x1,
-    )
-
-    right = probe_strip(
-        x2,
-        x2 + VERTICAL_SEPARATOR_PROBE_WIDTH,
-    )
-
-    return bool(left or right)
-
-
 def build_local_response(page_json_path, page_image_path=None):
     """
     Group one page's blocks into articles without any model call.
@@ -512,7 +376,7 @@ def group_blocks(blocks, page_image=None):
         for b in blocks
         if _bbox(b) is not None
         and roles.get(b["id"])
-        in {"article_title", "article_text", "article_image", "caption"}
+        in {"article_title", "article_text", "article_image", "caption", "byline"}
     ]
 
     content.sort(key=lambda b: (_bbox(b)["y1"], _bbox(b)["x1"]))
@@ -556,7 +420,7 @@ def group_blocks(blocks, page_image=None):
 
         probe_height = max(gap, SEPARATOR_MIN_BAND_HEIGHT)
 
-        has_horizontal_separator = _has_visual_separator(
+        has_horizontal_separator = has_visual_separator(
             page_image,
             box["x1"],
             box["x2"],
@@ -566,7 +430,7 @@ def group_blocks(blocks, page_image=None):
 
         # Some layouts print several short items in one row,
         # divided by a vertical bar instead of a horizontal gap.
-        has_vertical_separator = _has_vertical_separator(
+        has_vertical_sep_line = has_vertical_separator(
             page_image,
             box["x1"],
             box["x2"],
@@ -574,7 +438,7 @@ def group_blocks(blocks, page_image=None):
             box["y2"],
         )
 
-        if has_horizontal_separator or has_vertical_separator:
+        if has_horizontal_separator or has_vertical_sep_line:
             roots.append(block)
 
     # A page of pure body text still needs somewhere to put it.

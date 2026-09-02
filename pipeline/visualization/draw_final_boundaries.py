@@ -38,22 +38,32 @@ class FinalBoundaryVisualizer:
             y2 = int(boundary.y2)
 
             #
-            # Draw boundary
+            # Draw boundary. An article boundary_decomposer.py gave a
+            # multi-rectangle shape (see Article.sub_rects) is drawn
+            # as its precise pieces instead of the single overall
+            # rectangle, which would still visually cross whatever
+            # neighbouring article it was reshaped to avoid.
             #
 
-            cv2.rectangle(
+            sub_rects = getattr(boundary, "sub_rects", None) or []
 
-                image,
+            rects_to_draw = sub_rects if sub_rects else [(x1, y1, x2, y2)]
 
-                (x1, y1),
+            for rx1, ry1, rx2, ry2 in rects_to_draw:
 
-                (x2, y2),
+                cv2.rectangle(
 
-                (0, 255, 0),      # Green
+                    image,
 
-                3,
+                    (int(rx1), int(ry1)),
 
-            )
+                    (int(rx2), int(ry2)),
+
+                    (0, 255, 0),      # Green
+
+                    3,
+
+                )
 
             #
             # Label

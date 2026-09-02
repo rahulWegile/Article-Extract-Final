@@ -96,6 +96,12 @@ function toDraftItem(boundary) {
         bbox: { ...boundary.bbox },
         is_multi_page: boundary.is_multi_page,
         isNew: false,
+        // Precise sub-rectangles the backend gives an article whose
+        // single bbox would otherwise cross into a neighbouring
+        // article (see Article.sub_rects, pipeline side). Empty for
+        // the overwhelming majority of articles, which render as
+        // `bbox` alone exactly as before.
+        sub_rects: (boundary.sub_rects || []).map((r) => ({ ...r })),
     };
 }
 
@@ -937,38 +943,69 @@ function Viewer() {
 
                                             )}
 
-                                            {draftBoundaries.map((item) => (
+                                            {draftBoundaries.map((item) => {
 
-                                                <rect
-                                                    key={item.key}
-                                                    x={item.bbox.x1}
-                                                    y={item.bbox.y1}
-                                                    width={item.bbox.x2 - item.bbox.x1}
-                                                    height={item.bbox.y2 - item.bbox.y1}
-                                                    className={
-                                                        "boundary-box" +
-                                                        // (item.is_multi_page ? " multi-page" : "") +
-                                                        (!editMode || addMode ? " not-editable" : "") +
-                                                        (item.key === selectedKey ? " selected" : "") +
-                                                        (item.isNew ? " pending-new" : "") +
-                                                        (editedArticleIds.has(item.article_id) ? " pending-edited" : "")
-                                                    }
-                                                    onPointerDown={
-                                                        editMode && !addMode && !item.is_multi_page
-                                                            ? handleBoxPointerDown(item)
-                                                            : undefined
-                                                    }
-                                                >
+                                                const hasSubRects = item.sub_rects && item.sub_rects.length > 0;
 
-                                                    {item.is_multi_page && (
-                                                        <title>
-                                                            Spans multiple pages — not editable here
-                                                        </title>
-                                                    )}
+                                                const boxClassName =
+                                                    "boundary-box" +
+                                                    // (item.is_multi_page ? " multi-page" : "") +
+                                                    (!editMode || addMode ? " not-editable" : "") +
+                                                    (item.key === selectedKey ? " selected" : "") +
+                                                    (item.isNew ? " pending-new" : "") +
+                                                    (editedArticleIds.has(item.article_id) ? " pending-edited" : "");
 
-                                                </rect>
+                                                return (
 
-                                            ))}
+                                                    <g key={item.key}>
+
+                                                        <rect
+                                                            x={item.bbox.x1}
+                                                            y={item.bbox.y1}
+                                                            width={item.bbox.x2 - item.bbox.x1}
+                                                            height={item.bbox.y2 - item.bbox.y1}
+                                                            className={
+                                                                boxClassName +
+                                                                // The precise pieces below carry the visible
+                                                                // fill/stroke instead -- this rect stays only
+                                                                // as the drag/select hit-target so editing
+                                                                // (which always acts on the single bbox) is
+                                                                // unaffected.
+                                                                (hasSubRects ? " boundary-box-hit-only" : "")
+                                                            }
+                                                            onPointerDown={
+                                                                editMode && !addMode && !item.is_multi_page
+                                                                    ? handleBoxPointerDown(item)
+                                                                    : undefined
+                                                            }
+                                                        >
+
+                                                            {item.is_multi_page && (
+                                                                <title>
+                                                                    Spans multiple pages — not editable here
+                                                                </title>
+                                                            )}
+
+                                                        </rect>
+
+                                                        {hasSubRects && item.sub_rects.map((r, index) => (
+
+                                                            <rect
+                                                                key={`${item.key}-sub-${index}`}
+                                                                x={r.x1}
+                                                                y={r.y1}
+                                                                width={r.x2 - r.x1}
+                                                                height={r.y2 - r.y1}
+                                                                className={boxClassName + " boundary-sub-rect"}
+                                                            />
+
+                                                        ))}
+
+                                                    </g>
+
+                                                );
+
+                                            })}
 
                                             {editMode && selectedItem && !selectedItem.is_multi_page && (
 

@@ -8,9 +8,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+import cv2
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai import APIConnectionError, APIStatusError
+
+from pipeline.article.visual_separator import annotate_gaps
 
 load_dotenv()
 
@@ -18,9 +21,9 @@ load_dotenv()
 # ============================================================
 # ROLE ENUM
 #
-# Must match the roles listed in pipeline/gemini/gemini_prompt.py
-# (ARTICLE_GROUP_PROMPT) and pipeline/article/article_grouper.py
-# (IGNORE_ROLES).
+# Must match the roles listed in the grouping prompts
+# (each language's pipeline/languages/<language>/grouping_prompt.py) and
+# pipeline/article/article_grouper.py (IGNORE_ROLES).
 # ============================================================
 
 _BLOCK_ROLES = [
@@ -294,7 +297,10 @@ class OpenAIService:
     # ========================================================
 
     @staticmethod
-    def _compact_blocks_payload(json_path: str) -> str:
+    def _compact_blocks_payload(
+        json_path: str,
+        image_path: str | None = None,
+    ) -> str:
         """
         The exported page JSON carries a lot of fields the grouping
         prompt never asks for (width/height/center derived from bbox,
@@ -308,10 +314,34 @@ class OpenAIService:
         the prompt documents as input ("id, class, type, bbox,
         reading_order, OCR text, column, confidence, optional
         knowledge") and serialize it compactly.
+
+        Also annotates each block with gap_above/gap_below (blank
+        vertical distance to its nearest same-column neighbour) and,
+        when `image_path` is given, has_rule_line_above/
+        has_rule_line_below (a printed rule line or colored box edge
+        probed directly from the page's own pixels) plus the page's
+        median_block_gap for scale -- see
+        pipeline.article.visual_separator.annotate_gaps.
+
+        This was previously computed only on the Gemini path
+        (gemini_service.py), which left every OpenAI-routed language
+        -- Urdu among them -- without the single strongest
+        separation signal on a boxed/ruled newspaper layout: printed
+        story borders. Confirmed on a real Urdu (THE INQUILAB) page,
+        every story is boxed in exactly this way, and the model
+        analyzing that page never received evidence of it.
         """
 
         with open(json_path, "r", encoding="utf-8") as f:
             page = json.load(f)
+
+        page_image = None
+
+        if image_path is not None:
+            try:
+                page_image = cv2.imread(str(image_path))
+            except Exception:
+                page_image = None
 
         compact_blocks = []
 
@@ -333,10 +363,13 @@ class OpenAIService:
                 }
             )
 
+        median_gap = annotate_gaps(compact_blocks, page_image)
+
         compact_page = {
             "page": page.get("page"),
             "page_width": page.get("page_width"),
             "page_height": page.get("page_height"),
+            "median_block_gap": median_gap,
             "blocks": compact_blocks,
         }
 
@@ -353,7 +386,7 @@ class OpenAIService:
         prompt: str,
     ) -> dict[str, Any]:
 
-        page_json_text = self._compact_blocks_payload(json_path)
+        page_json_text = self._compact_blocks_payload(json_path, image_path)
 
         schema = {
             "type": "object",

@@ -8,7 +8,12 @@ from rapidocr import RapidOCR
 from rapidocr.utils.typings import LangRec, ModelType, OCRVersion
 
 from pipeline.ocr.ocr_models import OCRResult
-from pipeline.ocr.layout_gap_recovery import recover_missed_blocks
+from pipeline.ocr.layout_gap_recovery import (
+    page_confidence_reference,
+    page_line_heights,
+    recover_missed_blocks,
+    recover_misclassified_text_blocks,
+)
 
 
 # ============================================================
@@ -142,19 +147,55 @@ class RapidOCREngine:
     # "clean enough, skip the second opinion".
     TITLE_CANDIDATE_CONFIDENCE_THRESHOLD = 0.90
 
-    def __init__(self, lang="en"):
+    def __init__(
+        self,
+        lang="en",
+        enable_misclassified_figure_recovery=True,
+        enable_low_confidence_retry=True,
+    ):
 
         print(f"Loading RapidOCR (lang={lang})...")
 
         self.lang = lang
 
-        if lang in ("hi", "hindi"):
+        # Both default to True, i.e. the behaviour this engine has had
+        # since these passes were added. English's language pipeline
+        # (pipeline/languages/english/__init__.py) turns them off to
+        # match the reference "english Pproper" pipeline, whose OCR
+        # engine has neither pass. Every other language, and the
+        # default engine used for masthead detection, keeps them.
+        self._enable_misclassified_figure_recovery = bool(
+            enable_misclassified_figure_recovery
+        )
+
+        self._enable_low_confidence_retry = bool(
+            enable_low_confidence_retry
+        )
+
+        # Devanagari-script languages share the same recognition
+        # model -- Marathi is written in the same script as Hindi,
+        # so it reuses every Hindi-tuned accuracy path in this file
+        # (see self._is_devanagari_lang below) instead of getting a
+        # separate, unvalidated code path.
+        self._is_devanagari_lang = lang in (
+            "hi", "hindi", "mr", "marathi",
+        )
+
+        # Whole-page contrast normalization (see _normalize_contrast)
+        # is a generic scan/photo preprocessing step, not specific to
+        # Devanagari, so it is also applied to every other RapidOCR-
+        # routed non-Latin language.
+        self._apply_page_contrast_normalization = lang in (
+            "hi", "hindi", "mr", "marathi", "ta", "tamil",
+        )
+
+        if self._is_devanagari_lang:
 
             # PP-OCRv6 (the package default) has no Devanagari
             # recognition model -- only PP-OCRv4/v5 ship one.
             # Detection/orientation stay on their normal defaults;
             # only the recognition model is swapped, and only for
-            # documents already identified as Hindi.
+            # documents already identified as Hindi or Marathi.
             self.reader = RapidOCR(
                 params={
                     "Rec.lang_type": LangRec.DEVANAGARI,
@@ -162,6 +203,33 @@ class RapidOCREngine:
                     "Rec.model_type": ModelType.MOBILE,
                 }
             )
+
+        elif lang in ("ta", "tamil"):
+
+            # Same PP-OCRv5/mobile family as the Devanagari branch
+            # above, swapped to the Tamil recognition model.
+            self.reader = RapidOCR(
+                params={
+                    "Rec.lang_type": LangRec.TA,
+                    "Rec.ocr_version": OCRVersion.PPOCRV5,
+                    "Rec.model_type": ModelType.MOBILE,
+                }
+            )
+
+        # NOTE: RapidOCR does ship real recognition models for Telugu
+        # (LangRec.TE, PP-OCRv5/mobile) and Kannada (LangRec.KA,
+        # PP-OCRv4/mobile -- its only tier for that script), and both
+        # were originally routed here on that basis. A direct side-by-
+        # side test against TesseractOCREngine found RapidOCR's shared
+        # text detector silently returns zero detected boxes for some
+        # real Telugu conjunct clusters (unfixed by lower confidence
+        # thresholds, padding, or upscaling) and badly garbles Kannada
+        # recognition, while Tesseract read the identical crops
+        # correctly. Both languages were moved to TesseractOCREngine
+        # (see pipeline/languages/telugu.py and
+        # pipeline/languages/kannada.py for the measured comparison)
+        # -- this class intentionally has no "te"/"ka" branch any
+        # more.
 
         else:
 
@@ -347,29 +415,30 @@ class RapidOCREngine:
         text,
         confidence,
         is_title=False,
-        doc_is_hindi=False,
+        doc_is_devanagari_script=False,
     ):
         """
         Cheap, text-only pre-filter deciding whether a block/line is
         worth a second opinion from the native Devanagari recognizer.
 
-        Hindi-routed documents ONLY (`doc_is_hindi` must be true) --
-        this used to also run on English-routed documents, as a
-        "catch a Devanagari sidebar hiding in an English page" safety
-        net, but that reached further than intended: it returned True
+        Devanagari-routed documents ONLY (Hindi/Marathi --
+        `doc_is_devanagari_script` must be true) -- this used to also
+        run on English-routed documents, as a "catch a Devanagari
+        sidebar hiding in an English page" safety net, but that
+        reached further than intended: it returned True
         unconditionally for any empty-text block regardless of
         language, which meant the native model's preload was very
         likely firing on English-only documents too, and its short-
         reading/garbage-ratio checks could also flag genuine English
         bylines or punctuation-heavy fragments, sending them through
         an unnecessary and unvalidated second opinion. Restricted back
-        to Hindi-routed documents, where Devanagari characters in the
-        reading are the normal, expected case and this filter's
+        to Devanagari-routed documents, where Devanagari characters in
+        the reading are the normal, expected case and this filter's
         confidence-threshold/garbage-ratio signals are what they were
         actually validated against.
         """
 
-        if not doc_is_hindi:
+        if not doc_is_devanagari_script:
             return False
 
         text = (text or "").strip()
@@ -685,8 +754,8 @@ class RapidOCREngine:
                 is_title=(
                     getattr(block, "cls", None) == "title"
                 ),
-                doc_is_hindi=(
-                    self.lang in ("hi", "hindi")
+                doc_is_devanagari_script=(
+                    self._is_devanagari_lang
                 ),
             ):
 
@@ -1014,6 +1083,7 @@ class RapidOCREngine:
         image_path,
         blocks,
         time_budget_seconds=None,
+        page_number=None,
     ):
 
         # ====================================================
@@ -1037,7 +1107,7 @@ class RapidOCREngine:
             time_budget_seconds = (
                 self.NATIVE_DEVANAGARI_TIME_BUDGET_SECONDS
                 if (
-                    self.lang in ("hi", "hindi")
+                    self._is_devanagari_lang
                     and self._native_retry_enabled
                 )
                 else self.DEFAULT_TIME_BUDGET_SECONDS
@@ -1061,7 +1131,7 @@ class RapidOCREngine:
         # ones) would load a ~660MB model on English-only documents
         # that will never use it, violating the "don't initialize
         # PaddleOCR for English-only documents" requirement.
-        if self.lang in ("hi", "hindi"):
+        if self._is_devanagari_lang:
             self._start_native_devanagari_preload()
 
         # ====================================================
@@ -1199,7 +1269,7 @@ class RapidOCREngine:
         # passes on top of each other has no benefit.
         ocr_input = image
 
-        if self.lang in ("hi", "hindi"):
+        if self._apply_page_contrast_normalization:
 
             ocr_input = self._normalize_contrast(
                 image
@@ -1532,7 +1602,27 @@ class RapidOCREngine:
         # exactly as the layout model produced them.
         # ====================================================
 
-        if self.lang in ("hi", "hindi"):
+        # What "confident" means for THIS page's script, measured
+        # from the blocks the full-page pass already read
+        # successfully, so the recovery passes below gate on a floor
+        # the engine can actually reach on this script -- see
+        # layout_gap_recovery's SCRIPT-RELATIVE CONFIDENCE FLOORS.
+        confidence_reference = page_confidence_reference(
+            result.confidence
+            for result in results.values()
+            if result.text.strip()
+        )
+
+        # How tall this page's body type and display type actually
+        # are, per LINE -- see
+        # layout_gap_recovery._classify_recovered_block.
+        line_heights = page_line_heights(
+            (block.cls, results[block.id].lines)
+            for block in blocks
+            if block.id in results
+        )
+
+        if self._is_devanagari_lang:
 
             next_id = (
                 max((b.id for b in blocks), default=0) + 1
@@ -1543,6 +1633,8 @@ class RapidOCREngine:
                 image,
                 self.reader,
                 next_id,
+                confidence_reference=confidence_reference,
+                line_heights=line_heights,
             )
 
             for (
@@ -1573,6 +1665,63 @@ class RapidOCREngine:
                 )
 
         # ====================================================
+        # MISCLASSIFIED FIGURE RECOVERY
+        #
+        # A different failure from the layout-gap recovery above:
+        # here the detector DID draw a box, but classified it
+        # "figure" (image) when the region is actually text -- see
+        # layout_gap_recovery.py's MISCLASSIFIED FIGURE RECOVERY
+        # section for the confirmed real-page case and the safety
+        # checks that keep a genuine photograph from ever being
+        # relabeled. NOT limited to Hindi/Marathi like the gap
+        # recovery above -- a layout model calling bold headline
+        # text an image is a visual misclassification, not a
+        # script-specific OCR problem, so this runs for every
+        # document.
+        # ====================================================
+
+        reclassified = (
+            recover_misclassified_text_blocks(
+                blocks,
+                image,
+                self.reader,
+                confidence_reference=confidence_reference,
+                page_number=page_number,
+                line_heights=line_heights,
+            )
+            if self._enable_misclassified_figure_recovery
+            else []
+        )
+
+        for (
+            reclassified_block,
+            recovered_text,
+            recovered_confidence,
+            recovered_lines,
+        ) in reclassified:
+
+            print(
+                "Figure misclassification recovery: relabeled "
+                f"block (id={reclassified_block.id}) from "
+                f"'figure' to {reclassified_block.cls!r} -- "
+                f"{recovered_text[:60]!r}"
+            )
+
+            skipped_count -= 1
+
+            processed_blocks.append(reclassified_block)
+
+            results[reclassified_block.id] = OCRResult(
+                text=recovered_text,
+                confidence=recovered_confidence,
+                x1=reclassified_block.x1,
+                y1=reclassified_block.y1,
+                x2=reclassified_block.x2,
+                y2=reclassified_block.y2,
+                lines=recovered_lines,
+            )
+
+        # ====================================================
         # NATIVE-PADDLE PRELOAD (only if this page needs it)
         #
         # Scanning every block's already-computed text/confidence is
@@ -1593,14 +1742,14 @@ class RapidOCREngine:
         if self._native_retry_enabled:
 
             needs_native_preload = (
-                self.lang in ("hi", "hindi")
+                self._is_devanagari_lang
                 or any(
                     self._is_devanagari_candidate(
                         results[block.id].text,
                         results[block.id].confidence,
                         is_title=(block.cls == "title"),
-                        doc_is_hindi=(
-                            self.lang in ("hi", "hindi")
+                        doc_is_devanagari_script=(
+                            self._is_devanagari_lang
                         ),
                     )
                     for block in processed_blocks
@@ -1742,6 +1891,27 @@ class RapidOCREngine:
             # candidate reading here, so the retry's output only
             # replaces it further below if it actually scores higher
             # (see _score_reading) -- never blindly.
+            #
+            # Low confidence (any script/language): a SEPARATE,
+            # broader trigger from the Devanagari check above --
+            # confirmed on a real Tamil page: a title block ("சென்னை",
+            # a dateline) printed only 3px above the next block's
+            # first line, with overlapping columns, made RapidOCR's
+            # own full-page text DETECTOR draw a corrupted region
+            # spanning across both -- 0.552 confidence, recognizable
+            # Latin-letter noise mixed into otherwise-perfect Tamil.
+            # The Tamil recognition model itself is not at fault (the
+            # same reader gets 0.92-0.98 on this exact text once
+            # re-cropped in isolation, away from the neighbouring
+            # block) -- this is a detection-boundary collision that
+            # can happen in ANY script whenever two blocks sit nearly
+            # flush against each other, so unlike the Devanagari
+            # check this is deliberately NOT gated by language.
+            # Deliberately kept OUT of `needs_enhancement` itself: that
+            # flag also controls the Devanagari-only contrast
+            # enhancement and native-paddle retry paths below, neither
+            # of which should ever fire for a non-Devanagari block just
+            # because its confidence happens to be low.
             # ------------------------------------------------
 
             needs_enhancement = (
@@ -1750,13 +1920,21 @@ class RapidOCREngine:
                     current_text,
                     current_confidence,
                     is_title=(block.cls == "title"),
-                    doc_is_hindi=(
-                        self.lang in ("hi", "hindi")
+                    doc_is_devanagari_script=(
+                        self._is_devanagari_lang
                     ),
                 )
             )
 
-            if current_text and not needs_enhancement:
+            is_low_confidence = (
+                self._enable_low_confidence_retry
+                and bool(current_text)
+                and current_confidence < self.LOW_CONFIDENCE_THRESHOLD
+            )
+
+            needs_retry = needs_enhancement or is_low_confidence
+
+            if current_text and not needs_retry:
 
                 continue
 
@@ -2097,18 +2275,25 @@ class RapidOCREngine:
 
                     fallback_confidence = 0.0
 
-                # The empty-result path (needs_enhancement False)
-                # always has nothing to lose, so it always keeps
-                # the fallback. The Devanagari-candidate retry DOES
-                # already have a candidate reading, so its enhanced
-                # result only replaces it when it actually scores
-                # higher (see _score_reading, same multi-factor
-                # comparison used for the native-paddle retry) -- an
-                # enhanced retry is not guaranteed to beat the
-                # original on every block.
+                # The empty-result path (current_text falsy) always
+                # has nothing to lose, so it always keeps the
+                # fallback. Both retry-with-an-existing-reading cases
+                # -- the Devanagari-candidate retry AND the low-
+                # confidence retry (see needs_retry above) -- DO
+                # already have a candidate reading, so their result
+                # only replaces it when it actually scores higher
+                # (see _score_reading, same multi-factor comparison
+                # used for the native-paddle retry) -- a retry is not
+                # guaranteed to beat the original on every block.
+                #
+                # Keyed on `current_text` itself, not `needs_enhancement`:
+                # a low-confidence-only retry (needs_enhancement False,
+                # needs_retry True) still has a real existing reading to
+                # lose, so it must go through the same score comparison,
+                # not the "nothing to lose" branch.
 
                 keep_fallback = (
-                    not needs_enhancement
+                    not current_text
                     or self._score_reading(
                         fallback_text, fallback_confidence,
                     )

@@ -990,6 +990,26 @@ body{
 
 }
 
+/* An article reshaped into precise sub-rectangles (see
+   Article.sub_rects) keeps its single-bbox rect only as the
+   drag/select hit-target -- .boundary-sub-rect below carries the
+   actual visible fill/stroke, in the article's real (possibly
+   L-shaped) outline instead of a rectangle that crosses into a
+   neighbouring article. */
+.boundary-box.boundary-box-hit-only{
+
+    fill:none;
+
+    stroke:none;
+
+}
+
+.boundary-sub-rect{
+
+    pointer-events:none;
+
+}
+
 .boundary-handle{
 
     fill:#16a34a;

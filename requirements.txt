@@ -18,6 +18,13 @@ rapidocr==3.9.2
 paddlepaddle==3.3.1
 paddlex==3.7.2
 
+# Gujarati OCR (pipeline/ocr/tesseract_engine.py) -- neither RapidOCR
+# nor EasyOCR ship a Gujarati recognition model. Requires the actual
+# Tesseract engine to be installed separately (a system package, not
+# pip-installable) -- see Dockerfile / README for the guj.traineddata
+# language file setup.
+pytesseract==0.3.10
+
 sentence-transformers==5.7.0
 google-genai==2.10.0
 openai==2.20.0

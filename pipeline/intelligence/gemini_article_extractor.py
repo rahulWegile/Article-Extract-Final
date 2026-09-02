@@ -91,6 +91,7 @@ class GeminiArticleExtractor:
         api_key: str | None = None,
         model: str | None = None,
         pages_per_batch: int = 3,
+        prompt_template: str | None = None,
     ):
 
         self.api_key = (
@@ -115,6 +116,13 @@ class GeminiArticleExtractor:
             1,
             int(pages_per_batch),
         )
+
+        # Per-language extraction prompt template (see
+        # pipeline/languages/<language>/extraction_prompt.py). When not
+        # supplied, _build_prompt falls back to the template literal it
+        # has always carried, so callers that don't pass one behave
+        # exactly as before.
+        self.prompt_template = prompt_template
 
         timeout_seconds = int(
             os.getenv(
@@ -1602,9 +1610,8 @@ class GeminiArticleExtractor:
     # PROMPT
     # ========================================================
 
-    @classmethod
     def _build_prompt(
-        cls,
+        self,
         page_numbers: list[int],
         article_manifest: list[
             dict[str, Any]
@@ -1642,7 +1649,7 @@ class GeminiArticleExtractor:
 
             page_articles.sort(
                 key=lambda item:
-                cls._article_sort_key(
+                self._article_sort_key(
                     str(
                         item["article_id"]
                     )
@@ -1703,6 +1710,11 @@ class GeminiArticleExtractor:
         # ----------------------------------------------------
         # Prompt
         #
+        # Sourced from this document's language pipeline
+        # (pipeline/languages/<language>/extraction_prompt.py) when the
+        # caller supplied one; the literal below is the unchanged
+        # fallback for callers that don't.
+        #
         # IMPORTANT:
         #
         # This is NOT an f-string.
@@ -1710,7 +1722,7 @@ class GeminiArticleExtractor:
         # escaping.
         # ----------------------------------------------------
 
-        prompt = """
+        prompt = self.prompt_template or """
 You are the newspaper article extraction and
 continuation-resolution engine.
 

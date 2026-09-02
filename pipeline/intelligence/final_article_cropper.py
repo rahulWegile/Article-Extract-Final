@@ -338,6 +338,17 @@ class FinalArticleCropper:
                         boundary
                     )
                 ),
+
+                # Precise sub-rectangles for display, when this
+                # article was reshaped to avoid enclosing a
+                # neighbour -- see Article.sub_rects. The crop
+                # image above is unaffected: it is always the
+                # single bbox region regardless, same as before.
+                "sub_rects": (
+                    self._get_sub_rects(
+                        boundary
+                    )
+                ),
             }
 
             # =================================================
@@ -500,6 +511,44 @@ class FinalArticleCropper:
             )
 
             return list(value)
+
+        except Exception:
+
+            return []
+
+    @staticmethod
+    def _get_sub_rects(
+        boundary: Any,
+    ) -> list:
+
+        # =================================================
+        # sub_rects (see Article.sub_rects / ArticleBoundary.
+        # sub_rects) is empty for every article except the
+        # rare ones boundary_decomposer.py gave a precise
+        # multi-rectangle shape to avoid enclosing a
+        # neighbouring article. Missing/malformed sub_rects
+        # must never break cropping itself -- the crop image
+        # is always taken from the single overall x1..y2 box
+        # regardless -- so this degrades to an empty list
+        # instead of raising, same as _get_block_ids.
+        # =================================================
+
+        try:
+
+            if isinstance(boundary, dict):
+                value = boundary.get("sub_rects") or []
+            else:
+                value = getattr(boundary, "sub_rects", None) or []
+
+            return [
+                {
+                    "x1": int(round(r[0])),
+                    "y1": int(round(r[1])),
+                    "x2": int(round(r[2])),
+                    "y2": int(round(r[3])),
+                }
+                for r in value
+            ]
 
         except Exception:
 

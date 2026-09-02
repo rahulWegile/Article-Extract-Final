@@ -21,6 +21,7 @@ class PageCleaner:
         page_width,
         page_height,
         page_number=None,
+        is_rtl=False,
     ):
         #
         # Remove noise
@@ -77,6 +78,7 @@ class PageCleaner:
         self.assign_columns(
             blocks,
             page_width,
+            is_rtl=is_rtl,
         )
 
         #
@@ -107,6 +109,35 @@ class PageCleaner:
             "figure",
         }
 
+        #
+        # Classes kept for their GEOMETRY even when OCR read nothing
+        # off them.
+        #
+        # A "title" is where an article begins. Every downstream stage
+        # -- the grouping prompt, local_grouper's root detection, and
+        # the final article crop's top edge -- needs that box to exist
+        # even when its text is unreadable, and the article-extraction
+        # model re-reads the crop image anyway, so an empty string
+        # here costs nothing.
+        #
+        # Dropping these was silently turning an OCR failure into a
+        # LAYOUT failure: confirmed on real Gujarati (દિવ્ય ભાસ્કર)
+        # pages, where headline boxes the layout detector found at
+        # IoU 1.00 were deleted here after Tesseract returned a single
+        # character for them, and the articles beneath them were then
+        # cropped starting below their own headline. Tesseract's side
+        # of that is fixed in tesseract_engine._ocr_block; this is the
+        # guard that stops the same shape of OCR failure from
+        # removing a real article boundary again.
+        #
+        structural_classes = {
+            "title",
+        }
+
+        keep_without_text = (
+            visual_classes | structural_classes
+        )
+
         for block in blocks:
 
             cls = getattr(
@@ -129,26 +160,17 @@ class PageCleaner:
                 continue
 
             #
-            # Keep visual blocks even when OCR
-            # returns no text.
-            #
-
-            if (
-                len(text) == 0
-                and cls not in visual_classes
-            ):
-                continue
-
-            #
             # Remove tiny OCR garbage.
             #
             # IMPORTANT:
-            # Do not remove visual blocks.
+            # Do not remove visual blocks, and do not remove the
+            # structural blocks whose box carries meaning on its own
+            # (see keep_without_text above).
             #
 
             if (
                 len(text) <= 2
-                and cls not in visual_classes
+                and cls not in keep_without_text
             ):
                 continue
 
@@ -718,6 +740,7 @@ class PageCleaner:
         self,
         blocks,
         page_width,
+        is_rtl=False,
     ):
 
         article_blocks = [
@@ -749,12 +772,25 @@ class PageCleaner:
                 + block.x2
             ) / 2
 
-            block.column = min(
+            raw_column = min(
                 int(
                     center
                     / column_width
                 ),
                 5,
+            )
+
+            # For a right-to-left script (Urdu), column 0 must stay
+            # "the first column a reader's eye reaches" -- the
+            # RIGHTMOST print column, not the geometrically leftmost
+            # one -- since the grouping prompt uses the column number
+            # itself as a reading-flow signal (see LanguagePipeline
+            # .is_rtl and sort_blocks.py for the matching reading-
+            # order fix).
+            block.column = (
+                5 - raw_column
+                if is_rtl
+                else raw_column
             )
 
     # -----------------------------------------------------

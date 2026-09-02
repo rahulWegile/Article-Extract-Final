@@ -16,9 +16,11 @@ from pipeline.export.gemini_page_exporter import (
 )
 
 from pipeline.gemini.gemini_service import GeminiService
-from pipeline.gemini.gemini_prompt import (
-    ARTICLE_GROUP_PROMPT,
-    ARTICLE_GROUP_PROMPT_ENGLISH,
+from pipeline.languages.hindi.grouping_prompt import (
+    HINDI_GROUPING_PROMPT,
+)
+from pipeline.languages.english.grouping_prompt import (
+    ENGLISH_GROUPING_PROMPT,
 )
 from pipeline.openai.openai_service import OpenAIService
 
@@ -58,6 +60,7 @@ def prepare_page(
     ocr_engine,
     document_id,
     document_dir,
+    is_rtl=False,
 ):
 
     # =====================================================
@@ -97,7 +100,8 @@ def prepare_page(
     )
 
     blocks = sort_blocks(
-        blocks
+        blocks,
+        is_rtl=is_rtl,
     )
 
     stage_start = _record_timing(timings, 
@@ -117,6 +121,7 @@ def prepare_page(
     ocr_results = ocr_engine.process_blocks(
         page_path,
         blocks,
+        page_number=page_number,
     )
 
     for block, ocr in zip(
@@ -208,6 +213,7 @@ def prepare_page(
             page_width=page_width,
             page_height=page_height,
             page_number=page_number,
+            is_rtl=is_rtl,
         )
     )
 
@@ -272,7 +278,7 @@ def prepare_page(
 # safe to run concurrently across a document's pages)
 # =========================================================
 
-def run_gemini(page_path, json_path):
+def run_gemini(page_path, json_path, prompt=HINDI_GROUPING_PROMPT):
 
     print()
     print(
@@ -287,7 +293,7 @@ def run_gemini(page_path, json_path):
         service.analyze_page(
             image_path=page_path,
             json_path=json_path,
-            prompt=ARTICLE_GROUP_PROMPT,
+            prompt=prompt,
         )
     )
 
@@ -304,7 +310,7 @@ def run_gemini(page_path, json_path):
 # safe to run concurrently across a document's pages)
 # =========================================================
 
-def run_openai(page_path, json_path):
+def run_openai(page_path, json_path, prompt=ENGLISH_GROUPING_PROMPT):
 
     print()
     print(
@@ -324,7 +330,7 @@ def run_openai(page_path, json_path):
         service.analyze_page(
             image_path=page_path,
             json_path=json_path,
-            prompt=ARTICLE_GROUP_PROMPT_ENGLISH,
+            prompt=prompt,
         )
     )
 
@@ -340,13 +346,18 @@ def run_openai(page_path, json_path):
 # LOCAL GROUPING (NO API CALL)
 # =========================================================
 
-def run_local(page_path, json_path):
+def run_local(page_path, json_path, prompt=None):
     """
     Drop-in replacement for run_openai / run_gemini that groups the
     page with pipeline.article.local_grouper instead of a model.
 
     Returns the same (response, elapsed) pair and the same response
     shape, so finish_page and every stage after it are unchanged.
+
+    Accepts (and ignores) `prompt` purely so callers can invoke
+    run_local/run_gemini/run_openai interchangeably with the same
+    keyword arguments -- local mode never calls an LLM, so there is
+    no prompt to send.
     """
 
     print()
@@ -383,7 +394,17 @@ def run_local(page_path, json_path):
 # FINISH PAGE (everything after the network call)
 # =========================================================
 
-def finish_page(prep, gemini_response, gemini_elapsed, is_hindi: bool = True):
+def finish_page(
+    prep,
+    gemini_response,
+    gemini_elapsed,
+    use_contested_block_arbitration: bool = True,
+    use_orphan_block_reassignment: bool = True,
+    use_orphan_title_root_repair: bool = True,
+    use_unclaimed_kicker_recovery: bool = True,
+    use_unclaimed_image_recovery: bool = True,
+    use_article_splitter: bool = True,
+):
 
     page_number = prep["page_number"]
     page_path = prep["page_path"]
@@ -485,7 +506,22 @@ def finish_page(prep, gemini_response, gemini_elapsed, is_hindi: bool = True):
             output_path=str(
                 output_path
             ),
-            is_hindi=is_hindi,
+            use_contested_block_arbitration=(
+                use_contested_block_arbitration
+            ),
+            use_orphan_block_reassignment=(
+                use_orphan_block_reassignment
+            ),
+            use_orphan_title_root_repair=(
+                use_orphan_title_root_repair
+            ),
+            use_unclaimed_kicker_recovery=(
+                use_unclaimed_kicker_recovery
+            ),
+            use_unclaimed_image_recovery=(
+                use_unclaimed_image_recovery
+            ),
+            use_article_splitter=use_article_splitter,
         )
     )
 
@@ -745,5 +781,5 @@ def process_page(
         prep,
         llm_response,
         llm_elapsed,
-        is_hindi=is_hindi,
+        use_contested_block_arbitration=is_hindi,
     )

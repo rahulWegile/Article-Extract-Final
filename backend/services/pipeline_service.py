@@ -17,6 +17,8 @@ from pipeline.layout_detector import LayoutDetector
 
 from pipeline.ocr.rapidocr_engine import RapidOCREngine
 
+from pipeline.languages.registry import resolve_language_pipeline
+
 from pipeline.page_processor_gemini import (
     prepare_page,
     run_gemini,
@@ -38,26 +40,6 @@ from pipeline.intelligence.local.masthead.masthead_extractor import (
 # ============================================================
 # NEW PIPELINE STAGES
 # ============================================================
-
-from pipeline.intelligence.gemini_article_extractor import (
-    GeminiArticleExtractor,
-)
-
-from pipeline.intelligence.openai_article_extractor import (
-    OpenAIArticleExtractor,
-)
-
-from pipeline.intelligence.gemini_document_order_extractor import (
-    GeminiDocumentOrderExtractor,
-)
-
-from pipeline.intelligence.reconcile import (
-    reconcile_articles,
-)
-
-from pipeline.intelligence.heading_repair import (
-    repair_missing_headings,
-)
 
 from pipeline.intelligence.local.local_article_extractor import (
     LocalArticleExtractor,
@@ -175,11 +157,19 @@ class PipelineService:
 
         self.ocr_engine = RapidOCREngine()
 
-        # Lazily-created, cached Devanagari-configured OCR engine.
-        # Kept separate from self.ocr_engine so switching a Hindi
-        # document to it never affects English documents processed
-        # by this same (long-lived) PipelineService instance.
-        self._hindi_ocr_engine = None
+        # Lazily-created, cached per-language OCR engine instances,
+        # keyed by LanguagePipeline.code (see
+        # pipeline/languages/registry.py). Kept separate per language
+        # so switching one language's document to its engine never
+        # affects another language processed by this same (long-
+        # lived) PipelineService instance. Pre-seeded with "english"
+        # so English documents reuse this exact self.ocr_engine
+        # instance (also used by the local masthead extractor below)
+        # instead of EnglishPipeline.ocr_engine_factory building a
+        # second, redundant one.
+        self._ocr_engine_cache = {
+            
+        }
 
         # =====================================================
         # Newspaper Metadata Client
@@ -199,9 +189,10 @@ class PipelineService:
         # the document's language -- this call is what DETERMINES
         # the document's language in the first place, so there is
         # nothing to route on yet at this point. The per-document
-        # Hindi-vs-English choice below (see _is_hindi_language)
-        # only applies to boundary detection and article extraction,
-        # both of which run after the language is already known.
+        # provider choice below (see
+        # pipeline/languages/registry.py) only applies to boundary
+        # detection and article extraction, both of which run after
+        # the language is already known.
         if self.llm_provider == "local":
             self.newspaper_client = None
         else:
@@ -229,54 +220,6 @@ class PipelineService:
             "✓ Local Masthead Extractor Loaded "
             f"({len(self.local_masthead_extractor.templates)} templates)"
         )
-
-    # ========================================================
-    # LANGUAGE DETECTION (shared by OCR engine AND LLM routing)
-    # ========================================================
-
-    @staticmethod
-    def _is_hindi_language(language):
-        """
-        Shared Hindi/Devanagari check for both OCR engine selection
-        (_get_ocr_engine_for_language) and per-document LLM routing
-        (see the LLM ROUTING note in process_pdf): "Hindi", "hi",
-        "hin", and anything containing "hindi" (e.g. "Hindi
-        (Devanagari)") all count. Kept as one place so the two
-        decisions can never quietly disagree with each other.
-        """
-
-        language = (language or "").strip().lower()
-
-        return (
-            language in ("hi", "hin", "hindi")
-            or "hindi" in language
-        )
-
-    # ========================================================
-    # OCR ENGINE SELECTION
-    # ========================================================
-
-    def _get_ocr_engine_for_language(self, language):
-        """
-        Pick the RapidOCR engine to use for this document.
-
-        Hindi documents get a Devanagari-configured engine;
-        everything else keeps using the default (English/Latin)
-        engine that was already validated. This is a per-document
-        choice, not a global config change, so English documents
-        are never affected by the Hindi model.
-        """
-
-        if not self._is_hindi_language(language):
-            return self.ocr_engine
-
-        if self._hindi_ocr_engine is None:
-
-            self._hindi_ocr_engine = RapidOCREngine(
-                lang="hi"
-            )
-
-        return self._hindi_ocr_engine
 
     def _detect_script_locally(self, page_image_path):
         """
@@ -335,11 +278,15 @@ class PipelineService:
 
         latin_confidence = average_confidence(self.ocr_engine)
 
-        if self._hindi_ocr_engine is None:
-            self._hindi_ocr_engine = RapidOCREngine(lang="hi")
+        if "hindi" not in self._ocr_engine_cache:
+            self._ocr_engine_cache["hindi"] = (
+                resolve_language_pipeline(
+                    "hindi"
+                ).ocr_engine_factory()
+            )
 
         hindi_confidence = average_confidence(
-            self._hindi_ocr_engine
+            self._ocr_engine_cache["hindi"]
         )
 
         print(
@@ -1229,18 +1176,28 @@ class PipelineService:
                     )
 
             # -------------------------------------------------
-            # Pick OCR engine for this document's language
+            # Resolve this document's language pipeline (see
+            # pipeline/languages/registry.py): decides which OCR
+            # engine, LLM provider, grouping prompt/policy, and
+            # article extractor this document uses, all in one
+            # place instead of scattered per-language checks.
             # -------------------------------------------------
 
-            active_ocr_engine = (
-                self._get_ocr_engine_for_language(
-                    metadata.get("language", "")
+            lang_pipeline = resolve_language_pipeline(
+                metadata.get("language", "")
+            )
+
+            if lang_pipeline.code not in self._ocr_engine_cache:
+                self._ocr_engine_cache[lang_pipeline.code] = (
+                    lang_pipeline.ocr_engine_factory()
                 )
+
+            active_ocr_engine = (
+                self._ocr_engine_cache[lang_pipeline.code]
             )
 
             print(
-                f"OCR engine : "
-                f"{'devanagari' if active_ocr_engine is self._hindi_ocr_engine else 'default'}"
+                f"OCR engine : {lang_pipeline.ocr_engine_label}"
             )
 
             # -------------------------------------------------
@@ -1248,29 +1205,19 @@ class PipelineService:
             # extraction only -- newspaper metadata above always
             # uses OpenAI, see __init__)
             #
-            # Hindi/Devanagari documents route to Gemini
-            # (gemini-3.6-flash): confirmed this session, on the
-            # same real headline crop, to read Devanagari
-            # correctly where gpt-5.6-luna fabricates unrelated
-            # text instead. Every other language stays on OpenAI.
-            #
             # This is a PER-DOCUMENT decision based on the
-            # language just determined above, not the global
-            # LLM_PROVIDER value -- LLM_PROVIDER=gemini/openai no
-            # longer manually pins boundary/extraction to one
-            # engine, only LLM_PROVIDER=local still does (the
-            # explicit no-API-calls override, orthogonal to
+            # language pipeline just resolved above, not the
+            # global LLM_PROVIDER value -- LLM_PROVIDER=gemini/
+            # openai no longer manually pins boundary/extraction
+            # to one engine, only LLM_PROVIDER=local still does
+            # (the explicit no-API-calls override, orthogonal to
             # language).
             # -------------------------------------------------
 
             if self.llm_provider == "local":
                 document_llm_provider = "local"
-            elif self._is_hindi_language(
-                metadata.get("language", "")
-            ):
-                document_llm_provider = "gemini"
             else:
-                document_llm_provider = "openai"
+                document_llm_provider = lang_pipeline.llm_provider
 
             print(
                 f"LLM routing : {document_llm_provider} "
@@ -1308,6 +1255,8 @@ class PipelineService:
 
             document_order_enabled = (
                 document_llm_provider == "gemini"
+                and lang_pipeline.document_order_extractor_factory
+                is not None
                 and os.getenv(
                     "DOCUMENT_ORDER_RECONCILE",
                     "0",
@@ -1332,11 +1281,13 @@ class PipelineService:
                 )
 
                 # document_order_enabled already requires
-                # document_llm_provider == "gemini" (English has no
-                # Stream B, matching the reference pipeline), so
-                # this is always the Gemini/Hindi extractor.
+                # lang_pipeline.document_order_extractor_factory to
+                # be set, which today only Hindi's LanguagePipeline
+                # declares (English and the other languages have no
+                # Stream B, matching the reference pipeline).
                 document_order_futures = (
-                    GeminiDocumentOrderExtractor().submit_batches(
+                    lang_pipeline.document_order_extractor_factory()
+                    .submit_batches(
                         document_order_executor,
                         pages,
                     )
@@ -1536,6 +1487,7 @@ class PipelineService:
                         ocr_engine=active_ocr_engine,
                         document_id=document_id,
                         document_dir=document_dir,
+                        is_rtl=lang_pipeline.is_rtl,
                     ): page_number
                     for page_number, page_path in enumerate(
                         pages,
@@ -1594,6 +1546,7 @@ class PipelineService:
                             run_page_llm,
                             page_path=prep["page_path"],
                             json_path=prep["json_path"],
+                            prompt=lang_pipeline.grouping_prompt,
                         )
                     ] = prep["page_number"]
 
@@ -1664,7 +1617,35 @@ class PipelineService:
                     prep,
                     gemini_response,
                     gemini_elapsed,
-                    is_hindi=(document_llm_provider == "gemini"),
+                    # Matches the previous
+                    # `is_hindi=(document_llm_provider == "gemini")`
+                    # exactly: arbitration is a per-language policy,
+                    # but "local" mode (no LLM calls at all) must
+                    # still force it off regardless of the detected
+                    # language, same as before.
+                    use_contested_block_arbitration=(
+                        document_llm_provider != "local"
+                        and lang_pipeline.use_contested_block_arbitration
+                    ),
+                    use_orphan_block_reassignment=(
+                        lang_pipeline
+                        .use_orphan_block_reassignment
+                    ),
+                    use_orphan_title_root_repair=(
+                        lang_pipeline
+                        .use_orphan_title_root_repair
+                    ),
+                    use_unclaimed_kicker_recovery=(
+                        lang_pipeline
+                        .use_unclaimed_kicker_recovery
+                    ),
+                    use_unclaimed_image_recovery=(
+                        lang_pipeline
+                        .use_unclaimed_image_recovery
+                    ),
+                    use_article_splitter=(
+                        lang_pipeline.use_article_splitter
+                    ),
                 )
 
                 # ---------------------------------------------
@@ -1836,7 +1817,7 @@ class PipelineService:
 
                     document_order_sections.extend(batch_sections)
 
-                    repair_missing_headings(
+                    lang_pipeline.document_order_repair_headings(
                         document_dir,
                         batch_sections,
                     )
@@ -1893,19 +1874,15 @@ class PipelineService:
                     )
                 )
 
-            elif article_extractor_engine == "gemini":
-
-                article_extractor = (
-                    GeminiArticleExtractor(
-                        pages_per_batch=3,
-                    )
-                )
-
             else:
 
                 article_extractor = (
-                    OpenAIArticleExtractor(
+                    lang_pipeline.extractor_class(
                         pages_per_batch=3,
+                        prompt_template=(
+                            lang_pipeline
+                            .extraction_prompt_template
+                        ),
                     )
                 )
 
@@ -1930,7 +1907,7 @@ class PipelineService:
             if document_order_enabled:
 
                 gemini_articles, _unresolved_sections = (
-                    reconcile_articles(
+                    lang_pipeline.document_order_reconcile_articles(
                         gemini_articles,
                         document_order_sections,
                     )

@@ -76,5 +76,113 @@
         "verified": false,
         "notes": "auto-learned from a Gemini fallback result",
         "confirmation_count": 1
+    },
+    {
+        "template_id": "business_standard_new_delhi",
+        "newspaper_name": "Business Standard",
+        "edition": "New Delhi",
+        "language": "English",
+        "name_ocr_variants": [
+            "Business Standard"
+        ],
+        "masthead_region": [
+            0.13616935731902713,
+            0.0,
+            1.0,
+            0.09123689727463312
+        ],
+        "date_region": [
+            0.0,
+            0.0,
+            1.0,
+            0.025934929850024192
+        ],
+        "edition_region": [
+            0.0,
+            0.013746169972585065,
+            1.0,
+            0.03812046444121916
+        ],
+        "edition_patterns": [
+            "NEW DELHI"
+        ],
+        "edition_primary_token": "NEW DELHI",
+        "date_format_hint": "",
+        "sample_source": "output\\temp\\run_a89c598b62cc\\pages\\page_001.png",
+        "verified": false,
+        "notes": "auto-learned from a Gemini fallback result",
+        "confirmation_count": 1
+    },
+    {
+        "template_id": "kannada_prabha_bengaluru",
+        "newspaper_name": "Kannada Prabha",
+        "edition": "Bengaluru",
+        "language": "Kannada",
+        "name_ocr_variants": [
+            "www.KannadaPrabha.in"
+        ],
+        "masthead_region": [
+            0.023770160675048828,
+            0.008035519884825032,
+            0.17129031590053015,
+            0.036202548368166595
+        ],
+        "date_region": [
+            0.0,
+            0.008716104692289553,
+            1.0,
+            0.03484137695427634
+        ],
+        "edition_region": [
+            0.0,
+            0.009056397995502423,
+            1.0,
+            0.036202548368166595
+        ],
+        "edition_patterns": [
+            "BENGALURU"
+        ],
+        "edition_primary_token": "BENGALURU",
+        "date_format_hint": "",
+        "sample_source": "output\\temp\\run_96982b00151c\\pages\\page_001.png",
+        "verified": false,
+        "notes": "auto-learned from a Gemini fallback result",
+        "confirmation_count": 1
+    },
+    {
+        "template_id": "sambad_bhubaneswar",
+        "newspaper_name": "SAMBAD",
+        "edition": "Bhubaneswar",
+        "language": "Odia",
+        "name_ocr_variants": [
+            "SAMBAD"
+        ],
+        "masthead_region": [
+            0.4508433734939759,
+            0.013026315789473683,
+            0.545140562248996,
+            0.04092105263157895
+        ],
+        "date_region": [
+            0.0,
+            0.1011842105263158,
+            1.0,
+            0.12907894736842104
+        ],
+        "edition_region": [
+            0.0,
+            0.09197368421052632,
+            1.0,
+            0.11789473684210526
+        ],
+        "edition_patterns": [
+            "BHUBANESWAR"
+        ],
+        "edition_primary_token": "BHUBANESWAR",
+        "date_format_hint": "",
+        "sample_source": "output\\temp\\run_b92bc4f86964\\pages\\page_001.png",
+        "verified": true,
+        "notes": "auto-learned from a Gemini fallback result",
+        "confirmation_count": 3
     }
 ]

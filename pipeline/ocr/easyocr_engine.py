@@ -368,6 +368,7 @@ class EasyOCREngine:
         self,
         image_path,
         blocks,
+        page_number=None,
     ):
 
         image_path = str(

@@ -45,7 +45,7 @@ from typing import Any
 from PIL import Image
 
 from pipeline.article.local_grouper import _bbox, _overlap_ratio, COLUMN_OVERLAP
-from pipeline.intelligence.reconcile import (
+from pipeline.languages.hindi.reconcile import (
     _normalize_heading,
     _significant_tokens,
 )

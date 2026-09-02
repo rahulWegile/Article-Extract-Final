@@ -25,6 +25,28 @@ from pipeline.database.import_final_articles import (
 )
 from pipeline.database.db import get_connection
 from pipeline.intelligence.openai_article_extractor import OpenAIArticleExtractor
+from pipeline.languages.registry import resolve_language_pipeline
+
+
+def _resolve_document_language(document_dir: Path) -> str:
+    """
+    Reads the language this document was actually processed with
+    (backend/services/pipeline_service.py._save_document_metadata
+    writes it to document.json's top-level "language" field), so
+    manual re-extraction below can use the same LanguagePipeline the
+    automatic pipeline used instead of always assuming OpenAI.
+    """
+
+    metadata_file = Path(document_dir) / "document.json"
+
+    if not metadata_file.is_file():
+        return ""
+
+    try:
+        with open(metadata_file, "r", encoding="utf-8") as f:
+            return json.load(f).get("language", "") or ""
+    except Exception:
+        return ""
 
 
 def list_page_boundaries(
@@ -75,6 +97,13 @@ def list_page_boundaries(
                 "article_id": article_id,
                 "bbox": bbox,
                 "is_multi_page": article_id in multi_page_ids,
+                # Precise sub-rectangles for display when this
+                # article was reshaped to avoid enclosing a
+                # neighbouring article (see Article.sub_rects in
+                # pipeline/article/article_grouper.py) -- empty for
+                # every other article, which keeps rendering as the
+                # single `bbox` above exactly as before.
+                "sub_rects": metadata.get("sub_rects") or [],
             }
         )
 
@@ -167,7 +196,34 @@ def save_boundary_and_reextract(
     with open(article_dir / "crop.json", "w", encoding="utf-8") as f:
         json.dump(crop_metadata, f, indent=4, ensure_ascii=False)
 
-    extractor = OpenAIArticleExtractor()
+    # Use this document's own language pipeline (see
+    # pipeline/languages/) so, e.g., a Hindi document re-extracts
+    # through the same provider the automatic pipeline used for it --
+    # falling back to OpenAIArticleExtractor when that language's
+    # extractor doesn't support single-crop re-extraction yet (today:
+    # GeminiArticleExtractor only implements the batched
+    # process_document() path, not _extract_single_article()).
+    lang_pipeline = resolve_language_pipeline(
+        _resolve_document_language(document_dir)
+    )
+
+    if hasattr(
+        lang_pipeline.extractor_class,
+        "_extract_single_article",
+    ):
+        extractor = lang_pipeline.extractor_class(
+            prompt_template=(
+                lang_pipeline.extraction_prompt_template
+            ),
+        )
+
+    else:
+        # Falling back to a different engine than this language
+        # declared, so its own template (written for that other
+        # engine) must NOT be forced on OpenAI's extractor -- let
+        # OpenAIArticleExtractor use its own built-in template,
+        # exactly as this path always has.
+        extractor = OpenAIArticleExtractor()
 
     extracted = extractor._extract_single_article(
         page_number=page_number,

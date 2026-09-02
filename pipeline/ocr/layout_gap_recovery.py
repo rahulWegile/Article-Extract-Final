@@ -152,6 +152,142 @@ LINE_CROP_PADDING = 5
 # it is more likely noise (a rule line, a stray mark) than real text.
 MIN_RECOVERED_CONFIDENCE = 0.5
 
+
+# ----------------------------------------------------------------
+# SCRIPT-RELATIVE CONFIDENCE FLOORS
+#
+# Both recovery passes below gate on an ABSOLUTE OCR confidence.
+# Those two numbers (0.5 here, 0.6 for the figure pass) were tuned
+# on scripts whose engines report 0.8+ on a clean reading, which
+# made them look like generous floors. They are not generous for
+# every script: an OCR engine's confidence is a per-glyph certainty,
+# and a cursive, ligature-dense script drags it down across the
+# board even when the reading itself is correct.
+#
+# Confirmed on a real Urdu (THE INQUILAB, Nastaliq) document read
+# with tessdata_best `urd`: the HIGHEST confidence Tesseract
+# reported for ANY block on either page was 0.576, with a mean of
+# 0.39 over 90 body-text blocks that all read back as real,
+# well-formed Urdu. Both floors therefore sat ABOVE the engine's own
+# ceiling for that script, so neither recovery pass could fire even
+# once -- not because a check failed on the merits, but because the
+# threshold was unreachable by construction. Three Nastaliq banner
+# headlines detected as "figure" (766x77 aspect 9.9, 1037x121
+# aspect 8.6, 765x82 aspect 9.3) were rejected on confidence alone,
+# and the stories under them were then grouped with no headline at
+# all.
+#
+# So the floor is now calibrated against the SAME page's own
+# measured confidence distribution -- the median confidence of the
+# blocks the primary OCR pass already read successfully, which are
+# known-good text by definition. This is the same approach the rest
+# of the pipeline already takes for page-varying quantities rather
+# than hardcoding one absolute number (see local_grouper's
+# `median_gap * ROOT_GAP_FACTOR` and gemini_service's
+# `median_block_gap`).
+#
+# The absolute floor stays the CEILING of what can be asked, so no
+# script that already clears it today has its bar lowered -- a
+# Gujarati page whose reference is 0.85 still gets asked for the
+# full 0.6 (0.85 * 0.75 = 0.64, capped back to 0.6) and behaves
+# exactly as before. Only a script whose engine cannot physically
+# reach the absolute floor gets a reachable one instead.
+# ----------------------------------------------------------------
+
+# Fraction of the page's own median OCR confidence a recovered
+# reading must reach. Below 1.0 because what gets recovered here is
+# almost always DISPLAY type (a banner headline), and display type
+# reads lower than body type on the same page: it is read in
+# isolation line by line, and large tightly-kerned headline
+# lettering is harder for the recognizer than the body face it was
+# calibrated on.
+#
+# 0.70 is that measured ratio, not a free knob. On the real Urdu
+# document above, the blocks the layout detector DID label "title"
+# read at a median of 0.315 (page 1) and 0.215 (page 2) against
+# body-text medians of 0.385 and 0.403 -- display type running at
+# roughly 0.55-0.80x body on the same page. The two banner
+# headlines still being lost at 0.75 (0.295 and 0.290, against a
+# floor of 0.302) sit inside exactly that band.
+#
+# Taking the median over title blocks alone would be the more
+# direct comparison, but is not usable as the reference: a page
+# where the detector found almost no titles is precisely the page
+# this recovery exists for (page 2 above yielded two), so the
+# denominator would be least reliable exactly when it matters most.
+# The all-block median is stable, and this factor carries the
+# display-vs-body difference instead.
+PAGE_CONFIDENCE_REFERENCE_FACTOR = 0.70
+
+# Absolute floor beneath which a reading is never trusted, whatever
+# the page's own distribution says. This is what stops the
+# page-relative floor from collapsing toward zero on a page the OCR
+# engine failed at wholesale -- if the reference itself is near
+# zero, "0.75x the reference" would accept pure noise. Set below the
+# 0.39 mean measured on real Nastaliq (which must stay recoverable)
+# and well above the confidence a rule line or a photo's texture
+# reads back at.
+CONFIDENCE_HARD_FLOOR = 0.25
+
+
+def _effective_confidence_floor(absolute_floor, confidence_reference):
+    """
+    The confidence a recovered reading must clear on THIS page.
+
+    `confidence_reference` is the median confidence of the blocks the
+    primary OCR pass already read successfully on this page, or None
+    when the caller has no such measurement -- in which case the
+    absolute floor is used unchanged, so a caller that does not
+    supply a reference behaves exactly as it did before.
+
+    Never above `absolute_floor` (no script's bar is raised) and
+    never below CONFIDENCE_HARD_FLOOR (no page's bar collapses).
+    """
+
+    if confidence_reference is None:
+        return absolute_floor
+
+    page_relative = (
+        float(confidence_reference)
+        * PAGE_CONFIDENCE_REFERENCE_FACTOR
+    )
+
+    return max(
+        CONFIDENCE_HARD_FLOOR,
+        min(absolute_floor, page_relative),
+    )
+
+
+def page_confidence_reference(confidences):
+    """
+    Median of the OCR confidences the primary pass reported for
+    blocks it read real text off, or None when there are none.
+
+    Lives here (rather than in each OCR engine) so every engine
+    feeds the recovery passes a reference computed the same way.
+    Callers pass only the confidences of blocks that actually
+    produced text -- an empty/skipped block's 0.0 is not a
+    measurement of anything and would drag the reference down.
+    """
+
+    values = [
+        float(value)
+        for value in confidences
+        if value is not None and float(value) > 0.0
+    ]
+
+    if not values:
+        return None
+
+    values.sort()
+
+    middle = len(values) // 2
+
+    if len(values) % 2:
+        return values[middle]
+
+    return (values[middle - 1] + values[middle]) / 2.0
+
 # Two candidate boxes count as "the same physical region" when their
 # IoU clears this. Deliberately high -- two overlapping-but-distinct
 # gap candidates (e.g. one pairing (block20, block119), another
@@ -429,20 +565,143 @@ def _recognize_lines(reader, crop, crop_x1, crop_y1):
     return lines
 
 
-def _classify_recovered_block(
-    cluster_height: float,
-    line_count: int,
-    blocks,
-) -> str:
+def recovered_line_height(lines) -> float:
     """
-    Title vs body, by comparing this region's own per-line height
-    against the page's EXISTING title/body per-line heights.
-    Defaults to "plain text" when the page has no title blocks to
-    compare against, since under-classifying a real headline as body
-    text is a smaller, safer error than the reverse.
+    Median per-line ink height of a recovered region.
+
+    The line boxes handed back by _recognize_lines carry
+    LINE_CROP_PADDING on each side (added so ascenders/descenders
+    are not clipped before recognition), so that padding is removed
+    here -- this must be comparable with a per-line height measured
+    off an ordinary OCR'd block, which has no such padding.
     """
 
-    recovered_line_height = cluster_height / max(1, line_count)
+    heights = [
+        float(line["bbox"]["y2"] - line["bbox"]["y1"])
+        - 2 * LINE_CROP_PADDING
+        for line in lines
+    ]
+
+    heights = [height for height in heights if height > 0]
+
+    if not heights:
+        return 0.0
+
+    return statistics.median(heights)
+
+
+def page_line_heights(samples) -> dict:
+    """
+    The page's own median per-line height for display type vs body
+    type, measured from the line boxes the primary OCR pass already
+    reported.
+
+    `samples` is an iterable of (block_class, lines) pairs, where
+    `lines` is that block's OCR line list. Returns
+    {"title": float|None, "body": float|None}.
+
+    Lives here (rather than in each OCR engine) so every engine
+    measures the reference the same way -- see
+    _classify_recovered_block for what it is compared against and
+    why a per-BLOCK height cannot stand in for it.
+    """
+
+    per_class = {"title": [], "body": []}
+
+    for block_class, lines in samples:
+
+        if not lines:
+            continue
+
+        if block_class == "title":
+            key = "title"
+        elif block_class == "plain text":
+            key = "body"
+        else:
+            continue
+
+        heights = [
+            float(line["bbox"]["y2"] - line["bbox"]["y1"])
+            for line in lines
+        ]
+
+        heights = [height for height in heights if height > 0]
+
+        if heights:
+            per_class[key].append(statistics.median(heights))
+
+    return {
+        key: (statistics.median(values) if values else None)
+        for key, values in per_class.items()
+    }
+
+
+def _classify_recovered_block(
+    line_height: float,
+    blocks,
+    line_heights=None,
+) -> str:
+    """
+    Title vs body for a recovered region, from how tall its type is.
+
+    WHY THIS NEEDS `line_heights`
+    -----------------------------
+
+    `line_height` is a PER-LINE measurement. The fallback path below
+    compares it against the page's existing title and "plain text"
+    BLOCK heights, which is a unit mismatch: a title block is one or
+    two lines tall, so its block height is close to its line height,
+    but a body block is a whole multi-line paragraph and its block
+    height is many times its line height. A big display headline
+    therefore lands nearer the body-BLOCK median than the
+    title-BLOCK median purely by arithmetic, and the taller the
+    headline is, the more confidently it is called body text.
+
+    Confirmed on a real Urdu (THE INQUILAB) page: banner headlines
+    recovered at a per-line height of 127-157px were classified
+    "plain text" against a title-block median of 49 and a body-block
+    median of 167 -- so they were recovered from "figure" only to
+    land as body text, still leaving their stories with no title to
+    start at. Measured per-LINE on the same pages, the three
+    populations separate cleanly and in the right order: body 35,
+    title 48, recovered banners 127-157.
+
+    So when the caller supplies the page's own per-line reference,
+    the test is like-for-like AND monotonic -- taller type is more
+    headline-like, never less. The fallback is kept unchanged for
+    callers that have no such measurement.
+    """
+
+    if line_heights:
+
+        title_line_height = line_heights.get("title")
+        body_line_height = line_heights.get("body")
+
+        if title_line_height and body_line_height:
+
+            # Midway between the page's body and display line
+            # heights. Anything at or above display height is a
+            # headline however far above it sits, which is what the
+            # absolute-distance test below gets wrong.
+            boundary = (
+                float(title_line_height)
+                + float(body_line_height)
+            ) / 2.0
+
+            if line_height >= boundary:
+                return "title"
+
+            return "plain text"
+
+    # ------------------------------------------------------------
+    # Fallback: no per-line reference available. Compares against
+    # per-BLOCK heights (see the unit mismatch above) and so is only
+    # reliable when the recovered region is itself about one line
+    # tall. Defaults to "plain text" when the page has no title
+    # blocks to compare against, since under-classifying a real
+    # headline as body text is a smaller, safer error than the
+    # reverse.
+    # ------------------------------------------------------------
 
     title_heights = [
         float(block.y2 - block.y1)
@@ -462,8 +721,8 @@ def _classify_recovered_block(
     title_median = statistics.median(title_heights)
     body_median = statistics.median(body_heights)
 
-    if abs(recovered_line_height - title_median) < abs(
-        recovered_line_height - body_median
+    if abs(line_height - title_median) < abs(
+        line_height - body_median
     ):
         return "title"
 
@@ -475,6 +734,8 @@ def recover_missed_blocks(
     page_image,
     reader: Callable[[Any], Any],
     next_id: int,
+    confidence_reference=None,
+    line_heights=None,
 ) -> list[tuple]:
     """
     Returns a list of (LayoutBlock, text, confidence, lines) tuples
@@ -485,12 +746,23 @@ def recover_missed_blocks(
     full-page pass (self.reader) -- called here on a small, isolated
     crop of just one candidate gap at a time, never on the whole
     page.
+
+    `confidence_reference` is this page's own median OCR confidence
+    (see page_confidence_reference) and makes the confidence gate
+    reachable on scripts whose engine never reports high absolute
+    confidence -- see SCRIPT-RELATIVE CONFIDENCE FLOORS above. None
+    keeps the previous absolute-only behaviour.
     """
 
     if page_image is None or not blocks:
         return []
 
     height, width = page_image.shape[:2]
+
+    min_confidence = _effective_confidence_floor(
+        MIN_RECOVERED_CONFIDENCE,
+        confidence_reference,
+    )
 
     median_gap = _page_median_column_gap(blocks)
 
@@ -569,7 +841,7 @@ def recover_missed_blocks(
 
         avg_confidence = sum(confidences) / len(confidences)
 
-        if avg_confidence < MIN_RECOVERED_CONFIDENCE:
+        if avg_confidence < min_confidence:
             continue
 
         recovered_x1 = min(line["bbox"]["x1"] for line in lines)
@@ -623,7 +895,9 @@ def recover_missed_blocks(
                 kept_id = recovered[duplicate_index][0].id
 
                 block_class = _classify_recovered_block(
-                    recovered_y2 - recovered_y1, len(lines), blocks,
+                    recovered_line_height(lines),
+                    blocks,
+                    line_heights=line_heights,
                 )
 
                 replacement_block = LayoutBlock(
@@ -641,7 +915,9 @@ def recover_missed_blocks(
             continue
 
         block_class = _classify_recovered_block(
-            recovered_y2 - recovered_y1, len(lines), blocks,
+            recovered_line_height(lines),
+            blocks,
+            line_heights=line_heights,
         )
 
         new_block = LayoutBlock(
@@ -657,5 +933,331 @@ def recover_missed_blocks(
         recovered.append((new_block, text, avg_confidence, lines))
 
         next_id += 1
+
+    return recovered
+
+
+# ============================================================
+# MISCLASSIFIED FIGURE RECOVERY -- layout detector labeled real
+# text as an image
+# ============================================================
+#
+# A DIFFERENT failure from the gap recovery above: here the layout
+# detector DID draw a box, but classified it "figure" (image) when
+# the region is actually text -- confirmed on a real page: a kicker
+# line plus a large bold headline ("H1N1થી બાળકનું હાર્ટ પમ્પિંગ 10
+# ટકા થયું...") sitting entirely inside one "figure"-class box, no
+# photograph anywhere in it. Because OCR_CLASSES (rapidocr_engine.py)
+# excludes "figure", this block is never sent through recognition at
+# all -- the full-page OCR pass's own line-to-block mapping only
+# considers OCR-eligible blocks as candidates, so even a correctly
+# -detected line overlapping a "figure" block's region is discarded
+# rather than attached to it. The story's real headline then simply
+# never exists as a block, and grouping falls back to whatever
+# nearby title-class fragment happens to exist instead (in the
+# confirmed case, a small explainer caption for an unrelated
+# diagram).
+#
+# NOT scoped to any one language (unlike the gap recovery above,
+# which is Hindi/Marathi-only for OCR-detection-quality reasons): a
+# layout model calling bold/stylized headline text an "image" is a
+# visual/geometric misclassification, not a script-specific OCR
+# problem, so this runs for every document.
+#
+# SAFETY: must never turn a genuine photograph into a bogus text
+# block. Two independent checks before ANY reclassification:
+# 1. The pixel-only line-band projection (_split_into_line_bands,
+#    reused as-is from the gap recovery above) must find a plausible
+#    MULTI-LINE pattern first -- a real photo's continuous tonal
+#    gradients essentially never decompose into the same blank-row
+#    -separated horizontal bands printed text does. Checked BEFORE
+#    any OCR call, so a block that doesn't look like text costs
+#    nothing extra.
+# 2. The recognized text must clear both a confidence floor AND a
+#    minimum character count -- a couple of garbled characters
+#    misread from a photo's texture must never be enough on their
+#    own to relabel it.
+# ------------------------------------------------------------
+
+# A real headline/caption is always more than one printed line in
+# practice; requiring at least this many detected line-bands is what
+# keeps a photo with one incidental horizontal edge (a horizon line,
+# a shelf) from ever reaching the OCR call at all.
+MIN_FIGURE_TEXT_LINES = 2
+
+# ...unless the block is far too wide and flat to be anything BUT a
+# single line of type.
+#
+# "A real headline is always more than one printed line" turned out
+# not to hold: confirmed on a real Bengali page, the banner headline
+# "ছুটির খবর দিতে ২৮ কিলোমিটার পাড়ি শিক্ষকের" runs the full width of
+# its story as ONE line -- 1959x136px, aspect 14.4 -- was detected as
+# a figure, and was rejected here before the OCR call because it
+# projects to exactly one ink band. Its story was then cropped with no
+# headline at all.
+#
+# What the two-line rule is really protecting against is a photo with
+# one incidental horizontal edge (a horizon, a shelf). Such a photo is
+# a normally-proportioned rectangle; a one-line banner headline is a
+# thin ribbon. Requiring that ribbon shape lets the real case through
+# while a squarish figure still needs the full two bands, and the
+# confidence, character-count, size and top-of-page checks all still
+# apply either way.
+SINGLE_LINE_MIN_ASPECT = 8.0
+
+# Below this many recognized (non-space) characters, "reads as text"
+# is not a confident enough claim to override a layout-model image
+# classification.
+MIN_FIGURE_TEXT_CHARS = 8
+
+# A FIFTH safety check -- added after a confirmed false positive on a
+# real Malayalam (ജന്മഭൂമി) page: a lottery/classified results grid
+# detected as a figure read back as
+# "1 പു 0182 0191 01990362 0516 ഷ്യം തയാ? 211 0792 1118 1325 13"
+# -- high enough confidence and long enough to clear every check
+# above, and duly relabeled a "title".
+#
+# What separates it from a real headline is not confidence or length
+# but CONTENT: a headline is language, a results grid is numbers. A
+# genuine headline does carry the odd figure ("7.5 કરોડથી વધુ લોકોએ
+# રિટર્ન ભર્યું" is ~7% digits), so this only rejects text that is
+# mostly digits -- which no headline in any of these scripts is,
+# since Indic digits are not ASCII either.
+MAX_FIGURE_TEXT_DIGIT_RATIO = 0.5
+
+# Deliberately higher than MIN_RECOVERED_CONFIDENCE above: reclassifying
+# an EXISTING block's type is a stronger claim than filling a gap that
+# had no block at all, so this asks for more certainty before doing it.
+MIN_FIGURE_TEXT_CONFIDENCE = 0.6
+
+# A THIRD safety check, on top of the two in the module docstring above
+# -- added after a confirmed false positive on a real page: the small
+# CMYK printer color-registration mark that appears near the bottom of
+# virtually every newspaper page (four tiny "C"/"M"/"Y"/"K" swatches,
+# printed in two stacked rows) cleared both the line-band and OCR-
+# confidence checks and was wrongly relabeled from "figure" to a text
+# block containing nonsense ("cYanmaallowbl..."). That mark measured
+# 65x186px; the confirmed genuine recovery case (a real bold headline)
+# measured 235x795px -- a real headline/caption is always a
+# substantially sized block, never a small decorative mark, so a
+# minimum size floor (checked before the cheap line-band pre-filter,
+# so a tiny mark never even reaches it) closes this off without
+# touching the confidence/line-count checks that the real case relies
+# on.
+#
+# The HEIGHT floor is skipped for a block already shaped like one
+# line of type (see SINGLE_LINE_MIN_ASPECT), because being short is
+# precisely what makes it that shape -- flooring its height asks a
+# banner headline not to be a banner headline.
+#
+# Confirmed on a real Punjabi (ਪੰਜਾਬੀ ਜਾਗਰਣ) page: the headline
+# "'ਅਣਖ' ਖ਼ਾਤਰ ਨੌਜਵਾਨ ਦਾ ਕਤਲ" was detected as a figure at 607x58px,
+# aspect 10.5, and reads back at 0.85 confidence -- it cleared every
+# other check here and was rejected on height alone, leaving the
+# story beneath it with no headline.
+#
+# These are ABSOLUTE pixel floors while page renders vary about 3x
+# across real documents (1607x2577 to 4923x7314), so the same
+# headline passes or fails depending only on how large its PDF
+# rasterised: 100px is 1.4% of a Malayalam page's height but 3.7% of
+# a Punjabi one's. Making both floors relative to page size would fix
+# that class properly; the aspect exemption below fixes the shape
+# that actually breaks, without changing what any other document
+# already does.
+#
+# Dropping the height floor for ribbons cannot readmit the CMYK mark:
+# at 186px wide it fails MIN_FIGURE_BLOCK_WIDTH, and at aspect 2.9 it
+# is not a ribbon in the first place.
+MIN_FIGURE_BLOCK_HEIGHT = 100.0
+MIN_FIGURE_BLOCK_WIDTH = 250.0
+
+# A FOURTH safety check -- added after a second confirmed false
+# positive on a real page: a newspaper section masthead/banner (a
+# large graphic combining a section logo, an icon, and small text --
+# a section name, a date, an email address) sat at the very top of
+# the page, was large enough to pass the size floor above, genuinely
+# does contain real text, and got relabeled "title" -- semantically
+# wrong, since masthead/section-header content must never become an
+# article headline (see ArticleGrouper.IGNORE_ROLES). This is not
+# something the line-band/confidence/size checks above can catch --
+# it IS real, substantial text, just not article text.
+#
+# PageCleaner (pipeline/preprocess/page_cleaner.py) already treats
+# "near the top of the page" as the deciding signal for masthead vs.
+# page-header detection (top_limit = page_height * 0.12-0.15), but
+# only for blocks matching a hardcoded list of known English/Hindi
+# newspaper names and keywords -- it has no non-text, position-only
+# fallback, and no Tamil/other-script coverage at all, so a Tamil
+# masthead was never going to be caught downstream either way. This
+# reuses the SAME top-of-page convention directly here instead,
+# independent of what text is actually recognized: a genuine missed
+# ARTICLE headline is never printed inside the masthead/header strip
+# in the first place (confirmed real case sat at 83% down its page;
+# this false positive sat at 10% down its own) -- so a "figure" block
+# up there is far more likely to be a banner than a story.
+#
+# PAGE 1 ONLY -- see the `page_number` argument below. A masthead
+# exists on page 1 and nowhere else, which PageCleaner already
+# encodes directly (pipeline/preprocess/page_cleaner.py: masthead
+# detection runs `if page_number is None or page_number == 1`, and
+# prints "Mastheads Detected : 0 (not page 1)" otherwise). Applied
+# to every page, this guard costs real headlines: confirmed on page
+# 2 of a real Urdu (THE INQUILAB) document, the two lead banner
+# headlines of the page -- 1031x164 at y=103 and 766x77 at y=114,
+# both detected as "figure" -- were rejected on position alone,
+# before any OCR ran, because they sit where page 1 would have its
+# masthead. Nothing was up there to protect: page 2 has no masthead.
+TOP_OF_PAGE_FRACTION = 0.15
+
+
+def recover_misclassified_text_blocks(
+    blocks: list,
+    page_image,
+    reader: Callable[[Any], Any],
+    confidence_reference=None,
+    page_number=None,
+    line_heights=None,
+) -> list[tuple]:
+    """
+    Check every "figure"-class block for real text the layout
+    detector missed by mislabeling it an image instead of skipping
+    it entirely, rather than a genuine photograph.
+
+    Returns a list of (block, text, confidence, lines) tuples for
+    blocks that were RECLASSIFIED. `block` is the SAME LayoutBlock
+    object passed in `blocks`, mutated in place (its `cls` updated)
+    -- never removed, replaced, or duplicated. A genuine photograph
+    elsewhere on the page is completely unaffected: this only ever
+    touches a "figure" block that passes every safety check above.
+
+    `confidence_reference` is this page's own median OCR confidence
+    (see page_confidence_reference). Without it, this pass cannot
+    fire at all on a script whose engine never reaches
+    MIN_FIGURE_TEXT_CONFIDENCE -- see SCRIPT-RELATIVE CONFIDENCE
+    FLOORS above for the confirmed Nastaliq case. None keeps the
+    previous absolute-only behaviour.
+
+    `page_number` gates the masthead/banner position guard to page 1,
+    where a masthead actually is -- see TOP_OF_PAGE_FRACTION. None
+    (a caller that does not know its page number) applies the guard,
+    exactly as before.
+    """
+
+    if page_image is None:
+        return []
+
+    height, width = page_image.shape[:2]
+
+    # See TOP_OF_PAGE_FRACTION: a masthead/section banner is a page-1
+    # phenomenon, so on later pages a "figure" near the top edge is
+    # just a story's headline and the guard is skipped.
+    apply_top_of_page_guard = (
+        page_number is None or int(page_number) == 1
+    )
+
+    top_of_page_limit = (
+        height * TOP_OF_PAGE_FRACTION
+        if apply_top_of_page_guard
+        else 0.0
+    )
+
+    min_confidence = _effective_confidence_floor(
+        MIN_FIGURE_TEXT_CONFIDENCE,
+        confidence_reference,
+    )
+
+    recovered = []
+
+    for block in blocks:
+
+        if block.cls != "figure":
+            continue
+
+        block_aspect = (
+            float(block.x2 - block.x1)
+            / max(1.0, float(block.y2 - block.y1))
+        )
+
+        # A ribbon is exempt from the HEIGHT floor -- being short is
+        # what makes it a ribbon. See SINGLE_LINE_MIN_ASPECT; the
+        # width floor and the aspect test below both still apply, and
+        # each of them independently excludes the CMYK mark this
+        # height floor was added for (186px wide, aspect 2.9).
+        if (
+            block_aspect < SINGLE_LINE_MIN_ASPECT
+            and float(block.y2 - block.y1) < MIN_FIGURE_BLOCK_HEIGHT
+        ):
+            continue
+
+        if float(block.x2 - block.x1) < MIN_FIGURE_BLOCK_WIDTH:
+            continue
+
+        if float(block.y2) <= top_of_page_limit:
+            continue
+
+        x1 = max(0, int(block.x1) - CROP_PADDING)
+        y1 = max(0, int(block.y1) - CROP_PADDING)
+        x2 = min(width, int(block.x2) + CROP_PADDING)
+        y2 = min(height, int(block.y2) + CROP_PADDING)
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        crop = page_image[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            continue
+
+        # A ribbon-shaped block can only hold one line of type, so
+        # one band is all there is to find. See
+        # SINGLE_LINE_MIN_ASPECT.
+        min_lines = (
+            1
+            if block_aspect >= SINGLE_LINE_MIN_ASPECT
+            else MIN_FIGURE_TEXT_LINES
+        )
+
+        # Cheap, OCR-free pre-filter -- see SAFETY check 1 above.
+        bands = _split_into_line_bands(crop)
+
+        if len(bands) < min_lines:
+            continue
+
+        lines = _recognize_lines(reader, crop, x1, y1)
+
+        if len(lines) < min_lines:
+            continue
+
+        text = " ".join(line["text"] for line in lines)
+
+        compact = text.replace(" ", "")
+
+        if len(compact) < MIN_FIGURE_TEXT_CHARS:
+            continue
+
+        # Mostly-numeric content is a table, not a headline. See
+        # MAX_FIGURE_TEXT_DIGIT_RATIO.
+        digit_count = sum(1 for char in compact if char.isascii() and char.isdigit())
+
+        if digit_count / len(compact) > MAX_FIGURE_TEXT_DIGIT_RATIO:
+            continue
+
+        avg_confidence = sum(
+            line["confidence"] for line in lines
+        ) / len(lines)
+
+        if avg_confidence < min_confidence:
+            continue
+
+        recovered_y1 = min(line["bbox"]["y1"] for line in lines)
+        recovered_y2 = max(line["bbox"]["y2"] for line in lines)
+
+        block.cls = _classify_recovered_block(
+            recovered_line_height(lines),
+            blocks,
+            line_heights=line_heights,
+        )
+
+        recovered.append((block, text, avg_confidence, lines))
 
     return recovered

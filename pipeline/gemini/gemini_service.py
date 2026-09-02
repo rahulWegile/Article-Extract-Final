@@ -3,16 +3,20 @@ import os
 import time
 from typing import Any
 
+import cv2
 import httpx
 
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
-# Must match the roles listed in pipeline/gemini/gemini_prompt.py
-# (ARTICLE_GROUP_PROMPT) and pipeline/article/article_grouper.py
-# (IGNORE_ROLES) -- constraining the schema to a different taxonomy
-# than the prompt documents silently corrupts page-level grouping.
+from pipeline.article.visual_separator import annotate_gaps
+
+# Must match the roles listed in the grouping prompts
+# (each language's pipeline/languages/<language>/grouping_prompt.py) and
+# pipeline/article/article_grouper.py (IGNORE_ROLES) --
+# constraining the schema to a different taxonomy than the prompt
+# documents silently corrupts page-level grouping.
 _BLOCK_ROLES = [
     "article_title",
     "article_text",
@@ -144,170 +148,17 @@ class GeminiService:
     # ========================================================
 
     @staticmethod
-    def _has_intervening_block(
-        boxes: list[dict[str, Any] | None],
-        self_index: int,
-        y_start: float,
-        y_end: float,
-        bbox: dict[str, Any],
-    ) -> bool:
-        """
-        True when some OTHER block's y-range falls inside (y_start,
-        y_end) and it has ANY horizontal overlap with `bbox` at all --
-        not just the stricter 50% same-column overlap used to find a
-        gap neighbour. Such a block sits visually inside the measured
-        gap, so the gap is not clean whitespace.
-        """
-
-        lo, hi = min(y_start, y_end), max(y_start, y_end)
-
-        for other_index, other in enumerate(boxes):
-
-            if other is None or other_index == self_index:
-                continue
-
-            if other["y1"] >= hi or other["y2"] <= lo:
-                continue
-
-            overlap = min(bbox["x2"], other["x2"]) - max(
-                bbox["x1"], other["x1"]
-            )
-
-            if overlap > 0:
-                return True
-
-        return False
-
-    @staticmethod
-    def _annotate_gaps(compact_blocks: list[dict[str, Any]]) -> float | None:
-        """
-        Annotate each block with the whitespace gap to its nearest
-        neighbour above and below within the same print column, plus
-        return the page's median gap for scale.
-
-        Newspapers separate stories with visibly more whitespace than
-        they put between paragraphs of the same story, so the size of
-        a gap relative to the page's normal gap is one of the
-        strongest available separation signals. The model previously
-        received only raw bounding boxes and had to re-derive this
-        itself for every block, which it did inconsistently on dense
-        pages.
-
-        Column neighbours are found by horizontal overlap rather than
-        by the 6-slot column index, because a wide block (a spanning
-        headline, a photo) belongs to several index slots at once.
-        """
-
-        boxes = []
-
-        for block in compact_blocks:
-
-            bbox = block.get("bbox") or {}
-
-            if None in (
-                bbox.get("x1"),
-                bbox.get("y1"),
-                bbox.get("x2"),
-                bbox.get("y2"),
-            ):
-                boxes.append(None)
-                continue
-
-            boxes.append(bbox)
-
-        gaps: list[float] = []
-
-        for index, bbox in enumerate(boxes):
-
-            if bbox is None:
-                continue
-
-            width = max(1.0, float(bbox["x2"] - bbox["x1"]))
-
-            gap_above = None
-            gap_below = None
-            above_neighbor_y = None
-            below_neighbor_y = None
-
-            for other_index, other in enumerate(boxes):
-
-                if other is None or other_index == index:
-                    continue
-
-                other_width = max(1.0, float(other["x2"] - other["x1"]))
-
-                overlap = min(bbox["x2"], other["x2"]) - max(
-                    bbox["x1"], other["x1"]
-                )
-
-                # Same print column only.
-                if max(0.0, overlap) / min(width, other_width) < 0.5:
-                    continue
-
-                if other["y2"] <= bbox["y1"]:
-                    distance = float(bbox["y1"] - other["y2"])
-                    if gap_above is None or distance < gap_above:
-                        gap_above = distance
-                        above_neighbor_y = other["y2"]
-
-                elif bbox["y2"] <= other["y1"]:
-                    distance = float(other["y1"] - bbox["y2"])
-                    if gap_below is None or distance < gap_below:
-                        gap_below = distance
-                        below_neighbor_y = other["y1"]
-
-            # The same-column search above can skip straight past some
-            # OTHER block sitting visually in the gap (e.g. an inset
-            # photo of a different width, which fails the 50%
-            # column-overlap test and gets silently passed over) and
-            # report the distance across it as if it were plain
-            # whitespace. That number then gets handed to the model as
-            # a "this looks like a new article" signal even though the
-            # gap is actually occupied by unrelated content, not empty.
-            # When any block -- regardless of column overlap -- sits
-            # inside the measured span, the measurement isn't trustworthy
-            # as a whitespace gap, so drop it rather than report a
-            # number that can be silently wrong.
-            if gap_above is not None and GeminiService._has_intervening_block(
-                boxes, index, above_neighbor_y, bbox["y1"], bbox
-            ):
-                gap_above = None
-
-            if gap_below is not None and GeminiService._has_intervening_block(
-                boxes, index, bbox["y2"], below_neighbor_y, bbox
-            ):
-                gap_below = None
-
-            compact_blocks[index]["gap_above"] = (
-                None if gap_above is None else round(gap_above)
-            )
-
-            compact_blocks[index]["gap_below"] = (
-                None if gap_below is None else round(gap_below)
-            )
-
-            for value in (gap_above, gap_below):
-                if value is not None and value > 0:
-                    gaps.append(value)
-
-        if not gaps:
-            return None
-
-        gaps.sort()
-
-        middle = len(gaps) // 2
-
-        if len(gaps) % 2:
-            median = gaps[middle]
-        else:
-            median = (gaps[middle - 1] + gaps[middle]) / 2.0
-
-        return round(median, 1)
-
-    @staticmethod
-    def _compact_blocks_payload(json_path: str) -> str:
+    def _compact_blocks_payload(json_path: str, image_path: str | None = None) -> str:
         with open(json_path, "r", encoding="utf-8") as f:
             page = json.load(f)
+
+        page_image = None
+
+        if image_path is not None:
+            try:
+                page_image = cv2.imread(str(image_path))
+            except Exception:
+                page_image = None
 
         compact_blocks = []
         for block in page.get("blocks", []):
@@ -324,7 +175,7 @@ class GeminiService:
                 "category": knowledge.get("category") or None,
             })
 
-        median_gap = GeminiService._annotate_gaps(compact_blocks)
+        median_gap = annotate_gaps(compact_blocks, page_image)
 
         compact_page = {
             "page": page.get("page"),
@@ -348,7 +199,7 @@ class GeminiService:
         prompt: str,
     ) -> dict[str, Any]:
 
-        page_json_text = self._compact_blocks_payload(json_path)
+        page_json_text = self._compact_blocks_payload(json_path, image_path)
 
         schema = {
             "type": "object",

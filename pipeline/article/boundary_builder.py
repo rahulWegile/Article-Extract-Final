@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
+from typing import List, Tuple
 
 from pipeline.article.article_grouper import Article
 
@@ -28,6 +28,17 @@ class ArticleBoundary:
     block_ids: List[int]
 
     confidence: float = 1.0
+
+    # Precise (x1, y1, x2, y2) sub-rectangles, set only when
+    # boundary_decomposer.py gave this article a multi-rectangle shape
+    # to avoid enclosing a neighbouring article (see Article.sub_rects
+    # in article_grouper.py). Empty for every other article -- x1..y2
+    # above always stays the single overall bounding box (the union of
+    # these, when present), unchanged, so anything that only reads
+    # x1..y2 keeps working exactly as before.
+    sub_rects: List[Tuple[int, int, int, int]] = field(
+        default_factory=list
+    )
 
 
 class BoundaryBuilder:
@@ -100,6 +111,10 @@ class BoundaryBuilder:
                     ),
 
                     confidence=article.confidence,
+
+                    sub_rects=list(
+                        getattr(article, "sub_rects", None) or []
+                    ),
                 )
             )
 

@@ -14,6 +14,14 @@ from pipeline.article.article_splitter import (
     split_oversized_articles,
 )
 
+from pipeline.article.dropped_article_recovery import (
+    recover_dropped_articles,
+)
+
+from pipeline.article.boundary_decomposer import (
+    decompose_overlapping_articles,
+)
+
 from pipeline.article.boundary_builder import (
     BoundaryBuilder,
 )
@@ -87,7 +95,14 @@ class GeminiBoundaryPipeline:
         page_json_path,
         gemini_response_path,
         output_path,
-        is_hindi: bool = True,
+        use_contested_block_arbitration: bool = True,
+        use_orphan_block_reassignment: bool = True,
+        use_orphan_title_root_repair: bool = True,
+        use_unclaimed_kicker_recovery: bool = True,
+        use_unclaimed_image_recovery: bool = True,
+        use_article_splitter: bool = True,
+        use_dropped_article_recovery: bool = True,
+        use_boundary_decomposition: bool = True,
     ):
 
         print()
@@ -141,7 +156,25 @@ class GeminiBoundaryPipeline:
 
             blocks,
 
-            is_hindi=is_hindi,
+            use_contested_block_arbitration=(
+                use_contested_block_arbitration
+            ),
+
+            use_orphan_block_reassignment=(
+                use_orphan_block_reassignment
+            ),
+
+            use_orphan_title_root_repair=(
+                use_orphan_title_root_repair
+            ),
+
+            use_unclaimed_kicker_recovery=(
+                use_unclaimed_kicker_recovery
+            ),
+
+            use_unclaimed_image_recovery=(
+                use_unclaimed_image_recovery
+            ),
 
         )
 
@@ -153,21 +186,89 @@ class GeminiBoundaryPipeline:
         # (never touches ArticleGrouper's or the LLM's own decision
         # otherwise -- see article_splitter.py).
         #
-        # Hindi-only: the reference English pipeline has no
-        # equivalent step, so English keeps the model's own grouping
-        # as-is here.
+        # Runs for every language, not just Hindi: this whole check
+        # is pure geometry and raw layout-detector class (bbox
+        # overlap, gap size, rule-line pixels) -- nothing in
+        # split_oversized_articles, group_blocks, or the orphan-
+        # content merge reads or assumes anything about the text's
+        # language. Confirmed on a real Tamil page: an OpenAI-routed
+        # (non-Hindi) article with 4 title-class blocks -- well past
+        # the >1 trigger -- merged 4 unrelated stories (a returnee
+        # story, a Nepal rescue photo, a temperature forecast, a
+        # group-photo item) into one 16-block boundary, with no
+        # safety net at all to catch it while this ran Hindi-only.
+        # Was previously gated behind is_hindi only because the
+        # reference English pipeline had no equivalent step to draw
+        # on, not because of any language-specific assumption here.
+        # Already a no-op whenever an article has <=1 title block, so
+        # this cannot change behavior on pages that were already
+        # fine.
         #
 
-        if is_hindi:
+        # Per-language opt-in (see pipeline/languages/): enabled for
+        # every language except English, whose reference pipeline has
+        # no article-splitter step at all.
+        #
+        # Only the splitter and the recovery pass probe page pixels,
+        # so a language with both switched off never pays for
+        # decoding a full-resolution page scan here.
+        #
+
+        if use_article_splitter or use_dropped_article_recovery:
 
             try:
                 page_image = cv2.imread(str(image_path))
             except Exception:
                 page_image = None
 
+        else:
+
+            page_image = None
+
+        #
+        # Recover a whole story the model threw away by giving every
+        # one of its blocks a non-article role. ArticleGrouper's
+        # IGNORE_ROLES drop is terminal -- none of its repair passes
+        # can see a block whose role was excluded -- so a single
+        # wrong role classification silently costs a full article,
+        # boundary and crop. See dropped_article_recovery.py for the
+        # story-shape guards that keep this from resurrecting real
+        # advertisements.
+        #
+        # Runs BEFORE the splitter below so that anything it recovers
+        # is re-checked by the same over-merge logic every other
+        # article gets, and before decomposition so a recovered story
+        # is already a known owner by the time rectangles are checked
+        # for enclosing content they do not own.
+        #
+
+        if use_dropped_article_recovery:
+
+            articles = recover_dropped_articles(
+                articles,
+                blocks,
+                page_image,
+            )
+
+        if use_article_splitter:
+
             articles = split_oversized_articles(
                 articles,
                 page_image,
+            )
+
+        #
+        # Re-cut any article whose min/max RECTANGLE encloses content
+        # it does not own -- the L-shaped-article problem the
+        # grouping prompts describe but nothing enforced on our side.
+        # See boundary_decomposer.py.
+        #
+
+        if use_boundary_decomposition:
+
+            articles = decompose_overlapping_articles(
+                articles,
+                blocks,
             )
 
         #

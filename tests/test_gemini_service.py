@@ -5,7 +5,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from pipeline.gemini.gemini_service import GeminiService
-from pipeline.gemini.gemini_prompt import ARTICLE_GROUP_PROMPT
+from pipeline.languages.hindi.grouping_prompt import (
+    HINDI_GROUPING_PROMPT,
+)
 
 
 PAGE_DIR = Path("output/pages")
@@ -102,7 +104,7 @@ def main():
 
                 json_path=str(json_path),
 
-                prompt=ARTICLE_GROUP_PROMPT,
+                prompt=HINDI_GROUPING_PROMPT,
 
             )
 
