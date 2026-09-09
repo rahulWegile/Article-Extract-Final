@@ -74,3 +74,26 @@ models/
 .DS_Store
 Thumbs.db
 
+# Docker files (do not push to git)
+Dockerfile
+docker-compose*.yml
+docker/
+.dockerignore
+frontend/Dockerfile
+frontend/.dockerignore
+frontend/nginx.conf
+
+# Test and temporary/scratch files (do not push to git)
+tests/
+test.pdf
+test.png
+temp/
+temp_*/
+check_db*.py
+check_schema.py
+scratch*.txt
+titles*.txt
+/*.png
+z_folder.txt
+
+

@@ -460,6 +460,50 @@ def _local_block_density(bbox, blocks) -> int:
     return count
 
 
+def _bbox_overlaps_other_block(bbox, above, below, blocks) -> bool:
+    """
+    True if the candidate gap box `bbox` -- computed from `above`/
+    `below`'s UNION x-range (see the comment at its call site for why
+    union, not intersection) -- intersects any EXISTING block other
+    than the two that bracket it.
+
+    A genuine missed-content gap has nothing else already detected
+    inside it, by definition. Confirmed on a real Urdu (THE INQUILAB,
+    doc_000172 page 3) document where this was NOT checked: a gap
+    candidate's union bbox (0,850)-(1055,1192) bridged clean across a
+    column boundary and fully enclosed four already-detected blocks
+    from a DIFFERENT column (a title and three body/plain-text
+    blocks), none of which is `above` or `below` for this candidate.
+    Nothing before this caught it -- `_local_block_density` only
+    checks that blocks exist somewhere NEAR the box, not that the box
+    itself is empty, and the final dedup check compares IoU against
+    ONE block at a time, which stays low when a big box encloses
+    several small ones (the union's area swamps any single overlap).
+    Rejecting the whole candidate here is what the fix in
+    recover_missed_blocks's docstring calls preventing a recovered
+    box from "spanning across or enclosing" other columns' content --
+    a genuine one-column gap is never affected, since by construction
+    nothing already occupies it.
+    """
+
+    for block in blocks:
+
+        if block is above or block is below:
+            continue
+
+        other = _bbox_from_block(block)
+
+        inter_x1 = max(bbox["x1"], other["x1"])
+        inter_y1 = max(bbox["y1"], other["y1"])
+        inter_x2 = min(bbox["x2"], other["x2"])
+        inter_y2 = min(bbox["y2"], other["y2"])
+
+        if inter_x2 > inter_x1 and inter_y2 > inter_y1:
+            return True
+
+    return False
+
+
 def _split_into_line_bands(crop) -> list[tuple[int, int]]:
     """
     Row-wise ink projection: find the (y1, y2) pixel ranges of each
@@ -810,6 +854,14 @@ def recover_missed_blocks(
             "x1": float(x1), "y1": float(above.y2),
             "x2": float(x2), "y2": float(below.y1),
         }
+
+        # Reject a candidate whose box already has other detected
+        # content inside it -- see _bbox_overlaps_other_block. Checked
+        # before the density check below since an enclosing candidate
+        # is disqualified outright regardless of how dense its
+        # surroundings are.
+        if _bbox_overlaps_other_block(bbox, above, below, blocks):
+            continue
 
         if _local_block_density(bbox, blocks) < MIN_LOCAL_DENSITY:
             continue

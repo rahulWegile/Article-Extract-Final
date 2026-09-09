@@ -92,6 +92,8 @@ def list_page_boundaries(
             metadata.get("article_id") or article_dir.name
         )
 
+        logical = _find_logical_article(final_data, page_number, article_id)
+
         boundaries.append(
             {
                 "article_id": article_id,
@@ -104,21 +106,46 @@ def list_page_boundaries(
                 # every other article, which keeps rendering as the
                 # single `bbox` above exactly as before.
                 "sub_rects": metadata.get("sub_rects") or [],
+                # Layout blocks (paragraphs/headings/images) merged into
+                # this crop -- a real proxy for "how much content is in
+                # this article" shown in the Viewer's inspector panel.
+                "block_count": len(metadata.get("block_ids") or []),
+                # e.g. "final_verified_boundary" (pipeline-detected) or
+                # "manual" (drawn/edited in the Viewer) -- surfaced as-is
+                # rather than inventing a confidence score the backend
+                # doesn't compute.
+                "boundary_source": metadata.get("boundary_source"),
+                # Lets the Viewer deep-link a boundary to its imported
+                # article on the /search article page, when it's already
+                # been grouped into a logical article.
+                "logical_article_id": (
+                    logical.get("logical_article_id") if logical else None
+                ),
             }
         )
 
     return boundaries
 
 
-def save_boundary_and_reextract(
+def _extract_and_persist(
     document_dir: Path,
-    document_id: str,
     page_number: int,
-    article_id: str | None,
+    article_id: str,
     bbox: dict,
+    final_data: dict[str, Any],
+    final_logical_path: Path,
 ) -> dict:
+    """
+    Shared core of save_boundary_and_reextract and merge_boundaries:
+    crop `bbox` out of the page image, re-extract text through this
+    document's own language pipeline, and persist the result as the
+    physical/logical article `article_id` for `page_number`.
 
-    document_dir = Path(document_dir)
+    Never decides WHICH article_id to write under or what to do with
+    any other article -- callers own that (a plain edit keeps the
+    same id; a merge picks one survivor and separately removes the
+    rest -- see merge_boundaries).
+    """
 
     page_image_path = (
         document_dir
@@ -131,42 +158,13 @@ def save_boundary_and_reextract(
             f"Page image not found: {page_image_path}"
         )
 
-    final_logical_path = (
+    page_dir = (
         document_dir
-        / "gemini_article_batches"
-        / "final_logical_articles.json"
+        / "final_articles_crops"
+        / f"page_{page_number:03d}"
     )
 
-    final_data, _ = _load_final_logical_data(document_dir)
-
-    is_new = article_id is None
-
-    crops_root = document_dir / "final_articles_crops"
-    page_dir = crops_root / f"page_{page_number:03d}"
-
-    if is_new:
-
-        page_dir.mkdir(parents=True, exist_ok=True)
-        article_id = _next_article_id(page_dir)
-
-    else:
-
-        existing_logical = _find_logical_article(
-            final_data,
-            page_number,
-            article_id,
-        )
-
-        if existing_logical is not None:
-
-            source_parts = existing_logical.get("source_parts") or []
-
-            if len(source_parts) > 1:
-                raise ValueError(
-                    "This article spans multiple pages; manual "
-                    "boundary editing is only supported for "
-                    "single-page articles."
-                )
+    page_dir.mkdir(parents=True, exist_ok=True)
 
     image, crop, clamped_bbox = _crop_boundary(page_image_path, bbox)
 
@@ -250,6 +248,70 @@ def save_boundary_and_reextract(
         physical_article=physical_article,
     )
 
+    return {
+        "clamped_bbox": clamped_bbox,
+        "physical_article": physical_article,
+    }
+
+
+def save_boundary_and_reextract(
+    document_dir: Path,
+    document_id: str,
+    page_number: int,
+    article_id: str | None,
+    bbox: dict,
+) -> dict:
+
+    document_dir = Path(document_dir)
+
+    final_logical_path = (
+        document_dir
+        / "gemini_article_batches"
+        / "final_logical_articles.json"
+    )
+
+    final_data, _ = _load_final_logical_data(document_dir)
+
+    is_new = article_id is None
+
+    if is_new:
+
+        page_dir = (
+            document_dir
+            / "final_articles_crops"
+            / f"page_{page_number:03d}"
+        )
+        page_dir.mkdir(parents=True, exist_ok=True)
+        article_id = _next_article_id(page_dir)
+
+    else:
+
+        existing_logical = _find_logical_article(
+            final_data,
+            page_number,
+            article_id,
+        )
+
+        if existing_logical is not None:
+
+            source_parts = existing_logical.get("source_parts") or []
+
+            if len(source_parts) > 1:
+                raise ValueError(
+                    "This article spans multiple pages; manual "
+                    "boundary editing is only supported for "
+                    "single-page articles."
+                )
+
+    result = _extract_and_persist(
+        document_dir=document_dir,
+        page_number=page_number,
+        article_id=article_id,
+        bbox=bbox,
+        final_data=final_data,
+        final_logical_path=final_logical_path,
+    )
+
     db_synced = False
     db_error = None
 
@@ -260,12 +322,181 @@ def save_boundary_and_reextract(
     except Exception as exc:
         db_error = str(exc)
 
+    physical_article = result["physical_article"]
+
     return {
         "article_id": article_id,
-        "bbox": clamped_bbox,
+        "bbox": result["clamped_bbox"],
         "headline": physical_article.get("headline"),
         "article_text": physical_article.get("article_text"),
         "is_new": is_new,
+        "db_synced": db_synced,
+        "db_error": db_error,
+    }
+
+
+def merge_boundaries(
+    document_dir: Path,
+    document_id: str,
+    page_number: int,
+    article_ids: list[str],
+) -> dict:
+    """
+    Fuse several existing, separately-detected boundaries on one page
+    into ONE article: union their boxes, re-crop that single region,
+    and re-extract its text from scratch through the same vision
+    extractor a manual single-boundary edit uses (see
+    _extract_and_persist) -- never stitched together from the pieces'
+    old, separately-extracted text.
+
+    This exists for exactly the failure shape automatic grouping
+    cannot always avoid on badly garbled OCR (confirmed on a real
+    Urdu page): the SAME geometric signature -- several short items
+    sitting in one row with small gaps and no printed rule line
+    between them -- is equally the shape of several genuinely
+    independent briefs placed side by side. Nothing purely geometric
+    can tell the two apart without risking exactly the over-merge
+    this codebase has already been burned by once (see
+    ArticleGrouper's own "Report unclaimed content blocks" comment).
+    A human confirming "these are the same story" is the actual
+    disambiguating signal; this endpoint is what turns that human
+    judgement into one clean article instead of leaving the reviewer
+    to reconcile 2-3 separate crops/records by hand.
+
+    The FIRST id in `article_ids` survives (keeps its identity, its
+    logical_article_id, and any links already pointing at it); the
+    rest are deleted, from disk and from the DB, once the merged
+    article is safely persisted.
+    """
+
+    document_dir = Path(document_dir)
+
+    if len(article_ids) < 2:
+        raise ValueError(
+            "Merging requires at least two article boundaries."
+        )
+
+    if len(set(article_ids)) != len(article_ids):
+        raise ValueError("Duplicate article ids in merge request.")
+
+    final_logical_path = (
+        document_dir
+        / "gemini_article_batches"
+        / "final_logical_articles.json"
+    )
+
+    final_data, _ = _load_final_logical_data(document_dir)
+
+    multi_page_ids = _multi_page_article_ids(final_data, page_number)
+
+    blocked = [aid for aid in article_ids if aid in multi_page_ids]
+
+    if blocked:
+        raise ValueError(
+            "These articles span multiple pages; manual boundary "
+            "editing (including merging) is only supported for "
+            "single-page articles: " + ", ".join(blocked)
+        )
+
+    page_dir = (
+        document_dir
+        / "final_articles_crops"
+        / f"page_{page_number:03d}"
+    )
+
+    bboxes = []
+
+    for article_id in article_ids:
+
+        crop_json = page_dir / article_id / "crop.json"
+
+        if not crop_json.is_file():
+            raise FileNotFoundError(
+                f"Boundary not found: {article_id}"
+            )
+
+        with open(crop_json, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+
+        bbox = metadata.get("bbox")
+
+        if not bbox:
+            raise ValueError(f"Boundary {article_id} has no bbox")
+
+        bboxes.append(bbox)
+
+    merged_bbox = {
+        "x1": min(b["x1"] for b in bboxes),
+        "y1": min(b["y1"] for b in bboxes),
+        "x2": max(b["x2"] for b in bboxes),
+        "y2": max(b["y2"] for b in bboxes),
+    }
+
+    kept_id, *dropped_ids = article_ids
+
+    # import_document_directory only ever inserts/updates rows that
+    # are still present in final_data -- it never deletes a stale one
+    # (same requirement delete_boundary already has), so each dropped
+    # article's own logical_article_id has to be captured now, before
+    # it's removed from final_data below, or its DB row would be
+    # orphaned forever.
+    dropped_logical_ids = [
+        logical.get("logical_article_id")
+        for logical in (
+            _find_logical_article(final_data, page_number, dropped_id)
+            for dropped_id in dropped_ids
+        )
+        if logical is not None
+    ]
+
+    result = _extract_and_persist(
+        document_dir=document_dir,
+        page_number=page_number,
+        article_id=kept_id,
+        bbox=merged_bbox,
+        final_data=final_data,
+        final_logical_path=final_logical_path,
+    )
+
+    for dropped_id in dropped_ids:
+
+        crop_dir = page_dir / dropped_id
+
+        if crop_dir.is_dir():
+            shutil.rmtree(crop_dir)
+
+        _remove_physical_article(final_data, page_number, dropped_id)
+
+    final_logical_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(final_logical_path, "w", encoding="utf-8") as f:
+        json.dump(final_data, f, indent=4, ensure_ascii=False)
+
+    db_synced = False
+    db_error = None
+
+    try:
+
+        import_document_directory(str(document_dir))
+
+        for logical_id in dropped_logical_ids:
+            if logical_id:
+                _delete_logical_article_from_db(document_id, logical_id)
+
+        db_synced = True
+
+    except Exception as exc:
+        db_error = str(exc)
+
+    physical_article = result["physical_article"]
+
+    return {
+        "article_id": kept_id,
+        "bbox": result["clamped_bbox"],
+        "headline": physical_article.get("headline"),
+        "article_text": physical_article.get("article_text"),
+        "merged_from": article_ids,
+        "removed_article_ids": dropped_ids,
         "db_synced": db_synced,
         "db_error": db_error,
     }

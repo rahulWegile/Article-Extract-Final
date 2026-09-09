@@ -7,7 +7,29 @@ import api from "../api/api";
 // only reports completion that way now), this just hides the numbers.
 const SHOW_LIVE_PROGRESS = false;
 
-function UploadCard({ onUploadSuccess }) {
+function formatBytes(bytes) {
+
+    if (!bytes && bytes !== 0) {
+        return "";
+    }
+
+    if (bytes < 1024) {
+        return `${bytes} B`;
+    }
+
+    const kb = bytes / 1024;
+
+    if (kb < 1024) {
+        return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
+    }
+
+    const mb = kb / 1024;
+
+    return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
+
+}
+
+function UploadCard({ onUploadSuccess, onNotify, onBoundariesCreated }) {
 
     const fileInput = useRef(null);
 
@@ -19,9 +41,28 @@ function UploadCard({ onUploadSuccess }) {
 
     const [stage, setStage] = useState("");
 
+    const [isDragOver, setIsDragOver] = useState(false);
+
     const chooseFile = () => {
 
         fileInput.current.click();
+
+    };
+
+    const acceptFile = (candidate) => {
+
+        if (!candidate) {
+            return;
+        }
+
+        if (candidate.type !== "application/pdf" && !candidate.name?.toLowerCase().endsWith(".pdf")) {
+
+            onNotify?.("error", "Only PDF files are supported.");
+            return;
+
+        }
+
+        setFile(candidate);
 
     };
 
@@ -29,8 +70,37 @@ function UploadCard({ onUploadSuccess }) {
 
         if (event.target.files.length > 0) {
 
-            setFile(event.target.files[0]);
+            acceptFile(event.target.files[0]);
 
+        }
+
+    };
+
+    const onDrop = (event) => {
+
+        event.preventDefault();
+        setIsDragOver(false);
+
+        if (uploading) {
+            return;
+        }
+
+        if (event.dataTransfer.files.length > 0) {
+
+            acceptFile(event.dataTransfer.files[0]);
+
+        }
+
+    };
+
+    const clearFile = (event) => {
+
+        event.stopPropagation();
+
+        setFile(null);
+
+        if (fileInput.current) {
+            fileInput.current.value = "";
         }
 
     };
@@ -39,8 +109,7 @@ function UploadCard({ onUploadSuccess }) {
 
         if (!file) {
 
-            alert("Please select a PDF.");
-
+            onNotify?.("error", "Please select a PDF to upload.");
             return;
 
         }
@@ -50,6 +119,7 @@ function UploadCard({ onUploadSuccess }) {
         formData.append("file", file);
 
         let pollTimer = null;
+        let boundariesNotified = false;
 
         try {
 
@@ -105,6 +175,17 @@ function UploadCard({ onUploadSuccess }) {
 
                         setStage(job.stage ?? "");
 
+                        if (
+                            job.event === "boundaries_created" &&
+                            !boundariesNotified
+                        ) {
+
+                            boundariesNotified = true;
+
+                            onBoundariesCreated?.(job.article_count ?? null);
+
+                        }
+
                         if (job.status === "completed") {
 
                             clearInterval(pollTimer);
@@ -131,7 +212,7 @@ function UploadCard({ onUploadSuccess }) {
 
             });
 
-            alert("Upload completed.");
+            onNotify?.("success", "Upload completed successfully.");
 
             setFile(null);
 
@@ -147,7 +228,7 @@ function UploadCard({ onUploadSuccess }) {
 
             console.error(error);
 
-            alert(`Upload failed: ${error.message || error}`);
+            onNotify?.("error", `Upload failed: ${error.message || error}`);
 
         } finally {
 
@@ -171,11 +252,13 @@ function UploadCard({ onUploadSuccess }) {
 
         <div className="upload-card">
 
-            <h2>
+            <div className="upload-card-header">
 
-                Upload Newspaper PDF
+                <h2>Upload Newspaper PDF</h2>
 
-            </h2>
+                <p>Add a scanned edition to detect article boundaries automatically.</p>
+
+            </div>
 
             <input
 
@@ -183,7 +266,7 @@ function UploadCard({ onUploadSuccess }) {
 
                 type="file"
 
-                accept=".pdf"
+                accept=".pdf,application/pdf"
 
                 onChange={onFileChange}
 
@@ -191,37 +274,126 @@ function UploadCard({ onUploadSuccess }) {
 
             />
 
-            <div className="selected-file">
+            <div
+                className={
+                    "upload-dropzone" +
+                    (isDragOver ? " is-dragover" : "") +
+                    (uploading ? " is-disabled" : "")
+                }
+                onClick={uploading ? undefined : chooseFile}
+                onDragOver={(event) => {
+                    event.preventDefault();
+                    if (!uploading) {
+                        setIsDragOver(true);
+                    }
+                }}
+                onDragLeave={() => setIsDragOver(false)}
+                onDrop={onDrop}
+                role="button"
+                tabIndex={0}
+                aria-disabled={uploading}
+            >
 
-                {file ? file.name : "No file selected"}
+                {file ? (
+
+                    <div className="upload-file-chip">
+
+                        <span className="upload-file-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path
+                                    d="M7 3h7l5 5v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"
+                                    stroke="currentColor"
+                                    strokeWidth="1.5"
+                                    strokeLinejoin="round"
+                                />
+                                <path d="M14 3v5h5" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+                            </svg>
+                        </span>
+
+                        <span className="upload-file-info">
+                            <span className="upload-file-name">{file.name}</span>
+                            <span className="upload-file-size">{formatBytes(file.size)}</span>
+                        </span>
+
+                        {!uploading && (
+
+                            <button
+                                type="button"
+                                className="upload-file-remove"
+                                onClick={clearFile}
+                                aria-label="Remove selected file"
+                            >
+                                ×
+                            </button>
+
+                        )}
+
+                    </div>
+
+                ) : (
+
+                    <div className="upload-dropzone-empty">
+
+                        <span className="upload-dropzone-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path
+                                    d="M12 16V4m0 0 4 4m-4-4-4 4"
+                                    stroke="currentColor"
+                                    strokeWidth="1.75"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                />
+                                <path
+                                    d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"
+                                    stroke="currentColor"
+                                    strokeWidth="1.75"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                />
+                            </svg>
+                        </span>
+
+                        <p>
+                            <strong>Drag &amp; drop</strong> a PDF here, or click to browse
+                        </p>
+
+                        <span className="upload-dropzone-hint">Supports single PDF files</span>
+
+                    </div>
+
+                )}
 
             </div>
 
-            <button
+            <div className="upload-actions">
 
-                className="choose-btn"
+                <button
 
-                onClick={chooseFile}
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={chooseFile}
+                    disabled={uploading}
 
-            >
+                >
 
-                Choose PDF
+                    Choose PDF
 
-            </button>
+                </button>
 
-            <button
+                <button
 
-                className="upload-btn"
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={uploadPDF}
+                    disabled={uploading || !file}
 
-                onClick={uploadPDF}
+                >
 
-                disabled={uploading}
+                    {uploading ? "Uploading…" : "Upload"}
 
-            >
+                </button>
 
-                {uploading ? "Uploading..." : "Upload"}
-
-            </button>
+            </div>
 
             {uploading && SHOW_LIVE_PROGRESS && (
 

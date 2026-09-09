@@ -12,6 +12,8 @@ from typing import Any
 
 import cv2
 
+from pipeline.block_parser import LayoutBlock
+
 
 # ----------------------------------------------------------------
 # VISUAL SEPARATOR (rule line / colored box edge)
@@ -31,7 +33,7 @@ import cv2
 # white background and so has high variation), but not lit up close
 # to white either.
 SEPARATOR_ROW_STD_MAX = 15.0
-SEPARATOR_ROW_BRIGHTNESS_MAX = 205.0
+SEPARATOR_ROW_BRIGHTNESS_MAX = 235.0
 
 # A colored tag/box background (the common "अवसर" / "आदेश" style
 # orange or yellow label boxes) can be almost as bright as paper in
@@ -191,6 +193,81 @@ def has_vertical_separator_between(page_image, x1, x2, y1, y2):
         return False
 
     return _has_bar_in_strip(page_image, x1, x2, y1, y2)
+
+
+# ----------------------------------------------------------------
+# UNDETECTED CONTENT IN A "GAP"
+#
+# The opposite question from has_visual_separator: not "is there a
+# printed rule/border here", but "is this supposedly blank gutter
+# actually blank paper at all -- or does the newspaper print real
+# content there that the layout detector simply never boxed?"
+#
+# Confirmed on a real Urdu (THE INQUILAB) page: a colourful GDP/flag/
+# gold-bars infographic sat between two story columns and was never
+# detected as a block at all (the detector boxed the photo beside it
+# but not this one). article_splitter.py's column-package check,
+# reasoning only about DETECTED blocks, measured a 537px "gap"
+# between the two title columns either side of it -- far past its
+# own gutter-width allowance -- and concluded they were two separate
+# stories, splitting a single Gemini-grouped article back apart even
+# though Gemini's own read of the full page image had it right.
+#
+# Reuses the same ink test has_visual_separator already applies per
+# ROW (dark OR saturated pixels), just averaged over the whole probed
+# rectangle instead of tested row-by-row: a real photo/graphic lights
+# up a meaningful fraction of its own pixels either dark or coloured,
+# while genuinely blank newsprint does not.
+# ----------------------------------------------------------------
+
+# Fraction of ink pixels (dark or saturated) a rectangle must contain
+# before it counts as "real printed content", not blank paper. Set
+# low relative to SEPARATOR_ROW_STD_MAX's per-row test: a photo mixes
+# plenty of near-white sky/background/margin pixels with its actual
+# subject, so this only needs to catch a photo/graphic's presence, not
+# characterise its whole area as covered.
+UNDETECTED_CONTENT_INK_RATIO_MIN = 0.12
+
+
+def has_undetected_content(page_image, x1, x2, y1, y2) -> bool:
+    """
+    Whether the rectangle [x1, x2) x [y1, y2) contains substantial
+    printed ink -- i.e. is NOT genuinely blank paper -- regardless of
+    whether any layout-detector block covers it.
+
+    Used to tell a real editorial gutter (blank paper the newspaper
+    deliberately left empty between two separate stories) apart from
+    a gap that only LOOKS empty because the layout detector missed a
+    photo/graphic sitting in it (see module docstring above).
+    """
+
+    if page_image is None:
+        return False
+
+    height, width = page_image.shape[:2]
+
+    x1 = max(0, int(x1))
+    x2 = min(width, int(x2))
+    y1 = max(0, int(y1))
+    y2 = min(height, int(y2))
+
+    if x2 <= x1 or y2 <= y1:
+        return False
+
+    band = page_image[y1:y2, x1:x2]
+
+    if band.size == 0:
+        return False
+
+    gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+
+    ink = (
+        (gray < SEPARATOR_ROW_BRIGHTNESS_MAX)
+        | (hsv[:, :, 1] > SEPARATOR_ROW_SATURATION_MIN)
+    )
+
+    return float(ink.mean()) >= UNDETECTED_CONTENT_INK_RATIO_MIN
 
 
 # ----------------------------------------------------------------
@@ -412,3 +489,209 @@ def annotate_gaps(
         median = (gaps[middle - 1] + gaps[middle]) / 2.0
 
     return round(median, 1)
+
+
+TITLE_INK_GRAY_MAX = 150
+TITLE_ROW_INK_MIN = 0.03
+TITLE_BAND_GAP_MAX = 3
+TITLE_HEIGHT_FACTOR = 1.3
+TITLE_PROBE_FACTOR = 6.0
+TITLE_ATTACH_GAP_FACTOR = 2.0
+TITLE_HAS_ABOVE_FACTOR = 2.0
+TITLE_CONTRAST_TRIM = 0.12
+TITLE_CONTRAST_MAX = 0.15
+TITLE_COLUMN_OVERLAP_MIN = 0.35
+TITLE_RULE_LINE_COVERAGE_MIN = 0.85
+
+
+def _title_ink_rows(band):
+    if band is None or band.size == 0:
+        return None
+    gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+    ink = (gray < TITLE_INK_GRAY_MAX) | (
+        hsv[:, :, 1] > SEPARATOR_ROW_SATURATION_MIN
+    )
+    return ink.mean(axis=1)
+
+
+def _title_text_bands(page_image, x1, x2, y1, y2):
+    height, width = page_image.shape[:2]
+    x1 = max(0, int(x1))
+    x2 = min(width, int(x2))
+    y1 = max(0, int(y1))
+    y2 = min(height, int(y2))
+    if x2 <= x1 or y2 <= y1:
+        return []
+    row_ink = _title_ink_rows(page_image[y1:y2, x1:x2])
+    if row_ink is None:
+        return []
+    bands = []
+    start = None
+    gap = 0
+    for row, coverage in enumerate(row_ink):
+        if coverage >= TITLE_ROW_INK_MIN:
+            if start is None:
+                start = row
+            gap = 0
+        elif start is not None:
+            gap += 1
+            if gap > TITLE_BAND_GAP_MAX:
+                bands.append((start, row - gap))
+                start = None
+                gap = 0
+    if start is not None:
+        bands.append((start, len(row_ink) - 1 - gap))
+    return [(y1 + s, y1 + e) for s, e in bands if e >= s]
+
+
+def _title_column_overlap(a_x1, a_x2, block):
+    width_a = max(1.0, float(a_x2 - a_x1))
+    width_b = max(1.0, float(block.x2 - block.x1))
+    overlap = min(a_x2, block.x2) - max(a_x1, block.x1)
+    return max(0.0, overlap) / min(width_a, width_b)
+
+
+def _title_body_line_height(page_image, blocks):
+    heights = []
+    for block in blocks:
+        if (block.cls or "").strip().lower() != "plain text":
+            continue
+        for start, end in _title_text_bands(
+            page_image, block.x1, block.x2, block.y1, block.y2
+        ):
+            heights.append(end - start + 1)
+    if not heights:
+        return None
+    heights.sort()
+    middle = len(heights) // 2
+    if len(heights) % 2:
+        return heights[middle]
+    return (heights[middle - 1] + heights[middle]) / 2.0
+
+
+def _title_is_rule_line(page_image, x1, x2, band):
+    row_cov = _title_ink_rows(
+        page_image[int(band[0]):int(band[1]) + 1, int(x1):int(x2)]
+    )
+    if row_cov is None or len(row_cov) == 0:
+        return False
+    return float(row_cov.mean()) >= TITLE_RULE_LINE_COVERAGE_MIN
+
+
+def recover_missing_titles(page_image, blocks):
+    if page_image is None:
+        return []
+
+    body_line_height = _title_body_line_height(page_image, blocks)
+    if not body_line_height:
+        return []
+
+    probe_height = body_line_height * TITLE_PROBE_FACTOR
+    attach_gap_max = body_line_height * TITLE_ATTACH_GAP_FACTOR
+    has_above_gap_max = body_line_height * TITLE_HAS_ABOVE_FACTOR
+
+    all_blocks = list(blocks)
+    recovered = []
+    next_id = max((b.id for b in blocks), default=-1) + 1
+
+    for target in blocks:
+
+        cls = (target.cls or "").strip().lower()
+        if cls not in ("plain text", "figure"):
+            continue
+
+        has_above = any(
+            other is not target
+            and other.y2 <= target.y1
+            and (target.y1 - other.y2) <= has_above_gap_max
+            and _title_column_overlap(target.x1, target.x2, other)
+            >= TITLE_COLUMN_OVERLAP_MIN
+            for other in blocks
+        )
+        if has_above:
+            continue
+
+        probe_y1 = max(0.0, target.y1 - probe_height)
+        bands = _title_text_bands(
+            page_image, target.x1, target.x2, probe_y1, target.y1
+        )
+        if not bands:
+            continue
+
+        rule_lines = [
+            b for b in bands
+            if _title_is_rule_line(page_image, target.x1, target.x2, b)
+        ]
+        if rule_lines:
+            boundary = max(b[1] for b in rule_lines)
+            bands = [b for b in bands if b[0] > boundary]
+        if not bands:
+            continue
+
+        strong = [
+            b for b in bands
+            if (b[1] - b[0] + 1) >= body_line_height * TITLE_HEIGHT_FACTOR
+        ]
+        if not strong:
+            continue
+
+        if (target.y1 - strong[-1][1]) > attach_gap_max:
+            continue
+
+        cluster = [b for b in bands if b[0] >= strong[0][0]]
+        y1 = cluster[0][0]
+        y2 = cluster[-1][1]
+
+        row_cov = _title_ink_rows(
+            page_image[int(y1):int(y2) + 1, int(target.x1):int(target.x2)]
+        )
+        if row_cov is None or len(row_cov) == 0:
+            continue
+
+        trim = max(1, int(len(row_cov) * TITLE_CONTRAST_TRIM))
+        inner = row_cov[trim:len(row_cov) - trim]
+        if len(inner) == 0:
+            continue
+
+        contrast = float(inner.min()) / float(row_cov.max() + 1e-6)
+        if contrast > TITLE_CONTRAST_MAX:
+            continue
+
+        crop = page_image[
+            int(y1):int(y2) + 1, int(target.x1):int(target.x2)
+        ]
+        gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        hsv_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        ink = (gray_crop < TITLE_INK_GRAY_MAX) | (
+            hsv_crop[:, :, 1] > SEPARATOR_ROW_SATURATION_MIN
+        )
+        cols = ink.any(axis=0)
+        if not cols.any():
+            continue
+
+        col_indices = cols.nonzero()[0]
+        x1 = target.x1 + int(col_indices[0])
+        x2 = target.x1 + int(col_indices[-1]) + 1
+
+        overlaps_existing = any(
+            not (x2 <= b.x1 or x1 >= b.x2 or (y2 + 1) <= b.y1 or y1 >= b.y2)
+            for b in all_blocks
+        )
+        if overlaps_existing:
+            continue
+
+        new_block = LayoutBlock(
+            id=next_id,
+            cls="title",
+            x1=x1,
+            y1=int(y1),
+            x2=x2,
+            y2=int(y2) + 1,
+            confidence=1.0,
+        )
+        recovered.append(new_block)
+        all_blocks.append(new_block)
+        next_id += 1
+
+    return recovered

@@ -1,6 +1,11 @@
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
+from pipeline.article.visual_separator import (
+    has_vertical_separator_between,
+    has_visual_separator,
+)
+
 
 @dataclass
 class Article:
@@ -162,6 +167,175 @@ class ArticleGrouper:
 
         return vertical_gap + column_penalty
 
+    # Mirrors article_splitter.py's BANNER_FRAGMENT_EDGE_TOLERANCE /
+    # BANNER_FRAGMENT_HEIGHT_RATIO / BANNER_FRAGMENT_MAX_GAP_RATIO --
+    # same geometric test (two title blocks that are really one
+    # printed headline line, cut apart at a column gutter), duplicated
+    # here rather than imported because article_splitter.py already
+    # imports FROM this module (importing back would be circular).
+    # Deliberately WITHOUT that file's final has_vertical_separator_
+    # between pixel probe: ArticleGrouper.build() runs before any
+    # page image is loaded anywhere in the pipeline (see
+    # gemini_boundary_pipeline.py -- page_image is only read later,
+    # for the splitter/dropped-article-recovery stages), so only
+    # bbox/text evidence is available here. See
+    # _is_plausible_banner_pair below for why this exists.
+    BANNER_PAIR_MIN_ROW_OVERLAP_RATIO = 0.5
+    BANNER_PAIR_HEIGHT_RATIO = 0.75
+    BANNER_PAIR_MAX_GAP_RATIO = 0.5
+
+    @classmethod
+    def _is_plausible_banner_pair(cls, block_a, block_b) -> bool:
+        """
+        Whether two title-class blocks are plausibly two fragments of
+        ONE printed headline that a column gutter cut apart (e.g. a
+        banner running "GDP...fake claim" split into a left and right
+        title box) rather than two independent headlines that happen
+        to share a row.
+
+        _layout_distance structurally cannot see this: a banner
+        fragment's own bbox never column-overlaps its OTHER half --
+        that lack of overlap is exactly what makes it a cut-apart
+        fragment -- so the generic column-penalty formula scores two
+        genuine banner halves as maximally far apart, near its own
+        100000 ceiling. Confirmed on a real Urdu (THE INQUILAB) page:
+        this made _reassign_orphan_blocks repeatedly judge a banner
+        fragment "isolated" from its own true other half and instead
+        anchor it on whatever ordinary body block happened to sit
+        directly below it -- geometrically tighter by the generic
+        metric, but semantically the wrong pairing, since that body
+        block itself belongs with the OTHER fragment.
+
+        Uses ROW OVERLAP rather than article_splitter.py's stricter
+        single-line-text + exact-edge-tolerance test: a banner cut
+        into two narrower boxes routinely has its OCR text wrap
+        across 2-3 lines within each box's own narrower width (the
+        printed line is one row of large type; the per-box crop is
+        not), which would fail a literal single-line check even
+        though the two boxes are still visibly one banner row.
+        Confirmed necessary on a real Urdu page: the "ہر گھر تک جانچ
+        ہوگی" banner's own two fragments both carried multi-line OCR
+        text purely from this box-width wrapping.
+        """
+
+        if (
+            (getattr(block_a, "cls", None) or "").strip().lower()
+            != "title"
+            or (getattr(block_b, "cls", None) or "").strip().lower()
+            != "title"
+        ):
+            return False
+
+        height_a = block_a.y2 - block_a.y1
+        height_b = block_b.y2 - block_b.y1
+
+        shorter = min(height_a, height_b)
+        taller = max(height_a, height_b)
+
+        if shorter <= 0 or shorter / taller < cls.BANNER_PAIR_HEIGHT_RATIO:
+            return False
+
+        row_top = max(block_a.y1, block_b.y1)
+        row_bottom = min(block_a.y2, block_b.y2)
+        row_overlap = max(0.0, float(row_bottom - row_top))
+
+        if row_overlap / shorter < cls.BANNER_PAIR_MIN_ROW_OVERLAP_RATIO:
+            return False
+
+        left, right = (
+            (block_a, block_b)
+            if block_a.x1 <= block_b.x1
+            else (block_b, block_a)
+        )
+
+        gap = right.x1 - left.x2
+
+        if gap < 0 or gap > cls.BANNER_PAIR_MAX_GAP_RATIO * shorter:
+            return False
+
+        return True
+
+    @classmethod
+    def _reassignment_distance(cls, block_a, block_b):
+        """
+        _layout_distance, except a genuine banner-headline fragment
+        pair (see _is_plausible_banner_pair) is treated as touching
+        (0.0) instead of running through the generic column-penalty
+        formula. Used ONLY by _reassign_orphan_blocks_once -- every
+        OTHER caller of _layout_distance (contested-block arbitration,
+        orphan-title-root repair) is left exactly as before.
+        """
+
+        if cls._is_plausible_banner_pair(block_a, block_b):
+            return 0.0
+
+        return cls._layout_distance(block_a, block_b)
+
+    @staticmethod
+    def _has_separator_between(page_image, block_a, block_b) -> bool:
+        """
+        Whether a printed rule line or colored border sits between
+        block_a and block_b -- a HARD signal that the newspaper itself
+        already marked these as two separate editorial items, which
+        must never be overridden by geometric proximity alone.
+
+        Checks whichever relationship the two blocks actually have:
+        a horizontal rule in the blank band between them when they are
+        vertically stacked (the usual _reassign_orphan_blocks shape --
+        a block being pulled up/down into a neighboring article), or a
+        vertical divider in the gap between them when they sit side by
+        side. Reuses the SAME pixel probes article_splitter.py already
+        relies on for its own hard-separator checks
+        (has_visual_separator / has_vertical_separator_between) rather
+        than a new detector -- see visual_separator.py for the tuning
+        history behind both.
+
+        Returns False (no veto) when there is no page image to probe,
+        or when the two blocks neither stack nor sit side by side
+        (e.g. they overlap on both axes) -- this check only ever
+        BLOCKS a reassignment it can positively confirm crosses a
+        printed divider; it never blocks one it cannot evaluate.
+        """
+
+        if page_image is None:
+            return False
+
+        if block_a.y2 <= block_b.y1 or block_b.y2 <= block_a.y1:
+
+            top, bottom = (
+                (block_a, block_b)
+                if block_a.y2 <= block_b.y1
+                else (block_b, block_a)
+            )
+
+            if has_visual_separator(
+                page_image,
+                min(top.x1, bottom.x1),
+                max(top.x2, bottom.x2),
+                top.y2,
+                bottom.y1,
+            ):
+                return True
+
+        if block_a.x2 <= block_b.x1 or block_b.x2 <= block_a.x1:
+
+            left, right = (
+                (block_a, block_b)
+                if block_a.x2 <= block_b.x1
+                else (block_b, block_a)
+            )
+
+            if has_vertical_separator_between(
+                page_image,
+                left.x2,
+                right.x1,
+                min(block_a.y1, block_b.y1),
+                max(block_a.y2, block_b.y2),
+            ):
+                return True
+
+        return False
+
     # Fraction of the narrower block's width that must overlap
     # horizontally for two blocks to count as sharing a column, for
     # the orphan-title-root repairs below. Matches
@@ -170,6 +344,15 @@ class ArticleGrouper:
     # print), just re-expressed against Block objects instead of
     # page_json dicts.
     ORPHAN_TITLE_COLUMN_OVERLAP = 0.35
+
+    # A genuine kicker/eyebrow line is a single short line of text
+    # printed above the real headline -- never a wrapped multi-
+    # sentence paragraph. Used by _reassign_orphan_title_roots to
+    # tell a truly "body-less" title apart from a block the layout
+    # detector cut wide enough to also contain its own body text (see
+    # that method's docstring).
+    KICKER_MAX_LINES = 2
+    KICKER_MAX_CHARS = 90
 
     # Max vertical gap between an unclaimed article_image and its own
     # claimed caption for _recover_unclaimed_images_via_caption below
@@ -180,6 +363,14 @@ class ArticleGrouper:
     # wide margin on the "real pair" side while staying nowhere near
     # the "no real caption exists" tail.
     IMAGE_CAPTION_MAX_GAP = 250.0
+
+    # Fraction of page height counted as the page's own header band
+    # for _recover_unclaimed_title_graphics's masthead guard -- matches
+    # PageCleaner.detect_page_header's own top_limit (0.15), the
+    # broader "this is chrome, not a story" band, rather than
+    # detect_masthead's narrower 0.12 (which only covers the masthead
+    # proper on page 1).
+    MASTHEAD_HEADER_BAND_RATIO = 0.15
 
     @staticmethod
     def _title_column_overlap(block_a, block_b):
@@ -310,11 +501,16 @@ class ArticleGrouper:
         return resolved
 
     @classmethod
-    def _reassign_orphan_blocks(cls, response_articles, block_lookup):
+    def _reassign_orphan_blocks_once(
+        cls, response_articles, block_lookup, page_image=None
+    ):
         """
-        Reassign a block that is geometrically inconsistent with
-        every other block in the one article that claims it, when
-        some OTHER article's blocks fit it far better.
+        Compute every CANDIDATE reassignment for the current article
+        state (see _reassign_orphan_blocks for how these candidates
+        get applied one at a time): a block that is geometrically
+        inconsistent with every other block in the one article that
+        claims it, when some OTHER article's blocks fit it far
+        better.
 
         Distinct from _resolve_contested_blocks: that resolves a
         block claimed by MULTIPLE articles (an ownership dispute).
@@ -333,8 +529,23 @@ class ArticleGrouper:
         at once (see the ArticleGrouper docstring examples), so this
         should only ever fire on a genuine mismatch.
 
-        Returns {block_id: new_article_id} for blocks to move. Any
-        block absent from the result keeps its original article.
+        A candidate alternative is REJECTED outright (never becomes
+        `best_article_id`, however good its distance score) when a
+        printed rule line or border sits between the block and its
+        nearest neighbor in that candidate article -- see
+        _has_separator_between. This check runs BEFORE the distance
+        comparison, so a hard separator can never be outscored by
+        raw proximity: a confirmed editorial boundary is not a
+        candidate at all, not merely a worse-scoring one. `page_image`
+        is optional (None skips the check, same as every other
+        pixel-probing pass in this codebase when no image is given).
+
+        Returns {block_id: (new_article_id, distance)} for every
+        candidate reassignment, relative to THIS call's own
+        `response_articles` snapshot -- `distance` lets the caller
+        pick the single best candidate across the whole page (see
+        _reassign_orphan_blocks). Any block absent from the result is
+        not currently a reassignment candidate.
         """
 
         # A block's own claim is trusted at face value below this --
@@ -443,14 +654,48 @@ class ArticleGrouper:
                     continue
 
                 own_distance = min(
-                    cls._layout_distance(
+                    cls._reassignment_distance(
                         block,
                         block_lookup[other_id],
                     )
                     for other_id in own_reference_ids
                 )
 
-                if own_distance < ORPHAN_ISOLATION_FLOOR:
+                # A printed vertical divider between this block and
+                # its OWN article's headline overrides the geometric
+                # isolation floor below: the newspaper itself already
+                # marked the two as separate editorial items, so the
+                # model's claim doesn't get to stand on "it scores
+                # close enough" alone. Confirmed on a real Odia
+                # (Sambad, doc_000177 page 2) page: a 4-column lead
+                # story's Column 4 photo was claimed by a single-
+                # column Column 5 article, cutting through the lead
+                # story's own headline -- the photo and that article's
+                # headline sit on opposite sides of a printed rule
+                # line, but were otherwise close enough in the raw
+                # column-penalty metric to pass as a normal claim.
+                own_title_ids = [
+                    other_id
+                    for other_id in own_reference_ids
+                    if (
+                        getattr(block_lookup[other_id], "cls", "")
+                        or ""
+                    ).strip().lower() == "title"
+                ]
+
+                separated_from_own_title = any(
+                    cls._has_separator_between(
+                        page_image,
+                        block,
+                        block_lookup[other_id],
+                    )
+                    for other_id in own_title_ids
+                )
+
+                if (
+                    own_distance < ORPHAN_ISOLATION_FLOOR
+                    and not separated_from_own_title
+                ):
                     continue
 
                 best_article_id = None
@@ -474,13 +719,27 @@ class ArticleGrouper:
 
                     nearest_id = min(
                         candidate_ids,
-                        key=lambda other_id: cls._layout_distance(
+                        key=lambda other_id: cls._reassignment_distance(
                             block,
                             block_lookup[other_id],
                         ),
                     )
 
-                    distance = cls._layout_distance(
+                    # HARD BOUNDARY CHECK -- runs BEFORE the distance
+                    # comparison below, so a printed separator can
+                    # never be outscored by raw proximity: a
+                    # candidate article the newspaper itself already
+                    # separated this block from is not a worse
+                    # candidate, it is not a candidate at all. See
+                    # _has_separator_between.
+                    if cls._has_separator_between(
+                        page_image,
+                        block,
+                        block_lookup[nearest_id],
+                    ):
+                        continue
+
+                    distance = cls._reassignment_distance(
                         block,
                         block_lookup[nearest_id],
                     )
@@ -511,9 +770,93 @@ class ArticleGrouper:
                     and best_vertical_gap is not None
                     and best_vertical_gap <= ORPHAN_MAX_VERTICAL_GAP
                 ):
-                    reassignments[block_id] = best_article_id
+                    reassignments[block_id] = (best_article_id, best_distance)
 
         return reassignments
+
+    # A block's own best-fit alternative can depend on ANOTHER block
+    # that is itself a reassignment candidate -- confirmed on a real
+    # Urdu page: block 33 (a banner-headline fragment) belongs with
+    # article 5 (its own other fragment + photo), but article 5's OWN
+    # body paragraph (block 5) was, at that same moment, the single
+    # nearest thing to block 33 in article 5's ORIGINAL contents --
+    # and symmetrically, block 33 was the nearest thing to block 5 in
+    # ITS article's original contents. Deciding both moves from the
+    # same frozen snapshot and applying them together swapped the two
+    # articles' content instead of ever landing them together: article
+    # 5 ended up missing its own body text, and article 6 ended up
+    # holding two completely unrelated stories' body paragraphs fused
+    # into one. Each individual decision was correct against the
+    # snapshot it was computed from; only the compound, SIMULTANEOUS
+    # effect was wrong.
+    #
+    # Capped defensively -- normal pages reassign only a handful of
+    # blocks in total, so this is a generous ceiling on the number of
+    # SINGLE moves this pass will ever make on one page, not a tuned
+    # convergence-round count.
+    MAX_ORPHAN_REASSIGNMENTS = 25
+
+    @classmethod
+    def _reassign_orphan_blocks(cls, response_articles, block_lookup, page_image=None):
+        """
+        State-aware wrapper around _reassign_orphan_blocks_once:
+
+            1. Compute every candidate reassignment against the
+               CURRENT article contents.
+            2. Accept only the SINGLE best candidate (by distance)
+               across the entire page.
+            3. Apply it, updating current article membership.
+            4. Recompute every candidate's score from scratch against
+               that updated membership.
+            5. Repeat for the next-best candidate.
+
+        Never accepts two reassignments from the same frozen snapshot
+        -- a target article's membership is always re-scored before
+        the next block is allowed to move, so a block can never be
+        moved out of a story on the strength of a neighbor that is
+        itself only there because of a reassignment not yet applied
+        (see MAX_ORPHAN_REASSIGNMENTS above for the confirmed
+        real-page failure this prevents).
+
+        Returns {block_id: FINAL new_article_id}, relative to the
+        ORIGINAL `response_articles` passed in -- safe to apply once,
+        via _apply_orphan_reassignments, against that original list.
+        """
+
+        working_articles = response_articles
+        final_reassignments: dict = {}
+
+        for _ in range(cls.MAX_ORPHAN_REASSIGNMENTS):
+
+            candidates = cls._reassign_orphan_blocks_once(
+                working_articles,
+                block_lookup,
+                page_image=page_image,
+            )
+
+            if not candidates:
+                break
+
+            # The SINGLE best candidate across the whole page -- ties
+            # broken by block_id for a stable, deterministic result.
+            best_block_id = min(
+                candidates,
+                key=lambda block_id: (
+                    candidates[block_id][1],
+                    block_id,
+                ),
+            )
+
+            best_article_id, _best_distance = candidates[best_block_id]
+
+            working_articles = cls._apply_orphan_reassignments(
+                working_articles,
+                {best_block_id: best_article_id},
+            )
+
+            final_reassignments[best_block_id] = best_article_id
+
+        return final_reassignments
 
     @classmethod
     def _reassign_orphan_title_roots(cls, response_articles, block_lookup):
@@ -555,6 +898,26 @@ class ArticleGrouper:
                 continue
 
             if getattr(block, "role", None) != "article_title":
+                continue
+
+            # The model labels a block "article_title" whenever it
+            # STARTS with a headline, even when the layout detector
+            # cut the region wide enough to also contain that
+            # headline's own body paragraph below it in the same
+            # block -- this block is not actually "body-less", so
+            # merging it away as a kicker would silently swallow an
+            # entire separate story into its neighbour. Confirmed on
+            # a real Urdu page (Siasat Daily): two single-block
+            # articles -- "GST collection..." and "Congress workers
+            # scuffle with police", each a complete story with its
+            # own headline as the block's first line(s) -- were
+            # merged into one article this way. A genuine kicker/
+            # eyebrow line is one short line of text; anything longer
+            # is body content the block already carries on its own.
+            text = (getattr(block, "text", "") or "").strip()
+            text_lines = [line for line in text.splitlines() if line.strip()]
+
+            if len(text_lines) > cls.KICKER_MAX_LINES or len(text) > cls.KICKER_MAX_CHARS:
                 continue
 
             best_article_id = None
@@ -649,9 +1012,15 @@ class ArticleGrouper:
     @classmethod
     def _recover_unclaimed_kicker_titles(cls, unclaimed_blocks, articles):
         """
-        Fold a still-unclaimed lone title into the nearest article
-        whose OWN title-class block sits below it in the same
-        column.
+        Fold a still-unclaimed lone title into the nearest article it
+        is the headline (or kicker) FOR: preferentially another
+        article's OWN title-class block sitting below it in the same
+        column (a kicker/eyebrow line above an already-recognised
+        headline); falling back, only when no such title-to-title
+        match exists anywhere, to a currently HEADLINE-LESS article
+        whose own topmost block (any role) sits directly below it in
+        the same column (this block IS that article's missing
+        headline, not a kicker for one).
 
         Distinct from _reassign_orphan_title_roots: that repairs a
         kicker the model DID list inside some (single-block)
@@ -661,17 +1030,43 @@ class ArticleGrouper:
         unclaimed-blocks warning below and vanishes from the final
         output entirely.
 
+        The headline-less fallback closes a real gap the title-to-
+        title match alone cannot: confirmed on a real Urdu page (THE
+        INQUILAB), a genuine headline with unreadable OCR text (role
+        "unknown", cls "title" -- see _is_uncertain_title) sat 10px
+        above its own article's first body paragraph, but that
+        article had no OTHER title-class block for the loop below to
+        match against at all -- an entire story's headline vanished
+        from the final output with only a WARNING, never actually
+        reattached.
+
+        Both the title-to-title match and this fallback are bounded
+        by IMAGE_CAPTION_MAX_GAP: a kicker/headline pair, or a
+        headline/first-paragraph pair, is never more than a
+        line-height or two apart in print, so neither anchor is
+        strong enough evidence to justify an unbounded search. This
+        was confirmed the hard way on the same Urdu page's page 2: a
+        body paragraph mis-boxed as "title" by the layout detector
+        (correctly hedged "unknown" by the grouping model) shared
+        column alignment with an unrelated article's real title 404px
+        below it and, once an unrelated bug in the
+        has_own_unclaimed_body guard below was fixed, the title-to-
+        title loop -- uncapped at the time -- happily merged it in.
+        Capping both searches at IMAGE_CAPTION_MAX_GAP fixed that
+        false match while leaving every confirmed-real pair (a kicker
+        sitting well under 250px from its headline; block 73 above,
+        10px from its body) untouched.
+
         Deliberately as narrow as _reassign_orphan_title_roots: only
         a title-class block with no unclaimed article_text sibling
         of its own directly below it (i.e. not a genuine standalone
         story the model dropped outright, which this must not
-        swallow into an unrelated neighbor) is eligible, and it can
-        only attach to another article's own title-class block. This
-        cannot reproduce the nearest-ANY-geometry regression the
-        unclaimed-block auto-attach was reverted for (see the
-        "Report unclaimed content blocks" comment in build()) -- it
-        never touches a caption or body paragraph, and never
-        attaches sideways or upward.
+        swallow into an unrelated neighbor) is eligible. This cannot
+        reproduce the nearest-ANY-geometry regression the unclaimed-
+        block auto-attach was reverted for (see the "Report unclaimed
+        content blocks" comment in build()) -- it never touches a
+        caption or body paragraph, and never attaches sideways or
+        upward.
 
         Mutates the matched Article in place (appends the block,
         re-sorts by reading_order). Returns the set of recovered
@@ -693,10 +1088,23 @@ class ArticleGrouper:
             ):
                 continue
 
+            # "Directly below it" (see docstring) means genuinely
+            # adjacent, not merely somewhere further down the same
+            # column -- capped at IMAGE_CAPTION_MAX_GAP for the same
+            # reason as every other proximity check in this class.
+            # Confirmed on a real Urdu page: an unrelated unclaimed
+            # paragraph sat 856px below an orphaned headline, sharing
+            # its column purely by coincidence (both are narrow blocks
+            # in a page with few columns) -- without this cap it read
+            # as "this title has its own dropped body", permanently
+            # blocking the headline-less-article recovery below even
+            # though the two blocks belong to entirely different
+            # stories.
             has_own_unclaimed_body = any(
                 other is not block
                 and getattr(other, "role", None) == "article_text"
                 and other.y1 >= block.y2
+                and (other.y1 - block.y2) <= cls.IMAGE_CAPTION_MAX_GAP
                 and cls._title_column_overlap(block, other)
                 >= cls.ORPHAN_TITLE_COLUMN_OVERLAP
                 for other in unclaimed_blocks
@@ -725,6 +1133,207 @@ class ArticleGrouper:
                         continue
 
                     distance = float(candidate.y1 - block.y2)
+
+                    # A kicker/eyebrow line sits immediately above its
+                    # own headline in print -- a real pair is never
+                    # more than a line-height or two apart. Without
+                    # this cap a title-class block far up the page can
+                    # latch onto a distant, unrelated article's title
+                    # sharing its column purely by coincidence; see
+                    # the has_own_unclaimed_body cap above for a
+                    # confirmed real case of exactly that coincidence
+                    # (different guard, same underlying risk).
+                    if distance > cls.IMAGE_CAPTION_MAX_GAP:
+                        continue
+
+                    if best_distance is None or distance < best_distance:
+                        best_distance = distance
+                        best_article = article
+
+            if best_article is None:
+
+                # No article anywhere already has a title-class block
+                # positioned below this one -- try it as the MISSING
+                # headline of a currently headline-less article
+                # instead (see docstring). Only considered once the
+                # title-to-title search above has fully failed, so a
+                # genuine kicker/eyebrow match always wins over this
+                # weaker, distance-capped fallback.
+
+                for article in articles:
+
+                    if not article.blocks:
+                        continue
+
+                    has_own_title = any(
+                        getattr(existing, "role", None)
+                        == "article_title"
+                        for existing in article.blocks
+                    )
+
+                    if has_own_title:
+                        continue
+
+                    topmost = min(article.blocks, key=lambda b: b.y1)
+
+                    if topmost.y1 < block.y2:
+                        continue
+
+                    if (
+                        cls._title_column_overlap(block, topmost)
+                        < cls.ORPHAN_TITLE_COLUMN_OVERLAP
+                    ):
+                        continue
+
+                    distance = float(topmost.y1 - block.y2)
+
+                    if distance > cls.IMAGE_CAPTION_MAX_GAP:
+                        continue
+
+                    if (
+                        best_distance is None
+                        or distance < best_distance
+                    ):
+                        best_distance = distance
+                        best_article = article
+
+            if best_article is None:
+                continue
+
+            best_article.blocks.append(block)
+            best_article.block_ids.append(block.id)
+
+            best_article.blocks.sort(
+                key=lambda b: getattr(b, "reading_order", 0)
+            )
+
+            recovered.add(block.id)
+
+        return recovered
+
+    @classmethod
+    def _recover_unclaimed_title_graphics(
+        cls,
+        unclaimed_blocks,
+        articles,
+        header_band_bottom=None,
+        masthead_blocks=None,
+    ):
+        """
+        Fold an unclaimed graphic-style headline banner into the
+        article whose own topmost content sits directly beneath it in
+        the same column.
+
+        Some newspapers render a story's own headline as a colored
+        graphic banner (custom typography over an art background)
+        rather than plain OCR-able text. The layout detector correctly
+        boxes it as a "figure", but with no real-world photo content
+        to recognize and no prompt guidance distinguishing "this
+        story's own stylized title" from "the newspaper's own
+        recurring branding", the grouping model falls back to "logo"
+        or "decoration" -- both hard-excluded from articles by
+        IGNORE_ROLES, and so permanently invisible to every other
+        repair pass (they never reach unclaimed_content_blocks in the
+        first place -- see the caller). Confirmed on a real Tamil
+        page: an electric-vehicle-jobs story's own banner headline sat
+        immediately above the story's own lead photo, was tagged
+        "logo", and the story's final crop started below it -- cutting
+        its own headline out of its own boundary.
+
+        Deliberately as narrow as _recover_unclaimed_kicker_titles:
+        the caller already restricts candidates to cls == "figure"
+        with role "logo"/"decoration"; this only additionally accepts
+        one sitting directly ABOVE -- never beside, never overlapping
+        -- some article's own block, with substantial column overlap
+        and within IMAGE_CAPTION_MAX_GAP, and only when it is the
+        single nearest such article. A genuine page-level logo (a
+        masthead-adjacent section flag, say) sitting well above the
+        page's first real story is never this close to any article's
+        own content, so this cannot misattach real page chrome the
+        way an unbounded nearest-geometry attach would (see build()'s
+        "Report unclaimed content blocks" comment for why that was
+        reverted elsewhere).
+
+        Guards against a SPECIFIC over-reach of "sits directly above
+        some article": the newspaper's own masthead/nameplate logo,
+        sitting at the very top of the page above the lead story, also
+        satisfies "directly above, same column, close enough" once
+        that lead story has no headline of its own to compete with it.
+        Confirmed on a real Odia (Sambad, doc_000177 page 1) page: the
+        lead story had no headline block, and the masthead logo above
+        it (never textually recognized as a masthead by
+        PageCleaner.detect_masthead, since that check matches known
+        paper names and this masthead is a pure graphic) was folded in
+        as the story's own "title graphic", stretching the article's
+        crop up to swallow the paper's nameplate. `header_band_bottom`
+        (a y-coordinate) and `masthead_blocks` (already positively
+        identified by PageCleaner) both veto that: a candidate block
+        sitting above the header band, or overlapping a confirmed
+        masthead block, is never eligible here, regardless of which
+        article's content happens to sit beneath it.
+
+        Mutates the matched Article in place (appends the block,
+        re-sorts by reading_order). Returns the set of recovered
+        block ids.
+        """
+
+        def overlaps_masthead(candidate_block):
+
+            if not masthead_blocks:
+                return False
+
+            for masthead in masthead_blocks:
+
+                ix1 = max(candidate_block.x1, masthead.x1)
+                iy1 = max(candidate_block.y1, masthead.y1)
+                ix2 = min(candidate_block.x2, masthead.x2)
+                iy2 = min(candidate_block.y2, masthead.y2)
+
+                if ix2 > ix1 and iy2 > iy1:
+                    return True
+
+            return False
+
+        recovered = set()
+
+        for block in unclaimed_blocks:
+
+            if (
+                getattr(block, "is_global", False)
+                or (getattr(block, "type", "") or "").strip().lower()
+                == "masthead"
+            ):
+                continue
+
+            if (
+                header_band_bottom is not None
+                and block.y1 < header_band_bottom
+            ):
+                continue
+
+            if overlaps_masthead(block):
+                continue
+
+            best_article = None
+            best_distance = None
+
+            for article in articles:
+
+                for candidate in article.blocks:
+
+                    if candidate.y1 < block.y2:
+                        continue
+
+                    if (
+                        cls._title_column_overlap(block, candidate)
+                        < cls.ORPHAN_TITLE_COLUMN_OVERLAP
+                    ):
+                        continue
+
+                    distance = float(candidate.y1 - block.y2)
+
+                    if distance > cls.IMAGE_CAPTION_MAX_GAP:
+                        continue
 
                     if best_distance is None or distance < best_distance:
                         best_distance = distance
@@ -843,6 +1452,128 @@ class ArticleGrouper:
 
         return recovered
 
+    # A block recovered by footprint containment must sit within this
+    # many pixels of an article's own outer bbox to count as
+    # "immediately adjacent" when it isn't already strictly inside it
+    # -- generous enough to cover ordinary column-gutter/margin slack
+    # around a real footprint without approaching the scale of a
+    # genuinely separate story sitting in the next column or block.
+    FOOTPRINT_ADJACENT_TOLERANCE = 50.0
+
+    @classmethod
+    def _recover_unclaimed_blocks_by_footprint(
+        cls,
+        unclaimed_blocks,
+        articles,
+    ):
+        """
+        Attach a still-unclaimed non-chrome block to the ONE article
+        whose own outer footprint (the union bbox of its already-
+        claimed blocks) already geometrically contains it -- the last
+        resort after every more specific recovery above (kicker,
+        title-graphic, image-via-caption) has had its narrower chance.
+
+        Confirmed on a real Malayalam page (doc_000166, page 2): a
+        story's own byline (role "byline") and its own lead paragraph
+        (role "article_text") were both correctly role-classified by
+        the grouping model but never listed in ANY article's "blocks"
+        array -- neither a kicker-shaped title nor an image-via-
+        caption match, so both fell through every existing recovery
+        pass and stayed permanently unclaimed, printed only as a
+        WARNING. Both blocks sit, in x AND y, entirely inside the
+        bounding rectangle of the one real article whose headline and
+        remaining body/photo already surround them on every side --
+        exactly the shape a plain rectangular crop (see
+        boundary_builder.py) already includes on the page regardless,
+        but which the article's own block-membership list (and
+        anything downstream that reads it, e.g. text assembly) was
+        still silently missing.
+
+        Containment (block bbox falls entirely within the article's
+        own footprint, plus FOOTPRINT_ADJACENT_TOLERANCE of slack for
+        a block sitting just outside it) is deliberately a much
+        narrower question than the reverted whole-page nearest-ANY
+        attach (see the "Report unclaimed content blocks" comment in
+        build(), which merged 35% of one page into a single blob):
+        that attach considered every block a candidate for whichever
+        article was geometrically NEAREST, even a page away; this only
+        ever considers a block already sitting inside (or barely
+        outside) ONE specific article's own established boundary.
+
+        Ambiguous when more than one article's footprint contains the
+        block (can happen for an L-shaped/overlapping-rectangle
+        article, see boundary_decomposer.py) -- skipped rather than
+        guessed, same conservative default as every other recovery
+        pass here.
+
+        Deliberately does NOT also veto on _has_separator_between the
+        way _reassign_orphan_blocks_once does: confirmed on the same
+        real Malayalam page, a byline's own printed underline (routine
+        typographic styling directly under a byline, not a story
+        divider) sits in the immediate gap between the byline and its
+        own very next paragraph, and reads as a hard "rule line" to
+        that same-purposed probe -- which would permanently veto
+        recovering a block from the ONLY candidate that could ever
+        claim it. That veto earns its keep in _reassign_orphan_blocks_
+        once because it is choosing between competing ALTERNATIVE
+        articles and a wrong choice silently reattributes content;
+        here there is exactly one candidate to begin with (the
+        ambiguity check above already rejects every case where a
+        choice would even need making), so the failure mode a
+        separator veto guards against does not apply.
+
+        Mutates the matched Article in place (appends the block,
+        re-sorts by reading_order). Returns the set of recovered
+        block ids.
+        """
+
+        if not unclaimed_blocks:
+            return set()
+
+        recovered = set()
+
+        for block in unclaimed_blocks:
+
+            candidates = []
+
+            for article in articles:
+
+                if not article.blocks:
+                    continue
+
+                min_x = min(b.x1 for b in article.blocks)
+                min_y = min(b.y1 for b in article.blocks)
+                max_x = max(b.x2 for b in article.blocks)
+                max_y = max(b.y2 for b in article.blocks)
+
+                inside = (
+                    block.x1 >= min_x - cls.FOOTPRINT_ADJACENT_TOLERANCE
+                    and block.x2 <= max_x + cls.FOOTPRINT_ADJACENT_TOLERANCE
+                    and block.y1 >= min_y - cls.FOOTPRINT_ADJACENT_TOLERANCE
+                    and block.y2 <= max_y + cls.FOOTPRINT_ADJACENT_TOLERANCE
+                )
+
+                if not inside:
+                    continue
+
+                candidates.append(article)
+
+            if len(candidates) != 1:
+                continue
+
+            best_article = candidates[0]
+
+            best_article.blocks.append(block)
+            best_article.block_ids.append(block.id)
+
+            best_article.blocks.sort(
+                key=lambda b: getattr(b, "reading_order", 0)
+            )
+
+            recovered.add(block.id)
+
+        return recovered
+
     def build(
         self,
         parsed_response,
@@ -852,6 +1583,8 @@ class ArticleGrouper:
         use_orphan_title_root_repair: bool = True,
         use_unclaimed_kicker_recovery: bool = True,
         use_unclaimed_image_recovery: bool = True,
+        use_unclaimed_footprint_recovery: bool = True,
+        page_image=None,
     ):
 
         #
@@ -906,6 +1639,7 @@ class ArticleGrouper:
             orphan_reassignments = self._reassign_orphan_blocks(
                 parsed_response["articles"],
                 block_lookup,
+                page_image=page_image,
             )
 
             response_articles = self._apply_orphan_reassignments(
@@ -961,6 +1695,35 @@ class ArticleGrouper:
             article_blocks = []
 
             article_block_ids = []
+
+            #
+            # WEATHER MISCLASSIFICATION SAFETY NET
+            #
+            # "weather" is meant for a small numbers-only forecast
+            # panel, but the model sometimes tags an entire narrative
+            # news report about rain/monsoon conditions "weather"
+            # too (see the grouping prompts' WEATHER section) while
+            # still, correctly, listing that block inside a real
+            # article alongside a genuine article_title and
+            # article_text. IGNORE_ROLES is meant for page chrome
+            # (masthead, advertisement, etc.) that never belongs in
+            # an article regardless of context -- it should not also
+            # amputate real content the model's OWN article grouping
+            # already vouches for by surrounding it with a real
+            # headline and body text. Scoped to "weather" only: every
+            # other IGNORE_ROLES role (advertisement, masthead, ...)
+            # stays a hard exclusion, per the prompts' own "NEVER
+            # place advertisements inside news articles".
+            #
+            article_role_values = {
+                getattr(block_lookup.get(bid), "role", None)
+                for bid in article["blocks"]
+            }
+
+            article_has_real_story = (
+                "article_title" in article_role_values
+                and "article_text" in article_role_values
+            )
 
             for block_id in article["blocks"]:
 
@@ -1019,7 +1782,13 @@ class ArticleGrouper:
                 # Ignore non-article blocks
                 #
 
-                if has_role and role in self.IGNORE_ROLES:
+                if (
+                    has_role
+                    and role in self.IGNORE_ROLES
+                    and not (
+                        role == "weather" and article_has_real_story
+                    )
+                ):
 
                     removed += 1
 
@@ -1121,6 +1890,70 @@ class ArticleGrouper:
                 if block.id not in recovered_kicker_ids
             ]
 
+        # A "logo"/"decoration" role is excluded from
+        # unclaimed_content_blocks above by the IGNORE_ROLES filter --
+        # by design, since most blocks with those roles really are
+        # page chrome. Computed as its own separate pool, restricted
+        # to cls == "figure" so a plain-text/title block that got
+        # "decoration" stays excluded exactly as IGNORE_ROLES intends;
+        # see _recover_unclaimed_title_graphics for why a figure-shaped
+        # exception is needed. Same per-language opt-in as the kicker
+        # recovery above -- this is the same shape of repair (an
+        # unclaimed headline-role block reattached to the article
+        # beneath it), just for a graphic banner instead of OCR text.
+        unclaimed_graphic_blocks = [
+            block
+            for block in blocks
+            if block.id not in claimed_block_ids
+            and (getattr(block, "role", None) or "").strip().lower()
+            in ("logo", "decoration")
+            and (getattr(block, "cls", "") or "").strip().lower()
+            == "figure"
+        ]
+
+        # Masthead guard for _recover_unclaimed_title_graphics below --
+        # see that method's docstring. A true masthead is already
+        # flagged by PageCleaner.detect_masthead (block.type ==
+        # "masthead"), but that only fires when the paper's NAME is
+        # recognized in its OCR text; a masthead rendered as a pure
+        # graphic (no matching text) is invisible to that check, so a
+        # positional header-band cutoff is also needed. page_height
+        # isn't passed to build(); estimated the same way
+        # detect_page_header estimates page WIDTH from the blocks
+        # themselves.
+        estimated_page_height = max(
+            (getattr(b, "y2", 0) for b in blocks),
+            default=0,
+        )
+
+        header_band_bottom = (
+            estimated_page_height * self.MASTHEAD_HEADER_BAND_RATIO
+            if estimated_page_height
+            else None
+        )
+
+        masthead_blocks = [
+            b
+            for b in blocks
+            if (getattr(b, "type", "") or "").strip().lower()
+            == "masthead"
+        ]
+
+        recovered_title_graphic_ids = (
+            self._recover_unclaimed_title_graphics(
+                unclaimed_graphic_blocks,
+                articles,
+                header_band_bottom=header_band_bottom,
+                masthead_blocks=masthead_blocks,
+            )
+            if use_unclaimed_kicker_recovery
+            else set()
+        )
+
+        if recovered_title_graphic_ids:
+
+            claimed_block_ids.update(recovered_title_graphic_ids)
+
         # Per-language opt-in (see pipeline/languages/): enabled for
         # every language except English, matching every other repair
         # pass here.
@@ -1142,6 +1975,30 @@ class ArticleGrouper:
                 block
                 for block in unclaimed_content_blocks
                 if block.id not in recovered_image_ids
+            ]
+
+        # Last-resort catch-all, after every more specific recovery
+        # above has had its narrower chance: a block still unclaimed
+        # at this point but already sitting inside (or barely outside)
+        # one article's own established footprint. Same per-language
+        # opt-in as the other unclaimed-content recovery passes above.
+        recovered_footprint_ids = (
+            self._recover_unclaimed_blocks_by_footprint(
+                unclaimed_content_blocks,
+                articles,
+            )
+            if use_unclaimed_footprint_recovery
+            else set()
+        )
+
+        if recovered_footprint_ids:
+
+            claimed_block_ids.update(recovered_footprint_ids)
+
+            unclaimed_content_blocks = [
+                block
+                for block in unclaimed_content_blocks
+                if block.id not in recovered_footprint_ids
             ]
 
         print()
@@ -1209,6 +2066,16 @@ class ArticleGrouper:
                 f"{sorted(recovered_kicker_ids)}"
             )
 
+        if recovered_title_graphic_ids:
+
+            print(
+                f"WARNING: Recovered {len(recovered_title_graphic_ids)} "
+                "unclaimed title-graphic(s) -- tagged logo/decoration "
+                "by the model, merged into the article directly "
+                "beneath them instead: "
+                f"{sorted(recovered_title_graphic_ids)}"
+            )
+
         if recovered_image_ids:
 
             print(
@@ -1217,6 +2084,16 @@ class ArticleGrouper:
                 "by the model, merged into whichever article claimed "
                 "their own caption instead: "
                 f"{sorted(recovered_image_ids)}"
+            )
+
+        if recovered_footprint_ids:
+
+            print(
+                f"WARNING: Recovered {len(recovered_footprint_ids)} "
+                "unclaimed block(s) -- never listed in any article by "
+                "the model, merged into the one article whose own "
+                "footprint already geometrically contains them: "
+                f"{sorted(recovered_footprint_ids)}"
             )
 
         print()

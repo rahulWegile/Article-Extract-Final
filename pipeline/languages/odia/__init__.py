@@ -39,4 +39,11 @@ ODIA = LanguagePipeline(
     grouping_prompt=ODIA_GROUPING_PROMPT,
     extraction_prompt_template=ODIA_EXTRACTION_PROMPT,
     extractor_class=GeminiArticleExtractor,
+    # The shared 0.20 default drops genuine Odia headlines/columns.
+    # Confirmed on a real Odia (Sambad, doc_000177 page 1) page: the
+    # lead headline ("ସତର୍କ କରାଇଲା ଚୀନ୍") was detected at YOLO
+    # confidence 0.15 and discarded at the default threshold --
+    # across all 4 pages of that document, detections dropped ~30-40%
+    # at 0.20 vs. 0.10. See LanguagePipeline.layout_confidence.
+    layout_confidence=0.10,
 )

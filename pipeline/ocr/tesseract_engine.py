@@ -113,7 +113,7 @@ class TesseractOCREngine:
     Tesseract-backed OCR engine.
 
     Used ONLY for languages that have no recognition model in either
-    RapidOCR or EasyOCR -- currently Gujarati, Malayalam, Urdu,
+    RapidOCR or EasyOCR -- currently Gujarati, Malayalam,
     Punjabi, Bengali, Assamese, and Odia (see each language's module
     under pipeline/languages/ for the per-language routing and why
     each one lands here instead of RapidOCR). Loads
@@ -786,3 +786,48 @@ class TesseractOCREngine:
         print("=" * 60)
 
         return results
+
+    # ========================================================
+    # PROCESS FINAL ARTICLE CROP
+    #
+    # Same contract as RapidOCREngine.process_article_crop /
+    # EasyOCREngine.process_article_crop: LocalArticleExtractor calls
+    # this as its fallback OCR path for a final article crop whose
+    # page_json-block-derived text came back too short (see
+    # local_article_extractor.py, MIN_BLOCK_TEXT_CHARS). Without this
+    # method, every one of the nine Tesseract-routed languages hits an
+    # AttributeError the first time that fallback fires under the
+    # local (no-cloud) extraction path.
+    # ========================================================
+
+    def process_article_crop(self, image_path):
+        """
+        Run Tesseract directly on one final, already-cropped article
+        image, using _CropOriginBlock (already in its own coordinate
+        space, cls "plain text") so this reuses _ocr_block's existing
+        PSM-6-with-PSM-13-rescue path -- the same choice _ocr_block
+        makes for any non-title/caption block, since a full article
+        crop almost always holds more running body text than a
+        single headline line.
+        """
+
+        image = cv2.imread(str(image_path))
+
+        if image is None:
+
+            raise FileNotFoundError(
+                f"Unable to read article crop: {image_path}"
+            )
+
+        text, confidence, lines = self._ocr_block(
+            image, _CropOriginBlock()
+        )
+
+        return {
+            "text": text,
+            "confidence": confidence,
+            "lines": lines,
+            "width": int(image.shape[1]),
+            "height": int(image.shape[0]),
+            "line_count": len(lines),
+        }

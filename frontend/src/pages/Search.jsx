@@ -1,5 +1,6 @@
 import {
     useEffect,
+    useRef,
     useState,
 } from "react";
 
@@ -11,6 +12,9 @@ import {
 import api from "../api/api";
 
 import "../styles/archive.css";
+
+
+const PAGE_SIZE = 20;
 
 
 function Search() {
@@ -86,6 +90,12 @@ function Search() {
         total,
         setTotal
     ] = useState(0);
+
+
+    const [
+        page,
+        setPage
+    ] = useState(1);
 
 
     // ========================================================
@@ -367,6 +377,8 @@ function Search() {
 
         setTotal(0);
 
+        setPage(1);
+
         setSearched(false);
 
         setError("");
@@ -421,6 +433,7 @@ function Search() {
         await performSearch({
             suppliedNewspaper: newspaper,
             suppliedDate: "",
+            suppliedPage: 1,
         });
 
     };
@@ -446,6 +459,8 @@ function Search() {
         setResults([]);
 
         setTotal(0);
+
+        setPage(1);
 
         setSearched(false);
 
@@ -498,6 +513,7 @@ function Search() {
         await performSearch({
             suppliedNewspaper: selectedNewspaper,
             suppliedDate: date,
+            suppliedPage: 1,
         });
 
     };
@@ -511,7 +527,7 @@ function Search() {
         suppliedQuery = null,
         suppliedNewspaper = null,
         suppliedDate = null,
-        append = false,
+        suppliedPage = null,
     } = {}) => {
 
         const value = (
@@ -533,6 +549,12 @@ function Search() {
                 : selectedDate;
 
 
+        const currentPage =
+            suppliedPage !== null
+                ? suppliedPage
+                : page;
+
+
         // ----------------------------------------------------
         // No filters at all means "browse the entire archive" --
         // the backend already treats an empty query and no
@@ -541,9 +563,7 @@ function Search() {
         // ----------------------------------------------------
 
         const offset =
-            append
-                ? results.length
-                : 0;
+            (currentPage - 1) * PAGE_SIZE;
 
 
         setLoading(
@@ -564,7 +584,7 @@ function Search() {
                 // Empty string is allowed by backend.
                 q: value,
 
-                limit: 100,
+                limit: PAGE_SIZE,
 
                 offset,
 
@@ -612,22 +632,18 @@ function Search() {
                 data.results || [];
 
 
-            const combinedResults =
-                append
-                    ? [
-                        ...results,
-                        ...articles,
-                    ]
-                    : articles;
-
-
             setResults(
-                combinedResults
+                articles
             );
 
 
             setTotal(
                 data.total || 0
+            );
+
+
+            setPage(
+                currentPage
             );
 
 
@@ -650,7 +666,7 @@ function Search() {
                         data.total || 0,
 
                     results:
-                        combinedResults,
+                        articles,
                 })
             );
 
@@ -754,9 +770,46 @@ function Search() {
             event.key === "Enter"
         ) {
 
-            performSearch();
+            performSearch({
+                suppliedPage: 1,
+            });
 
         }
+
+    };
+
+
+    // ========================================================
+    // PAGINATION
+    // ========================================================
+
+    const totalPages =
+        Math.max(
+            1,
+            Math.ceil(
+                total / PAGE_SIZE
+            )
+        );
+
+
+    const goToPage = (
+        targetPage
+    ) => {
+
+        if (
+            targetPage === page ||
+            targetPage < 1 ||
+            targetPage > totalPages
+        ) {
+
+            return;
+
+        }
+
+
+        performSearch({
+            suppliedPage: targetPage,
+        });
 
     };
 
@@ -794,6 +847,8 @@ function Search() {
 
         setTotal(0);
 
+        setPage(1);
+
         setSearched(false);
 
         setError("");
@@ -830,6 +885,18 @@ function Search() {
                     }
                 >
 
+                    <span className="archive-logo-mark" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <rect x="3" y="3" width="18" height="18" rx="4" fill="currentColor" opacity="0.15" />
+                            <path
+                                d="M7 8h10M7 12h10M7 16h6"
+                                stroke="currentColor"
+                                strokeWidth="1.75"
+                                strokeLinecap="round"
+                            />
+                        </svg>
+                    </span>
+
                     <span>
                         Newspaper Archive
                     </span>
@@ -839,9 +906,17 @@ function Search() {
 
                 <div className="archive-header-search">
 
+                    <span className="archive-header-search-icon" aria-hidden="true">
+                        <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <circle cx="9" cy="9" r="6.5" stroke="currentColor" strokeWidth="1.6" />
+                            <path d="M17 17l-3.8-3.8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                        </svg>
+                    </span>
+
                     <input
                         value={query}
                         placeholder="Search articles..."
+                        aria-label="Search articles"
                         onChange={(event) =>
                             setQuery(
                                 event.target.value
@@ -852,19 +927,10 @@ function Search() {
                         }
                     />
 
-
-                    <button
-                        onClick={() =>
-                            performSearch()
-                        }
-                    >
-                        🔍
-                    </button>
-
                 </div>
 
 
-                <nav className="archive-nav">
+                <nav className="archive-nav" aria-label="Primary">
 
                     <button
                         onClick={() =>
@@ -877,6 +943,7 @@ function Search() {
 
                     <button
                         className="active"
+                        aria-current="page"
                     >
                         Browse
                     </button>
@@ -917,9 +984,17 @@ function Search() {
 
                 <div className="large-search">
 
+                    <span className="large-search-icon" aria-hidden="true">
+                        <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <circle cx="9" cy="9" r="6.5" stroke="currentColor" strokeWidth="1.6" />
+                            <path d="M17 17l-3.8-3.8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                        </svg>
+                    </span>
+
                     <input
                         value={query}
                         placeholder="Search articles, people, topics and keywords..."
+                        aria-label="Search articles, people, topics and keywords"
                         onChange={(event) =>
                             setQuery(
                                 event.target.value
@@ -933,7 +1008,9 @@ function Search() {
 
                     <button
                         onClick={() =>
-                            performSearch()
+                            performSearch({
+                                suppliedPage: 1,
+                            })
                         }
                         disabled={loading}
                     >
@@ -952,7 +1029,7 @@ function Search() {
                     NEWSPAPER / DATE FILTERS
                     ================================================= */}
 
-                <section className="archive-filters">
+                <section className="archive-filters" aria-label="Filters">
 
                     {/* =============================================
                         NEWSPAPER
@@ -962,49 +1039,30 @@ function Search() {
 
                         <label
                             htmlFor="newspaper-select"
+                            className="sr-only"
                         >
                             Newspaper
                         </label>
 
 
-                        <select
+                        <FilterDropdown
                             id="newspaper-select"
-                            value={
-                                selectedNewspaper
-                            }
-                            onChange={
-                                handleNewspaperChange
-                            }
-                            disabled={
-                                loadingNewspapers
-                            }
-                        >
-
-                            <option value="">
-                                All newspapers
-                            </option>
-
-
-                            {newspapers.map(
-                                (newspaper) => (
-
-                                    <option
-                                        key={
-                                            newspaper
-                                        }
-                                        value={
-                                            newspaper
-                                        }
-                                    >
-                                        {
-                                            newspaper
-                                        }
-                                    </option>
-
-                                )
+                            placeholder="Newspaper"
+                            loadingLabel="Loading newspapers..."
+                            value={selectedNewspaper}
+                            disabled={loadingNewspapers}
+                            options={newspapers.map(
+                                (newspaper) => ({
+                                    value: newspaper,
+                                    label: newspaper,
+                                })
                             )}
-
-                        </select>
+                            onChange={(value) =>
+                                handleNewspaperChange({
+                                    target: { value },
+                                })
+                            }
+                        />
 
                     </div>
 
@@ -1017,52 +1075,30 @@ function Search() {
 
                         <label
                             htmlFor="publish-date-select"
+                            className="sr-only"
                         >
-                            Publish Date
+                            Publish date
                         </label>
 
 
-                        <select
+                        <FilterDropdown
                             id="publish-date-select"
-                            value={
-                                selectedDate
-                            }
-                            onChange={
-                                handleDateChange
-                            }
-                            disabled={
-                                loadingDates
-                            }
-                        >
-
-                            <option value="">
-
-                                {loadingDates
-                                    ? "Loading dates..."
-                                    : "All dates"
-                                }
-
-                            </option>
-
-
-                            {publishDates.map(
-                                (date) => (
-
-                                    <option
-                                        key={date}
-                                        value={date}
-                                    >
-                                        {
-                                            formatDate(
-                                                date
-                                            )
-                                        }
-                                    </option>
-
-                                )
+                            placeholder="Publish date"
+                            loadingLabel="Loading dates..."
+                            value={selectedDate}
+                            disabled={loadingDates}
+                            options={publishDates.map(
+                                (date) => ({
+                                    value: date,
+                                    label: formatDate(date),
+                                })
                             )}
-
-                        </select>
+                            onChange={(value) =>
+                                handleDateChange({
+                                    target: { value },
+                                })
+                            }
+                        />
 
                     </div>
 
@@ -1074,7 +1110,9 @@ function Search() {
                     <button
                         className="archive-filter-button"
                         onClick={() =>
-                            performSearch()
+                            performSearch({
+                                suppliedPage: 1,
+                            })
                         }
                         disabled={
                             loading
@@ -1083,7 +1121,7 @@ function Search() {
 
                         {loading
                             ? "Loading..."
-                            : "Show Articles"
+                            : "Apply"
                         }
 
                     </button>
@@ -1122,7 +1160,7 @@ function Search() {
 
                         {selectedNewspaper && (
 
-                            <span>
+                            <span className="active-filter-chip">
                                 Newspaper:
                                 {" "}
                                 <strong>
@@ -1137,7 +1175,7 @@ function Search() {
 
                         {selectedDate && (
 
-                            <span>
+                            <span className="active-filter-chip">
                                 Date:
                                 {" "}
                                 <strong>
@@ -1162,9 +1200,33 @@ function Search() {
 
                 {error && (
 
-                    <div className="search-error">
+                    <div className="state-panel search-error-panel" role="alert">
 
-                        {error}
+                        <span className="state-panel-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.6" />
+                                <path d="M12 8v5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                                <circle cx="12" cy="16" r="1" fill="currentColor" />
+                            </svg>
+                        </span>
+
+                        <h2>
+                            Search unavailable
+                        </h2>
+
+                        <p>
+                            We couldn't load the archive results.
+                            Please try again.
+                        </p>
+
+                        <button
+                            className="state-panel-retry"
+                            onClick={() =>
+                                performSearch()
+                            }
+                        >
+                            Try again
+                        </button>
 
                     </div>
 
@@ -1172,30 +1234,63 @@ function Search() {
 
 
                 {/* =================================================
+                    LOADING SKELETON
+                    ================================================= */}
+
+                {loading && (
+
+                    <div className="search-results-skeleton" aria-hidden="true">
+
+                        {[0, 1, 2, 3, 4].map((key) => (
+
+                            <div className="result-skeleton-card" key={key}>
+
+                                <div className="result-skeleton-body">
+                                    <div className="skeleton-bar h-title" />
+                                    <div className="skeleton-bar h-meta" />
+                                    <div className="skeleton-bar w-full" />
+                                    <div className="skeleton-bar w-80" />
+                                </div>
+
+                                <div className="result-skeleton-thumb" />
+
+                            </div>
+
+                        ))}
+
+                    </div>
+
+                )}
+
+                {/* =================================================
                     RESULTS
                     ================================================= */}
 
-                {searched && !loading && (
+                {searched && !loading && !error && (
 
                     <section className="search-results">
 
-                        <div className="results-header">
+                        <div className="results-summary">
 
                             <h2>
 
+                                <span className="results-summary-eyebrow">
+                                    Search results
+                                </span>
+
                                 {total}
-
                                 {" "}
-
                                 {total === 1
                                     ? "article"
                                     : "articles"
                                 }
+                                {" "}
+                                found
 
                             </h2>
 
 
-                            <span>
+                            <span className="results-summary-context">
 
                                 {selectedNewspaper
                                     ? (
@@ -1224,7 +1319,7 @@ function Search() {
                                                 "{query}"
                                             </>
                                         )
-                                        : "found"
+                                        : null
                                 }
 
                             </span>
@@ -1234,182 +1329,298 @@ function Search() {
 
                         {results.length === 0 ? (
 
-                            <div className="no-results">
+                            <div className="state-panel no-results">
+
+                                <span className="state-panel-icon" aria-hidden="true">
+                                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                        <circle cx="10.5" cy="10.5" r="6.5" stroke="currentColor" strokeWidth="1.6" />
+                                        <path d="M19 19l-4.3-4.3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                                    </svg>
+                                </span>
 
                                 <h2>
                                     No articles found
                                 </h2>
 
                                 <p>
-
-                                    {selectedNewspaper
-                                        ? "No articles are available for the selected newspaper and date."
-                                        : "Try another name, topic or keyword."
-                                    }
-
+                                    Try a different keyword or adjust your filters.
                                 </p>
 
                             </div>
 
                         ) : (
 
-                            results.map(
-                                (
-                                    article,
-                                    index
-                                ) => (
+                            <>
 
-                                    <article
-                                        key={
-                                            `${article.document_id}-${article.logical_article_id}`
-                                        }
-                                        className="search-result-card"
-                                        onClick={() =>
-                                            openArticle(
-                                                article
-                                            )
-                                        }
-                                    >
+                                {results.map(
+                                    (
+                                        article,
+                                        index
+                                    ) => (
 
-                                        <div className="result-content">
+                                        <article
+                                            key={
+                                                `${article.document_id}-${article.logical_article_id}`
+                                            }
+                                            className="search-result-card"
+                                            tabIndex={0}
+                                            role="link"
+                                            onClick={() =>
+                                                openArticle(
+                                                    article
+                                                )
+                                            }
+                                            onKeyDown={(event) => {
 
-                                            <div className="result-number">
+                                                if (
+                                                    event.key === "Enter" ||
+                                                    event.key === " "
+                                                ) {
 
-                                                {String(
-                                                    index + 1
-                                                ).padStart(
-                                                    2,
-                                                    "0"
-                                                )}
+                                                    event.preventDefault();
 
-                                            </div>
+                                                    openArticle(
+                                                        article
+                                                    );
 
+                                                }
 
-                                            <div className="result-main">
+                                            }}
+                                        >
 
-                                                <h3>
-                                                    {
-                                                        article.title
-                                                    }
-                                                </h3>
+                                            <div className="result-content">
 
+                                                <div className="result-number">
 
-                                                {article.author && (
-
-                                                    <p className="result-author">
-
-                                                        {
-                                                            article.author
-                                                        }
-
-                                                    </p>
-
-                                                )}
-
-
-                                                <div className="result-meta">
-
-                                                    {article.display_date && (
-
-                                                        <span>
-                                                            {formatDate(
-                                                                article.display_date
-                                                            )}
-                                                        </span>
-
-                                                    )}
-
-
-                                                    {article.category && (
-
-                                                        <span className="category-tag">
-
-                                                            {
-                                                                article.category
-                                                            }
-
-                                                        </span>
-
+                                                    {String(
+                                                        (page - 1) * PAGE_SIZE +
+                                                        index + 1
+                                                    ).padStart(
+                                                        2,
+                                                        "0"
                                                     )}
 
                                                 </div>
 
 
-                                                {article.summary && (
+                                                <div className="result-main">
 
-                                                    <p className="result-summary">
+                                                    <div className="result-topline">
 
+                                                        {article.category && (
+
+                                                            <span className="category-tag">
+
+                                                                {
+                                                                    article.category
+                                                                }
+
+                                                            </span>
+
+                                                        )}
+
+                                                    </div>
+
+
+                                                    <h3>
                                                         {
-                                                            article.summary
+                                                            highlightMatch(article.title, query)
                                                         }
+                                                    </h3>
 
-                                                    </p>
 
-                                                )}
+                                                    {(article.author ||
+                                                        article.display_date) && (
+
+                                                        <p className="result-byline">
+
+                                                            {
+                                                                [
+                                                                    article.author,
+                                                                    article.display_date &&
+                                                                        formatDate(article.display_date),
+                                                                ]
+                                                                    .filter(Boolean)
+                                                                    .join(" · ")
+                                                            }
+
+                                                        </p>
+
+                                                    )}
+
+
+                                                    {article.summary && (
+
+                                                        <p className="result-summary">
+
+                                                            {
+                                                                highlightMatch(article.summary, query)
+                                                            }
+
+                                                        </p>
+
+                                                    )}
+
+
+                                                    {getResultTags(article).length > 0 && (
+
+                                                        <div className="result-tags">
+
+                                                            {getResultTags(article).map(
+                                                                (tag, tagIndex) => (
+
+                                                                    <span
+                                                                        className="result-tag"
+                                                                        key={tagIndex}
+                                                                    >
+                                                                        {tag}
+                                                                    </span>
+
+                                                                )
+                                                            )}
+
+                                                        </div>
+
+                                                    )}
+
+                                                </div>
 
                                             </div>
+
+
+                                            <div className="result-thumb">
+
+                                                {article.images &&
+                                                    article.images.length >
+                                                        0 &&
+                                                    article.images[0].url
+                                                    ? (
+
+                                                        <img
+                                                            className="result-image"
+                                                            src={
+                                                                buildUrl(
+                                                                    article.images[0].url
+                                                                )
+                                                            }
+                                                            alt={
+                                                                article.title
+                                                            }
+                                                        />
+
+                                                    )
+                                                    : (
+
+                                                        <span className="result-thumb-placeholder" aria-hidden="true">
+                                                            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                                                <path
+                                                                    d="M7 3h7l5 5v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"
+                                                                    stroke="currentColor"
+                                                                    strokeWidth="1.4"
+                                                                    strokeLinejoin="round"
+                                                                />
+                                                                <path d="M14 3v5h5" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
+                                                            </svg>
+                                                        </span>
+
+                                                    )
+                                                }
+
+                                            </div>
+
+                                        </article>
+
+                                    )
+                                )}
+
+
+                                {/* =========================================
+                                    PAGINATION
+                                    ========================================= */}
+
+                                {totalPages > 1 && (
+
+                                    <nav className="pagination" aria-label="Search results pages">
+
+                                        <button
+                                            className="pagination-nav-btn"
+                                            onClick={() =>
+                                                goToPage(page - 1)
+                                            }
+                                            disabled={
+                                                page <= 1 ||
+                                                loading
+                                            }
+                                        >
+                                            ← Previous
+                                        </button>
+
+
+                                        <div className="pagination-pages">
+
+                                            {getPageNumbers(page, totalPages).map(
+                                                (item, itemIndex) => (
+
+                                                    item === "…"
+                                                        ? (
+                                                            <span
+                                                                className="pagination-ellipsis"
+                                                                key={`ellipsis-${itemIndex}`}
+                                                            >
+                                                                …
+                                                            </span>
+                                                        )
+                                                        : (
+                                                            <button
+                                                                key={item}
+                                                                className={
+                                                                    "pagination-page" +
+                                                                    (item === page
+                                                                        ? " is-active"
+                                                                        : "")
+                                                                }
+                                                                aria-current={
+                                                                    item === page
+                                                                        ? "page"
+                                                                        : undefined
+                                                                }
+                                                                onClick={() =>
+                                                                    goToPage(item)
+                                                                }
+                                                                disabled={
+                                                                    loading
+                                                                }
+                                                            >
+                                                                {item}
+                                                            </button>
+                                                        )
+
+                                                )
+                                            )}
 
                                         </div>
 
 
-                                        {article.images &&
-                                            article.images.length >
-                                                0 &&
-                                            article.images[0].url && (
+                                        <button
+                                            className="pagination-nav-btn"
+                                            onClick={() =>
+                                                goToPage(page + 1)
+                                            }
+                                            disabled={
+                                                page >= totalPages ||
+                                                loading
+                                            }
+                                        >
+                                            Next →
+                                        </button>
 
-                                                <img
-                                                    className="result-image"
-                                                    src={
-                                                        buildUrl(
-                                                            article.images[0].url
-                                                        )
-                                                    }
-                                                    alt={
-                                                        article.title
-                                                    }
-                                                />
+                                    </nav>
 
-                                            )}
+                                )}
 
-                                    </article>
-
-                                )
-                            )
+                            </>
 
                         )}
-
-
-                        {/* =========================================
-                            LOAD MORE
-                            ========================================= */}
-
-                        {results.length > 0 &&
-                            results.length < total && (
-
-                                <button
-                                    className="archive-filter-button load-more-button"
-                                    onClick={() =>
-                                        performSearch({
-                                            append: true,
-                                        })
-                                    }
-                                    disabled={
-                                        loading
-                                    }
-                                >
-
-                                    {loading
-                                        ? "Loading..."
-                                        : `Load More (${
-                                            results.length
-                                        } of ${
-                                            total
-                                        })`
-                                    }
-
-                                </button>
-
-                            )}
 
                     </section>
 
@@ -1451,6 +1662,427 @@ function Search() {
 
 
 // ============================================================
+// FILTER DROPDOWN (custom-styled combobox)
+// ============================================================
+
+function FilterDropdown({
+    id,
+    placeholder,
+    loadingLabel,
+    value,
+    disabled,
+    options,
+    onChange,
+}) {
+
+    const [
+        open,
+        setOpen
+    ] = useState(false);
+
+
+    const [
+        activeIndex,
+        setActiveIndex
+    ] = useState(-1);
+
+
+    const rootRef = useRef(null);
+
+    const listRef = useRef(null);
+
+    const triggerRef = useRef(null);
+
+
+    const allOptions = [
+        {
+            value: "",
+            label: placeholder,
+        },
+        ...options,
+    ];
+
+
+    const selected =
+        allOptions.find(
+            (option) =>
+                option.value === value
+        );
+
+
+    useEffect(() => {
+
+        if (!open) {
+            return;
+        }
+
+
+        listRef.current?.focus();
+
+
+        const handleOutside = (event) => {
+
+            if (
+                rootRef.current &&
+                !rootRef.current.contains(event.target)
+            ) {
+
+                setOpen(false);
+
+            }
+
+        };
+
+        document.addEventListener(
+            "mousedown",
+            handleOutside
+        );
+
+        return () => {
+
+            document.removeEventListener(
+                "mousedown",
+                handleOutside
+            );
+
+        };
+
+    }, [open]);
+
+
+    const openDropdown = () => {
+
+        const index =
+            allOptions.findIndex(
+                (option) =>
+                    option.value === value
+            );
+
+        setActiveIndex(
+            index >= 0
+                ? index
+                : 0
+        );
+
+        setOpen(true);
+
+    };
+
+
+    const closeAndFocusTrigger = () => {
+
+        setOpen(false);
+
+        triggerRef.current?.focus();
+
+    };
+
+
+    const selectOption = (
+        option
+    ) => {
+
+        onChange(option.value);
+
+        closeAndFocusTrigger();
+
+    };
+
+
+    const handleListKeyDown = (
+        event
+    ) => {
+
+        if (event.key === "Escape") {
+
+            event.preventDefault();
+
+            closeAndFocusTrigger();
+
+            return;
+
+        }
+
+
+        if (event.key === "ArrowDown") {
+
+            event.preventDefault();
+
+            setActiveIndex(
+                (index) =>
+                    Math.min(
+                        index + 1,
+                        allOptions.length - 1
+                    )
+            );
+
+            return;
+
+        }
+
+
+        if (event.key === "ArrowUp") {
+
+            event.preventDefault();
+
+            setActiveIndex(
+                (index) =>
+                    Math.max(
+                        index - 1,
+                        0
+                    )
+            );
+
+            return;
+
+        }
+
+
+        if (
+            event.key === "Enter" ||
+            event.key === " "
+        ) {
+
+            event.preventDefault();
+
+            if (allOptions[activeIndex]) {
+
+                selectOption(
+                    allOptions[activeIndex]
+                );
+
+            }
+
+        }
+
+    };
+
+
+    return (
+
+        <div className="filter-dropdown" ref={rootRef}>
+
+            <button
+                type="button"
+                id={id}
+                ref={triggerRef}
+                className={
+                    "filter-dropdown-trigger" +
+                    (open ? " is-open" : "")
+                }
+                aria-haspopup="listbox"
+                aria-expanded={open}
+                disabled={disabled}
+                onClick={() => {
+
+                    if (open) {
+                        setOpen(false);
+                    }
+                    else {
+                        openDropdown();
+                    }
+
+                }}
+                onKeyDown={(event) => {
+
+                    if (event.key === "ArrowDown") {
+
+                        event.preventDefault();
+
+                        openDropdown();
+
+                    }
+
+                }}
+            >
+
+                <span className="filter-dropdown-trigger-label">
+
+                    {disabled && loadingLabel
+                        ? loadingLabel
+                        : (selected?.label || placeholder)
+                    }
+
+                </span>
+
+                <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                    <path
+                        d="M5.5 7.5l4.5 4.5 4.5-4.5"
+                        stroke="currentColor"
+                        strokeWidth="1.6"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                    />
+                </svg>
+
+            </button>
+
+
+            {open && (
+
+                <ul
+                    className="filter-dropdown-list"
+                    role="listbox"
+                    tabIndex={-1}
+                    ref={listRef}
+                    aria-activedescendant={
+                        activeIndex >= 0
+                            ? `${id}-option-${activeIndex}`
+                            : undefined
+                    }
+                    onKeyDown={handleListKeyDown}
+                >
+
+                    {allOptions.map(
+                        (option, index) => (
+
+                            <li
+                                key={
+                                    option.value ||
+                                    "placeholder"
+                                }
+                                id={`${id}-option-${index}`}
+                                role="option"
+                                aria-selected={option.value === value}
+                                className={
+                                    "filter-dropdown-option" +
+                                    (option.value === value
+                                        ? " is-selected"
+                                        : "") +
+                                    (index === activeIndex
+                                        ? " is-active"
+                                        : "")
+                                }
+                                onMouseEnter={() =>
+                                    setActiveIndex(index)
+                                }
+                                onClick={() =>
+                                    selectOption(option)
+                                }
+                            >
+
+                                {option.label}
+
+                            </li>
+
+                        )
+                    )}
+
+                </ul>
+
+            )}
+
+        </div>
+
+    );
+
+}
+
+
+// ============================================================
+// RESULT TAGS (topics + keywords)
+// ============================================================
+
+function getResultTags(article) {
+
+    const topics =
+        Array.isArray(article.topics)
+            ? article.topics
+            : [];
+
+    const keywords =
+        Array.isArray(article.keywords)
+            ? article.keywords
+            : [];
+
+    return [
+        ...topics,
+        ...keywords,
+    ]
+        .filter(Boolean)
+        .slice(0, 3);
+
+}
+
+
+// ============================================================
+// PAGE NUMBERS (with ellipsis windowing)
+// ============================================================
+
+function getPageNumbers(current, total) {
+
+    const pages = [];
+
+    const delta = 1;
+
+    const start = Math.max(2, current - delta);
+    const end = Math.min(total - 1, current + delta);
+
+    pages.push(1);
+
+    if (start > 2) {
+        pages.push("…");
+    }
+
+    for (let i = start; i <= end; i++) {
+        pages.push(i);
+    }
+
+    if (end < total - 1) {
+        pages.push("…");
+    }
+
+    if (total > 1) {
+        pages.push(total);
+    }
+
+    return pages;
+
+}
+
+
+// ============================================================
+// HIGHLIGHT SEARCH TERM
+// ============================================================
+
+function escapeRegExp(value) {
+
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+}
+
+function highlightMatch(text, query) {
+
+    if (!text) {
+        return text;
+    }
+
+    const trimmed = (query || "").trim();
+
+    if (!trimmed) {
+        return text;
+    }
+
+    const parts = text.split(
+        new RegExp(`(${escapeRegExp(trimmed)})`, "ig")
+    );
+
+    if (parts.length === 1) {
+        return text;
+    }
+
+    return parts.map(
+        (part, index) => (
+            part.toLowerCase() === trimmed.toLowerCase()
+                ? <mark className="search-highlight" key={index}>{part}</mark>
+                : part
+        )
+    );
+
+}
+
+
+// ============================================================
 // BUILD IMAGE URL
 // ============================================================
 
@@ -1480,7 +2112,7 @@ function buildUrl(
 
 
     return (
-        `${import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"}${url}`
+        `${import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000"}${url}`
     );
 
 }

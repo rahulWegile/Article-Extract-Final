@@ -1,3 +1,4 @@
+import difflib
 import re
 
 
@@ -24,11 +25,26 @@ class PageCleaner:
         is_rtl=False,
     ):
         #
+        # Merge duplicate detections
+        #
+        # Must run before remove_noise: a duplicate's losing box is
+        # picked by comparing OCR confidence, which remove_noise's
+        # class-based keep-without-text rule doesn't have a way to
+        # express.
+        #
+
+        blocks = self.merge_duplicate_detections(
+            blocks
+        )
+
+        #
         # Remove noise
         #
 
         blocks = self.remove_noise(
-            blocks
+            blocks,
+            page_height=page_height,
+            page_width=page_width,
         )
 
         #
@@ -92,13 +108,213 @@ class PageCleaner:
         return blocks
 
     # -----------------------------------------------------
+    # Merge Duplicate Detections
+    # -----------------------------------------------------
+
+    def merge_duplicate_detections(
+        self,
+        blocks,
+    ):
+        """
+        Collapse two layout boxes that describe the SAME physical
+        headline/paragraph at a different crop extent -- e.g. a
+        headline boxed once in full and again as just its first
+        word. The layout detector's own class-agnostic NMS
+        (pipeline/layout_detector.py) already removes near-identical
+        boxes across classes, but that's a plain IoU check, so it
+        can't catch a smaller box that sits almost entirely inside a
+        bigger one without the two being near-identical in size --
+        confirmed on a real Telugu (Namasthe Telangana) page, where
+        one headline was boxed three times ("వెంటాడిన మృత్యువు" in
+        full, then again slightly misread, then again as just its
+        first word "వెంటాడిన").
+
+        Only merges when BOTH the geometry (one box almost entirely
+        inside the other) AND the OCR'd text agree it's the same
+        content. Geometry alone would also catch a real caption or
+        title block that legitimately sits inside a much bigger
+        figure's box (e.g. a masthead graphic with its name printed
+        on it) -- that is not a duplicate and must not be dropped,
+        so a match requires real textual corroboration, not just
+        overlapping rectangles.
+        """
+
+        CONTAINMENT_THRESHOLD = 0.9
+
+        SIMILARITY_THRESHOLD = 0.6
+
+        def normalized(text):
+            return re.sub(
+                r"[^\w]",
+                "",
+                (text or "").strip().lower(),
+            )
+
+        def contained_area_ratio(a, b):
+
+            ix1 = max(a.x1, b.x1)
+            iy1 = max(a.y1, b.y1)
+            ix2 = min(a.x2, b.x2)
+            iy2 = min(a.y2, b.y2)
+
+            iw = max(0, ix2 - ix1)
+            ih = max(0, iy2 - iy1)
+
+            intersection = iw * ih
+
+            area_a = max(
+                1, (a.x2 - a.x1) * (a.y2 - a.y1)
+            )
+
+            area_b = max(
+                1, (b.x2 - b.x1) * (b.y2 - b.y1)
+            )
+
+            return intersection / min(area_a, area_b)
+
+        def same_text(text_a, text_b):
+
+            norm_a = normalized(text_a)
+            norm_b = normalized(text_b)
+
+            if not norm_a or not norm_b:
+                return False
+
+            if norm_a in norm_b or norm_b in norm_a:
+                return True
+
+            return (
+                difflib.SequenceMatcher(
+                    None, norm_a, norm_b,
+                ).ratio()
+                >= SIMILARITY_THRESHOLD
+            )
+
+        dropped = set()
+
+        for i, block_a in enumerate(blocks):
+
+            if id(block_a) in dropped:
+                continue
+
+            for block_b in blocks[i + 1:]:
+
+                if id(block_b) in dropped:
+                    continue
+
+                if (
+                    contained_area_ratio(block_a, block_b)
+                    < CONTAINMENT_THRESHOLD
+                ):
+                    continue
+
+                if not same_text(
+                    getattr(block_a, "text", ""),
+                    getattr(block_b, "text", ""),
+                ):
+                    continue
+
+                loser = (
+                    block_b
+                    if block_a.ocr_confidence
+                    >= block_b.ocr_confidence
+                    else block_a
+                )
+
+                dropped.add(id(loser))
+
+                if loser is block_a:
+                    break
+
+        merged = [
+            block
+            for block in blocks
+            if id(block) not in dropped
+        ]
+
+        removed = len(blocks) - len(merged)
+
+        if removed:
+            print(
+                f"Duplicate Detections Merged : {removed}"
+            )
+
+        return merged
+
+    # -----------------------------------------------------
     # Remove Noise
     # -----------------------------------------------------
+
+    # A single text-bearing block whose own height exceeds this
+    # fraction of the page height is treated as a layout-detector
+    # artifact, never real content -- see remove_noise below.
+    MAX_TEXT_BLOCK_HEIGHT_RATIO = 0.6
+
+    # Same idea, for width: a real newspaper column never runs this
+    # wide, so a text-bearing block that does is the layout detector
+    # failing to segment several columns as one blob -- confirmed on
+    # a real Urdu (THE INQUILAB, doc_000172 page 3) document, where a
+    # recovered "title" block at (0,850)-(1055,1192) on a 1846px-wide
+    # page (57% of page width, only 11% of page height -- so the
+    # existing HEIGHT check alone never caught it) sat directly on
+    # top of four properly-detected column blocks and was handed to
+    # the LLM as if it were real content of its own.
+    MAX_TEXT_BLOCK_WIDTH_RATIO = 0.45
+
+    # A block wider than the ratio above is still legitimate when it
+    # is a single-line horizontal banner headline -- confirmed real
+    # case (see layout_gap_recovery.py's SINGLE_LINE_MIN_ASPECT,
+    # same threshold and same reasoning): a real Bengali banner
+    # headline ran the full width of its story as one line, 1959x136,
+    # aspect 14.4. The confirmed bad block above was aspect ~3.1
+    # (1055x342) -- nowhere near ribbon-shaped -- so this exemption
+    # does not readmit it.
+    BANNER_MIN_ASPECT = 8.0
+
+    # A text-bearing block whose box contains at least this fraction
+    # of another (smaller) text-bearing block's own area counts as
+    # "enclosing" it, for the multi-block check below.
+    ENCLOSURE_CONTAINS_RATIO = 0.6
+
+    # A block enclosing at least this many OTHER, mutually distinct
+    # (non-overlapping) text-bearing blocks is a layout-detector blob
+    # covering several real blocks at once, regardless of its own
+    # width/height ratios -- the confirmed case above enclosed four.
+    MIN_ENCLOSED_BLOCKS = 2
 
     def remove_noise(
         self,
         blocks,
+        page_height=None,
+        page_width=None,
     ):
+
+        def contains_ratio(container, contained):
+
+            ix1 = max(container.x1, contained.x1)
+            iy1 = max(container.y1, contained.y1)
+            ix2 = min(container.x2, contained.x2)
+            iy2 = min(container.y2, contained.y2)
+
+            iw = max(0, ix2 - ix1)
+            ih = max(0, iy2 - iy1)
+
+            intersection = iw * ih
+
+            contained_area = max(
+                1,
+                (contained.x2 - contained.x1)
+                * (contained.y2 - contained.y1),
+            )
+
+            return intersection / contained_area
+
+        def mutually_overlapping(a, b):
+
+            return (
+                max(contains_ratio(a, b), contains_ratio(b, a))
+                >= self.ENCLOSURE_CONTAINS_RATIO
+            )
 
         cleaned = []
 
@@ -137,6 +353,38 @@ class PageCleaner:
         keep_without_text = (
             visual_classes | structural_classes
         )
+
+        # Classes a layout detector's own noise can plausibly mis-tag
+        # as spanning most of the page -- see the oversized-block
+        # check below. Deliberately excludes visual_classes: a real
+        # full-page photo/graphic is a normal, legitimate thing to
+        # detect, so height alone must never disqualify a "figure".
+        text_bearing_classes = {
+            "title",
+            "plain text",
+            "figure_caption",
+        }
+
+        # Classes the WIDTH check (below) applies to -- deliberately
+        # excludes "title". A real newspaper headline routinely spans
+        # 40%-80% of page width across 2 or 3 lines of large type
+        # (e.g. a 3-column headline at ~0.46 width ratio, ~6.75
+        # aspect), which is exactly the shape MAX_TEXT_BLOCK_WIDTH_
+        # RATIO exists to catch for a mis-segmented multi-column BODY
+        # blob instead. Confirmed on a real Odia (Sambad, doc_000177
+        # page 3) page: a legitimate 2-line, 3-column headline
+        # ("ସଂସଦର ଆଇନକୁ ଅପେକ୍ଷା ନକରି ପଦକ୍ଷେପ ନେଇଛୁ: ସିଜେଆଇ") at width
+        # ratio ~0.46 and aspect ~6.75 (under BANNER_MIN_ASPECT) was
+        # deleted by this check, leaving the article's body with no
+        # headline. The HEIGHT check and the enclosure check above/
+        # below still apply to "title" -- only the WIDTH check is
+        # body-only.
+        WIDTH_FILTER_CLASSES = {
+            "plain text",
+            "figure_caption",
+        }
+
+        oversized_removed = 0
 
         for block in blocks:
 
@@ -187,6 +435,117 @@ class PageCleaner:
             }:
                 continue
 
+            #
+            # Remove implausibly oversized text-bearing detections.
+            #
+            # A real newspaper headline, paragraph or caption never
+            # spans most of the page's height -- print layout always
+            # breaks that much vertical space into several stacked/
+            # columned blocks. A single "title"/"plain text"/
+            # "figure_caption" box that tall is the layout detector
+            # itself failing to segment a dense or unusually-shaped
+            # region (confirmed across Urdu, Kannada and English real
+            # pages -- e.g. a real Urdu (THE INQUILAB) page where a
+            # "title" block was returned at (423,340)-(1846,3004) on a
+            # 1846x3004 page, 89% of the page's own height, with
+            # garbled OCR text, sitting on top of that same region's
+            # real headline+body+image blocks which were ALSO
+            # detected at their own correct, much smaller sizes).
+            #
+            # Left in place, this kind of block still gets grouped
+            # into some article (its class survives remove_noise
+            # either way), and because BoundaryBuilder/
+            # article_region_reconstructor.py trust each article's
+            # own blocks completely and union ALL of them, that one
+            # phantom block alone stretches the article's final
+            # boundary to nearly the entire page -- exactly the
+            # "random"-looking, story-swallowing boundaries this
+            # guards against. It is always redundant with the
+            # properly-sized blocks covering the same real content,
+            # never the only copy of anything, so dropping it costs
+            # no real text.
+            #
+            # Purely geometric and class-based -- no language check,
+            # so it applies identically to every script.
+            #
+
+            if (
+                cls in text_bearing_classes
+                and page_height
+                and (block.y2 - block.y1)
+                > self.MAX_TEXT_BLOCK_HEIGHT_RATIO * page_height
+            ):
+                oversized_removed += 1
+                continue
+
+            #
+            # Remove implausibly WIDE text-bearing detections.
+            #
+            # Same failure mode as the height check above, along the
+            # other axis -- see MAX_TEXT_BLOCK_WIDTH_RATIO. Exempts a
+            # single-line horizontal banner headline (BANNER_MIN_ASPECT),
+            # which is legitimately close to full page width.
+            #
+
+            block_width = block.x2 - block.x1
+            block_height = max(1, block.y2 - block.y1)
+            block_aspect = block_width / block_height
+
+            if (
+                cls in WIDTH_FILTER_CLASSES
+                and page_width
+                and block_width
+                > self.MAX_TEXT_BLOCK_WIDTH_RATIO * page_width
+                and block_aspect < self.BANNER_MIN_ASPECT
+            ):
+                oversized_removed += 1
+                continue
+
+            #
+            # Remove a text-bearing block that ENCLOSES several other,
+            # mutually distinct text-bearing blocks -- regardless of
+            # its own width/height ratios. See ENCLOSURE_CONTAINS_RATIO/
+            # MIN_ENCLOSED_BLOCKS: this is the same "detector drew one
+            # blob over several real blocks" failure the width/height
+            # checks above target, caught here by content instead of
+            # by shape, for a blob whose own bbox doesn't happen to
+            # trip either ratio.
+            #
+
+            if cls in text_bearing_classes:
+
+                enclosed = []
+
+                for other in blocks:
+
+                    if other is block:
+                        continue
+
+                    other_cls = getattr(
+                        other, "cls", "",
+                    ).lower()
+
+                    if other_cls not in text_bearing_classes:
+                        continue
+
+                    if (
+                        contains_ratio(block, other)
+                        < self.ENCLOSURE_CONTAINS_RATIO
+                    ):
+                        continue
+
+                    if any(
+                        mutually_overlapping(other, kept)
+                        for kept in enclosed
+                    ):
+                        continue
+
+                    enclosed.append(other)
+
+                if len(enclosed) >= self.MIN_ENCLOSED_BLOCKS:
+                    oversized_removed += 1
+                    continue
+
             cleaned.append(
                 block
             )
@@ -203,6 +562,12 @@ class PageCleaner:
         print(
             f"Clean Blocks    : {len(cleaned)}"
         )
+
+        if oversized_removed:
+            print(
+                f"Oversized Detector Artifacts Removed : "
+                f"{oversized_removed}"
+            )
 
         print("=" * 60)
 

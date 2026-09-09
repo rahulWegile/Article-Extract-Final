@@ -3,6 +3,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
+from PIL import Image
 
 from backend.core.settings import DOCUMENTS_DIR
 from backend.services.document_manager import DocumentManager
@@ -16,9 +17,12 @@ from backend.models.document import (
     BoundaryUpdateRequest,
     BoundaryUpdateResponse,
     BoundaryDeleteResponse,
+    BoundaryMergeRequest,
+    BoundaryMergeResponse,
 )
 
 from pipeline.database.delete_document import delete_document_from_db
+from pipeline.database.import_final_articles import deterministic_uuid
 from pipeline.export.pdf_export import export_document_pdf
 
 
@@ -48,13 +52,18 @@ def get_documents():
         if not metadata_file.exists():
             continue
 
-        with open(
-            metadata_file,
-            "r",
-            encoding="utf-8",
-        ) as f:
+        try:
 
-            metadata = json.load(f)
+            with open(
+                metadata_file,
+                "r",
+                encoding="utf-8",
+            ) as f:
+
+                metadata = json.load(f)
+
+        except (json.JSONDecodeError, OSError):
+            continue
 
         documents.append(metadata)
 
@@ -161,6 +170,47 @@ def get_page(
     }
 
 
+THUMBNAIL_WIDTH = 260
+
+
+@router.get("/documents/{document_id}/page/{page_number}/thumbnail")
+def get_page_thumbnail(
+    document_id: str,
+    page_number: int,
+):
+
+    document_dir = DOCUMENTS_DIR / document_id
+
+    source_path = document_dir / "pages" / f"page_{page_number:03d}.png"
+
+    if not source_path.is_file():
+        raise HTTPException(status_code=404, detail="Page not found")
+
+    thumb_path = document_dir / "thumbnails" / f"page_{page_number:03d}.jpg"
+
+    if (
+        not thumb_path.is_file()
+        or thumb_path.stat().st_mtime < source_path.stat().st_mtime
+    ):
+
+        thumb_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with Image.open(source_path) as image:
+
+            image = image.convert("RGB")
+
+            ratio = THUMBNAIL_WIDTH / image.width
+            size = (THUMBNAIL_WIDTH, max(1, round(image.height * ratio)))
+
+            image.resize(size, Image.LANCZOS).save(
+                thumb_path,
+                format="JPEG",
+                quality=78,
+            )
+
+    return FileResponse(thumb_path, media_type="image/jpeg")
+
+
 @router.get(
     "/documents/{document_id}/page/{page_number}/boundaries",
     response_model=PageBoundariesResponse,
@@ -182,6 +232,7 @@ def get_page_boundaries(
 
     return {
         "document_id": document_id,
+        "document_uuid": deterministic_uuid("document", document_id),
         "page": page_number,
         "boundaries": boundaries,
     }
@@ -210,6 +261,42 @@ def update_page_boundary(
             page_number=page_number,
             article_id=payload.article_id,
             bbox=payload.bbox.model_dump(),
+        )
+
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return result
+
+
+@router.post(
+    "/documents/{document_id}/page/{page_number}/boundaries/merge",
+    response_model=BoundaryMergeResponse,
+)
+def merge_page_boundaries(
+    document_id: str,
+    page_number: int,
+    payload: BoundaryMergeRequest,
+):
+
+    document_dir = DOCUMENTS_DIR / document_id
+
+    if not document_dir.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    try:
+
+        result = boundary_editor.merge_boundaries(
+            document_dir=document_dir,
+            document_id=document_id,
+            page_number=page_number,
+            article_ids=payload.article_ids,
         )
 
     except FileNotFoundError as exc:

@@ -88,6 +88,12 @@ class LanguagePipeline:
     # its own caption (ArticleGrouper._recover_unclaimed_images_via_caption).
     use_unclaimed_image_recovery: bool = True
 
+    # Last-resort catch-all: fold any block still unclaimed after
+    # every recovery pass above into the one article whose own
+    # footprint already geometrically contains it
+    # (ArticleGrouper._recover_unclaimed_blocks_by_footprint).
+    use_unclaimed_footprint_recovery: bool = True
+
     # Re-check any article holding more than one title block against
     # local_grouper's geometry and split it when they disagree
     # (pipeline/article/article_splitter.split_oversized_articles).
@@ -138,6 +144,19 @@ class LanguagePipeline:
     # document_order_extractor_factory; None for languages with no
     # Stream B.
     document_order_repair_headings: Optional[Callable] = None
+
+    # Confidence floor passed to LayoutDetector.detect() (see
+    # pipeline/layout_detector.py's DEFAULT_CONFIDENCE) for this
+    # language's pages. Confirmed on a real Urdu (THE INQUILAB)
+    # document that the shared 0.20 default drops dozens of real
+    # articles on a dense Nastaliq page (20 blocks detected vs. 50+ at
+    # 0.08 on the SAME page) -- dense, cursive/ligature-heavy scripts
+    # push DocLayout-YOLO's own confidence lower than the Latin/
+    # Devanagari pages that default was tuned on. Per-language rather
+    # than global so lowering it for Urdu cannot loosen detection (and
+    # invite more false-positive/noise blocks) for every other script
+    # that already works well at 0.20.
+    layout_confidence: float = 0.20
 
     # Folds Stream B's text into Stream A's articles -- signature:
     # fn(articles, document_order_sections) -> (articles, unresolved).

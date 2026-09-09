@@ -6,8 +6,8 @@ from pipeline.languages.telugu.extraction_prompt import (
     TELUGU_EXTRACTION_PROMPT,
 )
 from pipeline.ocr.tesseract_engine import TesseractOCREngine
-from pipeline.intelligence.openai_article_extractor import (
-    OpenAIArticleExtractor,
+from pipeline.intelligence.gemini_article_extractor import (
+    GeminiArticleExtractor,
 )
 
 
@@ -31,8 +31,19 @@ TELUGU = LanguagePipeline(
     matches=matches,
     ocr_engine_factory=lambda: TesseractOCREngine(lang="tel"),
     ocr_engine_label="tesseract (telugu)",
+    # Grouping/boundary detection stays on OpenAI (llm_provider below)
+    # -- only ARTICLE-LEVEL TEXT EXTRACTION is switched to Gemini here,
+    # via extractor_class. Same pattern Marathi/Punjabi/Gujarati/
+    # Assamese/Bengali/Kannada use: OpenAIArticleExtractor's pinned
+    # model (OPENAI_ARTICLE_MODEL=gpt-5.6-luna) is confirmed failing on
+    # multiple non-Latin, non-Devanagari scripts, and Telugu shares
+    # that same architecture (Tesseract OCR + OpenAI extraction). To
+    # revert: change extractor_class back to OpenAIArticleExtractor
+    # (and restore the `from
+    # pipeline.intelligence.openai_article_extractor import
+    # OpenAIArticleExtractor` import above).
     llm_provider="openai",
     grouping_prompt=TELUGU_GROUPING_PROMPT,
     extraction_prompt_template=TELUGU_EXTRACTION_PROMPT,
-    extractor_class=OpenAIArticleExtractor,
+    extractor_class=GeminiArticleExtractor,
 )

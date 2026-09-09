@@ -40,6 +40,7 @@ ENGLISH = LanguagePipeline(
     use_orphan_title_root_repair=False,
     use_unclaimed_kicker_recovery=False,
     use_unclaimed_image_recovery=False,
+    use_unclaimed_footprint_recovery=False,
     use_article_splitter=False,
     use_dropped_article_recovery=False,
     use_boundary_decomposition=False,

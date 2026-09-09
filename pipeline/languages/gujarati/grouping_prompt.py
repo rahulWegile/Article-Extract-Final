@@ -299,6 +299,43 @@ advertisement
 NEVER place advertisements inside news articles.
 
 =========================================================
+WEATHER (STRICTLY SCOPED)
+=========================================================
+
+The "weather" role is ONLY for a small daily statistic panel:
+
+- a temperature/forecast widget
+- a short box of today's/tomorrow's numbers (temperature, rainfall
+  in mm, humidity, wind)
+- a small icon-and-number weather strip
+
+A weather panel has NO byline, NO reporter's name, and is not
+written as a multi-paragraph news report -- it is a compact table
+or strip of numbers.
+
+Weather is NOT for a narrative NEWS REPORT that happens to be about
+rain, monsoon rainfall deficits, flooding, storms, or seasonal
+weather patterns. A multi-paragraph report -- with its own headline,
+its own byline (e.g. "ભાસ્કર ન્યૂઝ" / a reporter's name/city), and
+its own reported facts, quotes, or statistics about the monsoon --
+is ordinary editorial content, exactly like a report on any other
+subject.
+
+Do NOT assign "weather" to:
+
+- a headline plus body paragraphs reporting on rainfall/monsoon
+  conditions, deficits, or forecasts, written as news
+- any block that carries a byline or dateline
+- any block that is part of a headline + body-text package
+
+Classify such a report normally: article_title for its headline,
+article_text for its paragraphs, byline for its byline -- the same
+as any other news story -- and include it in "articles" like any
+other story.
+
+Only the small numbers-only panel described above gets "weather".
+
+=========================================================
 OTHER NON-ARTICLE CONTENT
 =========================================================
 

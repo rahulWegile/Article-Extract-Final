@@ -1,22 +1,19 @@
 # Grouping prompt for Urdu.
 #
-# Physically separate per language so this one can be tuned without
-# touching any other language's prompt.
+# Deliberately a copy of Hindi's grouping prompt (the variant with
+# the WHITESPACE GAPS and MANDATORY COVERAGE AUDIT sections), the
+# same one Gujarati/Marathi/Punjabi already reuse verbatim -- see
+# pipeline/languages/base.py's is_rtl field: this prompt's own
+# "column flow and reading order" instructions (PRIORITY 5 in
+# ARTICLE OWNERSHIP DECISION ORDER) work correctly for Urdu without
+# any RTL-specific wording, because is_rtl=True already flips the
+# actual reading_order/column values computed BEFORE this prompt
+# ever runs (pipeline/sort_blocks.py, PageCleaner.assign_columns) --
+# the prompt just needs to trust those fields, same as every other
+# language.
 #
-# Diverges from the shared/default prompt in three ways, each added
-# after a confirmed real-page failure (THE INQUILAB, a Nastaliq/
-# Urdu daily): a RIGHT-TO-LEFT reading-order/column section (Urdu is
-# the only RTL language this pipeline handles, and reading_order/
-# column are computed RTL-aware for this language specifically --
-# see pipeline.languages.base.LanguagePipeline.is_rtl -- but nothing
-# told the model that, so its own "reading order" and "column flow"
-# tie-breakers pointed backwards); and the WHITESPACE GAPS /
-# VISUAL RULE-LINE sections copied over from the Hindi prompt, now
-# that pipeline.openai.openai_service actually populates
-# gap_above/gap_below/median_block_gap/has_rule_line_above/
-# has_rule_line_below for every OpenAI-routed language (previously
-# Gemini-only, so Urdu's payload never carried them and this section
-# would have documented fields that were not there).
+# Still physically separate so it can diverge from Hindi later
+# without touching Hindi.
 
 URDU_GROUPING_PROMPT = """
 You are an expert newspaper editor, newspaper page-layout analyst,
@@ -74,34 +71,6 @@ When OCR and visual appearance disagree,
 trust the original page image.
 
 =========================================================
-THIS PAGE IS URDU -- RIGHT-TO-LEFT (NASTALIQ)
-=========================================================
-
-This is an URDU newspaper page. Urdu is written and printed
-RIGHT-TO-LEFT. This is not a minor detail -- it changes what
-"reading order" and "column" mean on this specific page:
-
-- Within a printed row, the item FURTHEST RIGHT is read FIRST.
-  Reading proceeds right to left across the row, then down to
-  the next row -- the mirror image of an English or Hindi page.
-- reading_order for this page has ALREADY been computed
-  right-to-left: a LOWER reading_order value means EARLIER in
-  the page's actual (right-to-left) reading flow. Do not
-  reinterpret it as left-to-right.
-- column has ALSO already been numbered right-to-left for this
-  page: column 0 is the RIGHTMOST print column, and column
-  numbers increase moving LEFT across the page. A lower column
-  number means closer to the page's right edge, not the left.
-- Vertical order is unchanged -- a headline still sits above its
-  own body text, and stories still stack top to bottom. Only the
-  HORIZONTAL reading direction is reversed.
-- Wherever this prompt or the input fields ask you to reason
-  about "column flow", "reading order", or "headline reading
-  direction" (see WHITESPACE GAPS, ARTICLE OWNERSHIP DECISION
-  ORDER, and elsewhere below), apply them USING THIS RIGHT-TO-LEFT
-  DIRECTION, not a left-to-right assumption.
-
-=========================================================
 WHITESPACE GAPS (STRONG SEPARATION SIGNAL)
 =========================================================
 
@@ -130,7 +99,7 @@ How to read these values:
       -> a real editorial separation. The block below that
          gap very likely STARTS A NEW ARTICLE, especially
          when it is also a title, or begins with a dateline
-         such as "نئی دہلی" or "لاہور".
+         such as "نئی دہلی" or "New Delhi".
 
 - a large gap_above on a title block
       -> a strong signal of a new article. Weigh it together
@@ -164,7 +133,7 @@ IMPORTANT LIMITS on this signal:
   belongs to a headline by content, keep it with that
   headline even when the gap is unusually large.
 
-=========================================================
+  =========================================================
 VISUAL RULE-LINE / DIVIDER RULE
 =========================================================
 
@@ -175,11 +144,6 @@ The input may contain:
 
 These fields represent a detected visual horizontal/vertical rule,
 grey divider, coloured separator, or equivalent printed boundary.
-
-Urdu newspapers frequently box each story in its own printed
-border (a thin rule, or a coloured/tinted panel) -- when you see
-such a box in the page image, has_rule_line_above/below on the
-blocks along its edge is the field confirming it.
 
 When either field is TRUE:
 
@@ -393,6 +357,49 @@ parent story.
 
 Do NOT create a separate article merely because a block is visually
 prominent.
+
+=========================================================
+KICKER / PRE-HEADLINE RULE
+=========================================================
+
+A small text block immediately above a larger, bolder headline is
+usually a kicker, eyebrow, strapline, or pre-headline.
+
+It is NOT automatically an independent article root.
+
+When a smaller text block:
+
+- is directly above a larger headline
+- is in the same visual column/lane
+- has no independent body text of its own
+- visually functions as a label or introduction to the larger headline
+
+then:
+
+- treat the larger, dominant headline as the article_title
+- attach the smaller block to that article
+- do NOT create a separate article root for the smaller block
+
+The dominant headline is determined using:
+
+- font size
+- font weight
+- visual prominence
+- headline width
+- position
+- relationship to the following body text
+- surrounding visual structure
+
+IMPORTANT:
+
+A smaller text block above a headline is NOT a second article merely
+because it is title-like.
+
+Only create a separate article root when the smaller block has its own
+independent editorial story and supporting content.
+
+A kicker/eyebrow with no body text of its own MUST NOT become a
+standalone article.
 
 =========================================================
 ARTICLE ROOT DETECTION (VERY IMPORTANT)
@@ -1764,12 +1771,16 @@ elements, advertisements, and duplicate representations already
 covered by another block.
 
 However, any block classified with an article-eligible role
-(article_title, article_text, article_image, caption, byline,
-teaser_box, utility_box) should normally end up inside some article
-in the "articles" list. Do not classify a block as one of these
-roles in "blocks" and then leave it out of every article in
-"articles" --if it doesn't belong with any existing article,
-first determine whether it is:
+(article_title, article_text, article_image, caption, byline)
+should normally end up inside some article in the "articles" list.
+Do not classify a block as one of these roles in "blocks" and then
+leave it out of every article in "articles" --if it doesn't belong
+with any existing article, first determine whether it is:
+
+Note: teaser_box and utility_box are NOT article-eligible roles.
+Per the TEASER BOXES and UTILITY BOXES rules above, they must
+NEVER appear inside "articles" and are expected to remain
+unassigned -- do not "recover" them into an article.
 
 - image-only content
 - caption-only content
@@ -2118,6 +2129,35 @@ Blocks classified as:
 - unknown
 
 must NOT appear inside any article.
+
+=========================================================
+MANDATORY COVERAGE AUDIT (perform this LAST, right before
+writing the final JSON)
+=========================================================
+
+List, mentally, every block ID you assigned the role
+article_title, article_text, article_image, caption, or byline.
+
+For each one of those IDs, confirm it appears in the "blocks"
+array of at least one entry in "articles".
+
+If you find one that does not:
+
+1. Look at its column, its reading order, and the blocks
+   immediately before/after it in reading order.
+2. Attach it to the article that owns the surrounding blocks,
+   unless that would merge two genuinely independent stories --
+   in that case, form a new article for it instead.
+3. Never leave it unassigned simply because you are unsure.
+   A specific placement decision, even a close call, beats
+   silently dropping real article content.
+
+This audit is about roles article_title, article_text,
+article_image, caption, and byline ONLY. Blocks correctly
+classified as teaser_box, utility_box, advertisement, comic,
+weather, masthead, page_header, page_footer, page_number, logo,
+decoration, or unknown are SUPPOSED to remain unassigned -- do
+not add them to any article during this audit.
 
 =========================================================
 OUTPUT FORMAT

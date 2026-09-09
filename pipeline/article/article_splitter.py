@@ -37,17 +37,23 @@ JUST that article's own blocks in isolation. Two outcomes:
    rest): the article is split into one article per root, each
    keeping only the blocks that root's own content-attachment claims.
 
-NOTE ON SCOPE: an article with 0 or 1 title-class block(s) is never
-re-checked here, even when a rule line visibly sits between two of
-its blocks. group_blocks' root candidates are drawn EXCLUSIVELY from
-title-class blocks (see local_grouper.py's "Articles are created from
-HEADLINES first" principle) -- with at most one title present, it
-can never produce more than one root, so re-running it would only
-ever confirm "one story" regardless of pixel evidence. Fixing that
-case needs the upstream layout detector to actually mark each
-merged item's own heading as a title-class block; it cannot be fixed
-by post-processing here without abandoning the headline-first
-invariant this whole file depends on.
+NOTE ON SCOPE: an article with 0 or 1 title-class block(s) is
+re-checked here ONLY when a printed rule line/border is found between
+two of its own blocks (see PRINTED RULE-LINE / BORDER BREAK below,
+_has_internal_rule_line_break) -- otherwise it is skipped, same as
+before. Even when that trigger DOES fire, group_blocks' root
+candidates are still drawn EXCLUSIVELY from title-class blocks (see
+local_grouper.py's "Articles are created from HEADLINES first"
+principle), so with at most one title present group_blocks usually
+still confirms "one story" (kept_ambiguous) -- it can only actually
+split when the blocks on either side of that printed line also land
+in different columns, letting its "no root found" fallback stand
+each side up as its own entry. A merged story whose own second
+headline was never detected as a distinct title block AND sits in
+the same column as the first is not fixable here without abandoning
+the headline-first invariant this whole file depends on; that needs
+the upstream layout detector to mark it as a title-class block in
+the first place.
 
 ORPHAN CONTENT SUB-GROUPS: group_blocks' content-attachment requires
 column overlap with a title-class root (see local_grouper.py's
@@ -89,8 +95,20 @@ from __future__ import annotations
 from typing import List
 
 from pipeline.article.article_grouper import Article, ArticleGrouper
-from pipeline.article.local_grouper import group_blocks
+from pipeline.article.banner_fragments import (
+    BANNER_FRAGMENT_EDGE_TOLERANCE,
+    BANNER_FRAGMENT_HEIGHT_RATIO,
+    BANNER_FRAGMENT_MAX_GAP_RATIO,
+    BANNER_FRAGMENT_MAX_OVERLAP_RATIO,
+    group_banner_fragments,
+    is_banner_fragment_pair,
+    is_single_line_text,
+)
+from pipeline.article.local_grouper import IMAGE_CLASSES, group_blocks
 from pipeline.article.visual_separator import (
+    SEPARATOR_MIN_BAND_HEIGHT,
+    has_undetected_content,
+    has_visual_separator,
     has_vertical_separator_between,
 )
 
@@ -246,6 +264,117 @@ def _merge_orphan_content_subgroups(sub_groups, sub_roles, block_by_id):
     ]
 
 
+def _merge_headless_title_subgroups(sub_groups, sub_roles, block_by_id):
+    """
+    Fold a title-rooted sub-group that came out of the split with NO
+    body/figure content of its own -- just its lone root title, and
+    nothing group_blocks attached below it -- into whichever OTHER
+    sub-group sits geometrically nearest.
+
+    _merge_orphan_content_subgroups (above) only ever catches a
+    sub-group group_blocks could not root on a title at all. It
+    cannot catch THIS shape: a sub-group that IS title-rooted (so
+    `is_title_rooted` in that function says yes, nothing to merge)
+    but whose title governs no content in this narrow slice -- e.g. a
+    subordinate title rescued into `dominant_titles` purely for being
+    far from the article's real headline (see SUBORDINATE_TITLE_
+    MAX_GAP), which group_blocks then dutifully makes its own root
+    even though it has no paragraph or photo of its own here. Left
+    alone, split_oversized_articles would emit that as its own
+    "article": a bare headline with no story under it -- exactly the
+    "headless orphan subgroup" a split must never produce (see
+    requirement (c): a split only ever counts when it yields at least
+    two GENUINE, viable stories, each a title plus its own content).
+
+    Runs AFTER _merge_orphan_content_subgroups, so every remaining
+    sub-group here is already title-rooted; this only tests whether
+    that root has anything besides itself. Uses the same nearest-
+    neighbor `_layout_distance` metric the other merges in this file
+    already use, so a headless title always folds into whichever
+    surviving sub-group its own root sits closest to -- typically the
+    real headline's own group, i.e. exactly "the parent headline
+    group" a headless split fragment belongs back in.
+
+    `sub_roles` is group_blocks' own "blocks" list (id/role pairs).
+    Returns a new list of sub-groups with every headless title-only
+    group folded into its nearest neighbor and removed as a separate
+    entry; unchanged when every sub-group already has real content of
+    its own, or when there is no OTHER sub-group to merge into.
+    """
+
+    role_for = {item["id"]: item["role"] for item in sub_roles}
+
+    def has_own_content(group):
+        return any(
+            role_for.get(block_id) != "article_title"
+            for block_id in group.get("blocks", [])
+        )
+
+    headless_indices = [
+        index
+        for index, group in enumerate(sub_groups)
+        if group.get("blocks") and not has_own_content(group)
+    ]
+
+    if not headless_indices:
+        return sub_groups
+
+    target_indices = [
+        index
+        for index in range(len(sub_groups))
+        if index not in headless_indices and sub_groups[index].get("blocks")
+    ]
+
+    if not target_indices:
+        return sub_groups
+
+    merged = [
+        {**group, "blocks": list(group.get("blocks", []))}
+        for group in sub_groups
+    ]
+
+    for index in headless_indices:
+
+        headless_ids = sub_groups[index].get("blocks", [])
+
+        best_target = None
+        best_distance = None
+
+        for target_index in target_indices:
+
+            for headless_id in headless_ids:
+
+                headless_block = block_by_id.get(headless_id)
+
+                if headless_block is None:
+                    continue
+
+                for other_id in sub_groups[target_index].get("blocks", []):
+
+                    other_block = block_by_id.get(other_id)
+
+                    if other_block is None:
+                        continue
+
+                    distance = ArticleGrouper._layout_distance(
+                        headless_block,
+                        other_block,
+                    )
+
+                    if best_distance is None or distance < best_distance:
+                        best_distance = distance
+                        best_target = target_index
+
+        if best_target is not None:
+            merged[best_target]["blocks"].extend(headless_ids)
+
+    return [
+        group
+        for index, group in enumerate(merged)
+        if index not in headless_indices
+    ]
+
+
 def _recover_fully_dropped_blocks(sub_groups, original_ids, block_by_id):
     """
     Attach any block group_blocks left out of every sub-group
@@ -363,9 +492,93 @@ def _recover_fully_dropped_blocks(sub_groups, original_ids, block_by_id):
 # for (see WHY THIS EXISTS above, and the real 4-stories-in-one-crop
 # Tamil and Gemini examples). All this gate removes is the split that
 # had nothing behind it but a smaller sub-head.
+#
+# PROXIMITY, NOT JUST SIZE
+# ------------------------
+#
+# The size-ratio measurement above only ever looked at genuine,
+# ADJACENT sub-heads -- it never claimed a small title far from every
+# large one must also be one of them. Confirmed on a real Urdu (THE
+# INQUILAB) page: a small headline (line height 41px, "...London's
+# mayor...") sitting 2026px below the page's own large banner
+# headline (line height 251px, an unrelated Iran/US story) was
+# dismissed as that banner's own sub-head purely because 41/251 <
+# SUBORDINATE_TITLE_RATIO -- even though nothing of the banner's
+# story was printed anywhere in between, and the two headlines sat on
+# opposite ends of the page. article_splitter never even re-checked
+# that article (group_blocks was never called), and the merged
+# article's own outer boundary then stretched across virtually the
+# entire page height, swallowing every story printed between the two
+# headlines. A title only counts as a safely-skippable sub-head when
+# it is BOTH smaller AND close to the dominant headline it supposedly
+# belongs to -- see SUBORDINATE_TITLE_MAX_GAP.
+#
+# UPDATE: "far away" alone is not enough either. A cross-head deep
+# inside one long, single-column story (e.g. a "further developments"
+# section heading a few hundred pixels past SUBORDINATE_TITLE_MAX_GAP
+# from the article's own top headline) used to be rescued here purely
+# for being far away -- `not near_a_dominant_title(block)` short-
+# circuited the `or` below before has_own_story's own
+# SUBORDINATE_RESCUE_MIN_RATIO floor ever ran, so a cross-head set at
+# a fraction of the dominant headline's type size (as little as ~14%
+# in one real case) was promoted to its own independent story purely
+# for sitting far down the page, even though it never had the type
+# size a real second headline is set at. SUBORDINATE_RESCUE_MIN_RATIO
+# now gates BOTH rescue paths, not just has_own_story, closing that
+# bypass. Trade-off: a genuinely distant SECOND STORY whose headline
+# happens to be set very small relative to the page's dominant one
+# (the original real Urdu case above measured 41/251 = 0.16, below
+# the 0.40 floor) no longer gets rescued by distance alone either --
+# accepted deliberately, since in practice a tiny, far-away title is
+# far more often an in-article cross-head than a second headline.
 # ============================================================
 
 SUBORDINATE_TITLE_RATIO = 0.65
+
+# Vertical gap beyond which a smaller title is no longer assumed to
+# be a sub-head OF a nearby dominant headline, regardless of type
+# size. A genuine kicker/eyebrow/data-box heading/sidebar sub-head
+# sits immediately adjacent to (or a short paragraph away from) the
+# story it belongs to; this is the same order of magnitude as the
+# other proven "genuinely adjacent" gap constants already used
+# elsewhere in this codebase (e.g. ArticleGrouper.
+# IMAGE_CAPTION_MAX_GAP = 250.0), given generous headroom since a
+# sub-head can sit below a full headline-height's worth of kicker/
+# byline text rather than directly against an image. The real Urdu
+# gap this was measured against (2026px) is more than 3x this
+# threshold, so this comfortably separates the two without needing
+# to be tuned close to either number.
+SUBORDINATE_TITLE_MAX_GAP = 600.0
+
+# Floor a smaller title's own size must still clear before its OWN
+# content (see _has_independent_story_content) is trusted to rescue
+# it from subordinate classification at all. A real second headline
+# printed smaller than the page's dominant one is still typeset as a
+# genuine headline; an internal data-box/table heading or comparison
+# sidebar inside one larger feature is typeset much smaller still,
+# and routinely governs its own little photo/table graphic and a
+# paragraph or two of its own -- exactly the content shape
+# _has_independent_story_content looks for -- without being a second
+# story. Confirmed on a real Gujarati page (doc_000167, page 2): an
+# investigative feature's internal "NPA loan table" heading (ratio
+# 0.21 to the feature's own dominant headline) and a "comparison to a
+# Singapore company" sub-heading (ratio 0.14) each govern a photo/
+# table graphic and real paragraphs of their own, exactly like a
+# genuine second story would -- content ownership alone cannot tell
+# the two apart. Confirmed on a real Gujarati page (doc_000167, page
+# 3): the genuine second story this rescue exists for ("death toll
+# reaches 939", ratio 0.45 to its page's own dominant headline) sits
+# comfortably above both false positives, while the page's own
+# genuine sub-head ("equipment shortage", ratio 0.31) sits below it.
+# Set at 0.40 -- clear of the confirmed sub-head/data-box ratios
+# (0.14-0.31) and clear of the confirmed real second headline (0.45),
+# without being tuned close to either.
+#
+# Also gates the DISTANCE-based rescue (`not near_a_dominant_title`)
+# in _dominant_class_titles, not just this has_own_story path -- see
+# the "PROXIMITY, NOT JUST SIZE" UPDATE above for why a title has to
+# clear this floor regardless of which rescue path found it.
+SUBORDINATE_RESCUE_MIN_RATIO = 0.40
 
 
 def _title_line_height(block) -> float | None:
@@ -392,11 +605,121 @@ def _title_line_height(block) -> float | None:
     return (block.y2 - block.y1) / line_count
 
 
-def _dominant_class_titles(title_blocks) -> list:
+# ============================================================
+# SUBORDINATE TITLE WITH ITS OWN STORY
+#
+# SUBORDINATE_TITLE_RATIO's size test alone cannot tell a genuine
+# sub-head (a kicker/eyebrow/data-box heading that "has no
+# independent body text of its own" -- see the KICKER / PRE-HEADLINE
+# RULE in the grouping prompts, at most a line or two riding on the
+# bigger headline beside it) apart from a second, smaller-typeset
+# headline that governs a COMPLETE story of its own -- its own
+# paragraph(s), sometimes its own photo -- merely printed close to a
+# bigger one.
+#
+# Confirmed on a real Gujarati page (doc_000167, page 3): a "death
+# toll reaches 939" headline (50px line height) sitting 318px above
+# an unrelated "hundreds trapped in tunnels" headline (110px) was
+# suppressed as that headline's own sub-head purely on the size
+# ratio (50/110.5 = 0.45 < 0.65) and proximity (well under
+# SUBORDINATE_TITLE_MAX_GAP) -- even though the death-toll headline
+# governs its own paragraph AND its own photo, entirely separate
+# from the tunnel-rescue story's own text. The two were fused into
+# one article. On the SAME page, a genuine sub-head ("equipment
+# shortage", 34px) sitting in the same cluster governs only one
+# short paragraph and no photo of its own, and correctly stays
+# classified as a sub-head -- so the discriminator below is content
+# ownership (an image, or more than one paragraph, governed by the
+# smaller title and by no OTHER title in the article), not size or
+# distance alone.
+# ============================================================
+
+
+def _nearest_governing_title(block, title_blocks):
+    """
+    Which title in `title_blocks` most plausibly governs `block`,
+    for the sole purpose of measuring a smaller title's OWN content
+    below it (see _has_independent_story_content).
+
+    A title only governs content that starts at or below it in the
+    same column track (RULE_LINE_COLUMN_OVERLAP); among every title
+    that qualifies, the nearest one by vertical gap wins. Gap, not
+    raw column-overlap magnitude, is what has to decide this: a
+    full-width banner headline overlaps a narrow column beneath it
+    just as completely as that column's own, much smaller title
+    does, so overlap ratio alone cannot tell them apart -- confirmed
+    on the real page above, where the tunnel-rescue banner's column
+    span geometrically covers the death-toll headline's own body
+    paragraph too. Proximity is what a reader actually follows.
+    """
+
+    best = None
+    best_gap = None
+
+    for title in title_blocks:
+
+        if title.id == block.id:
+            continue
+
+        if _column_overlap_ratio(title, block) < RULE_LINE_COLUMN_OVERLAP:
+            continue
+
+        if title.y1 > block.y1:
+            continue
+
+        gap = max(0.0, block.y1 - title.y2)
+
+        if best_gap is None or gap < best_gap:
+            best_gap = gap
+            best = title
+
+    return best
+
+
+def _has_independent_story_content(title, title_blocks, all_blocks) -> bool:
+    """
+    Whether `title` governs enough content of its own -- a photo, or
+    more than one paragraph -- to plausibly be a complete second
+    story rather than a sub-head riding on a bigger headline nearby.
+    See SUBORDINATE TITLE WITH ITS OWN STORY above.
+    """
+
+    own_content = [
+        block
+        for block in all_blocks
+        if (getattr(block, "cls", "") or "").strip().lower()
+        in ("plain text", "figure")
+        and _nearest_governing_title(block, title_blocks) is title
+    ]
+
+    has_image = any(
+        (getattr(block, "cls", "") or "").strip().lower() == "figure"
+        for block in own_content
+    )
+
+    text_count = sum(
+        1
+        for block in own_content
+        if (getattr(block, "cls", "") or "").strip().lower()
+        == "plain text"
+    )
+
+    return has_image or text_count >= 2
+
+
+def _dominant_class_titles(title_blocks, all_blocks=None) -> list:
     """
     The subset of `title_blocks` set at (or near) the largest type
-    size present -- i.e. the ones that could each head their own
-    story. See SUBORDINATE_TITLE_RATIO above.
+    size present, PLUS any smaller title that either sits too far
+    from every one of those to plausibly be one of their own
+    sub-heads, or governs a complete story of its own -- i.e. every
+    title that could each head its own story. See
+    SUBORDINATE_TITLE_RATIO, SUBORDINATE_TITLE_MAX_GAP, and
+    SUBORDINATE TITLE WITH ITS OWN STORY above.
+
+    `all_blocks` (optional, normally the whole article's own blocks)
+    enables the independent-content rescue; omitted, this falls back
+    to the original size/distance-only behavior.
     """
 
     heights = {
@@ -415,13 +738,59 @@ def _dominant_class_titles(title_blocks) -> list:
 
     dominant_height = max(measured)
 
-    return [
+    dominant_by_size = [
         block
         for block in title_blocks
         if heights[block.id] is not None
         and heights[block.id]
         >= SUBORDINATE_TITLE_RATIO * dominant_height
     ]
+
+    dominant_ids = {block.id for block in dominant_by_size}
+
+    def near_a_dominant_title(block):
+        return any(
+            ArticleGrouper._vertical_gap(block, other)
+            <= SUBORDINATE_TITLE_MAX_GAP
+            for other in dominant_by_size
+        )
+
+    def is_stacked_with_dominant(block):
+        # A sub-headline or deck sitting immediately adjacent (<= 80px)
+        # above or below a dominant headline with column overlap
+        # is part of that headline's own multi-tier stack, never its own story.
+        for other in dominant_by_size:
+            if (
+                ArticleGrouper._vertical_gap(block, other) <= 80.0
+                and _column_overlap_ratio(block, other) >= 0.30
+            ):
+                return True
+        return False
+
+    def has_own_story(block):
+        if all_blocks is None or is_stacked_with_dominant(block):
+            return False
+        height = heights.get(block.id)
+        if (
+            height is None
+            or height < SUBORDINATE_RESCUE_MIN_RATIO * dominant_height
+        ):
+            return False
+        return _has_independent_story_content(
+            block, title_blocks, all_blocks
+        )
+
+    rescued = [
+        block
+        for block in title_blocks
+        if block.id not in dominant_ids
+        and heights.get(block.id, 0) is not None
+        and heights.get(block.id, 0)
+        >= SUBORDINATE_RESCUE_MIN_RATIO * dominant_height
+        and (not near_a_dominant_title(block) or has_own_story(block))
+    ]
+
+    return dominant_by_size + rescued
 
 
 # ============================================================
@@ -463,79 +832,34 @@ def _dominant_class_titles(title_blocks) -> list:
 # at a gutter.
 # ============================================================
 
-# How far the two halves' top/bottom edges may differ, as a fraction
-# of the shorter half's height. They are the same printed line, so
-# this is detector/OCR slop only, not a real layout allowance.
-BANNER_FRAGMENT_EDGE_TOLERANCE = 0.25
-
-# Shorter half's height over the taller's -- i.e. the same type size.
-BANNER_FRAGMENT_HEIGHT_RATIO = 0.75
-
-# Gutter width between the halves, as a fraction of their height.
-BANNER_FRAGMENT_MAX_GAP_RATIO = 0.5
+# Thresholds and the actual fragment-pair/grouping geometry now live
+# in banner_fragments.py, shared with local_grouper.py (which cannot
+# import from this file -- article_splitter.py already imports
+# group_blocks FROM local_grouper.py, so the reverse import would be
+# circular). Re-imported above for anything in this file/its tests
+# that still references the names under their original names here.
 
 
 def _is_single_line_title(block) -> bool:
-
-    text = (getattr(block, "text", "") or "").strip()
-
-    return bool(text) and "\n" not in text
+    return is_single_line_text(getattr(block, "text", ""))
 
 
 def _is_banner_fragment_pair(block_a, block_b, page_image) -> bool:
     """
     Whether these two title blocks are two halves of ONE headline
-    the layout detector cut at a column gutter.
+    the layout detector cut at a column gutter. Thin LayoutBlock
+    adapter over banner_fragments.is_banner_fragment_pair -- see that
+    module for the real geometry, thresholds, and the real Urdu (The
+    Siasat Daily) page that motivated BANNER_FRAGMENT_MAX_OVERLAP_RATIO.
     """
 
-    if not (
-        _is_single_line_title(block_a)
-        and _is_single_line_title(block_b)
-    ):
-        return False
-
-    height_a = block_a.y2 - block_a.y1
-    height_b = block_b.y2 - block_b.y1
-
-    shorter = min(height_a, height_b)
-    taller = max(height_a, height_b)
-
-    if shorter <= 0:
-        return False
-
-    if shorter / taller < BANNER_FRAGMENT_HEIGHT_RATIO:
-        return False
-
-    edge_tolerance = BANNER_FRAGMENT_EDGE_TOLERANCE * shorter
-
-    if abs(block_a.y1 - block_b.y1) > edge_tolerance:
-        return False
-
-    if abs(block_a.y2 - block_b.y2) > edge_tolerance:
-        return False
-
-    left, right = (
-        (block_a, block_b)
-        if block_a.x1 <= block_b.x1
-        else (block_b, block_a)
-    )
-
-    gap = right.x1 - left.x2
-
-    # A negative gap means they overlap horizontally, so they are
-    # stacked lines of one title, not two halves of one line.
-    if gap < 0:
-        return False
-
-    if gap > BANNER_FRAGMENT_MAX_GAP_RATIO * shorter:
-        return False
-
-    return not has_vertical_separator_between(
+    return is_banner_fragment_pair(
+        (block_a.x1, block_a.y1, block_a.x2, block_a.y2),
+        getattr(block_a, "text", ""),
+        (block_b.x1, block_b.y1, block_b.x2, block_b.y2),
+        getattr(block_b, "text", ""),
         page_image,
-        left.x2,
-        right.x1,
-        min(block_a.y1, block_b.y1),
-        max(block_a.y2, block_b.y2),
+        has_vertical_separator_between,
     )
 
 
@@ -547,29 +871,33 @@ def _banner_fragment_groups(title_blocks, page_image) -> list:
 
     Membership is transitive, so a headline cut into three or more
     pieces collapses into one group as long as each piece is
-    adjacent to the one before it.
+    adjacent to the one before it. Thin LayoutBlock adapter over
+    banner_fragments.group_banner_fragments, keyed by `id(block)`
+    since LayoutBlock objects here (unlike local_grouper.py's plain
+    dicts) are hashable by identity.
     """
 
-    groups = []
+    ordered = sorted(title_blocks, key=lambda item: (item.y1, item.x1))
 
-    for block in sorted(
-        title_blocks,
-        key=lambda item: (item.y1, item.x1),
-    ):
+    by_key = {id(block): block for block in ordered}
 
-        for group in groups:
+    items = [
+        (
+            id(block),
+            (block.x1, block.y1, block.x2, block.y2),
+            getattr(block, "text", ""),
+        )
+        for block in ordered
+    ]
 
-            if any(
-                _is_banner_fragment_pair(member, block, page_image)
-                for member in group
-            ):
-                group.append(block)
-                break
+    groups = group_banner_fragments(
+        items, page_image, has_vertical_separator_between,
+    )
 
-        else:
-            groups.append([block])
-
-    return groups
+    return [
+        [by_key[key] for key in group]
+        for group in groups
+    ]
 
 
 def _banner_primary(group):
@@ -587,6 +915,177 @@ def _collapse_banner_fragments(title_blocks, page_image) -> list:
         _banner_primary(group)
         for group in _banner_fragment_groups(title_blocks, page_image)
     ]
+
+
+# ============================================================
+# SAME-EVENT COLUMN PACKAGE
+#
+# Distinct from a banner fragment (one headline, cut into halves of
+# the SAME sentence) and from a subordinate title (a smaller sub-head
+# too close to a bigger headline to be its own story). This is two
+# or more DOMINANT, differently-worded titles, each with its own real
+# paragraph (and sometimes its own photo), printed side by side in
+# plain newspaper columns with nothing between them but an ordinary
+# gutter -- no rule line, no colour bar, no wider gap.
+#
+# Confirmed on a real Urdu (THE INQUILAB) page: a student-protest
+# story ran as three side-by-side columns under one topical spread --
+# the main report, a named attendee's quoted blame (with his photo),
+# and a "Centre and Bihar government responsible" column -- 13-17px
+# gutters apart, no printed divider between any of them. The grouping
+# LLM correctly merged all three as one article; group_blocks' pure
+# column-geometry fallback then split them straight back apart, since
+# nothing here previously distinguished "plain adjacent columns" from
+# "two boxes with real separation between them" (see PACKAGE_COLUMN_
+# MAX_GAP_RATIO below -- deliberately the same order of magnitude as
+# BANNER_FRAGMENT_MAX_GAP_RATIO, an already-validated normal-gutter
+# size, not a new guess).
+#
+# This must NOT swallow two genuinely unrelated highlight-box titles
+# sharing a page -- confirmed separately on a real Marathi page where
+# exactly that was wrongly fused (see BANNER HEADLINE FRAGMENTS above
+# for the sibling case this file already guards). The required
+# has_vertical_separator_between check is what keeps that case
+# splitting here too: a highlight/inset box prints its own visible
+# border or colour fill, which this detects even in a narrow gutter,
+# where BANNER_FRAGMENT_MAX_GAP_RATIO-only geometry could not tell
+# the two shapes apart.
+# ============================================================
+
+PACKAGE_COLUMN_MAX_GAP_RATIO = 0.5
+
+# How much of the shorter title's own height the two must share, so
+# a title far above or below (a different row entirely) is never
+# mistaken for a column neighbour just because it happens to be
+# horizontally close.
+PACKAGE_COLUMN_MIN_ROW_OVERLAP_RATIO = 0.5
+
+
+def _row_overlap_ratio(block_a, block_b) -> float:
+
+    top = max(block_a.y1, block_b.y1)
+    bottom = min(block_a.y2, block_b.y2)
+
+    overlap = max(0, bottom - top)
+
+    shorter = min(
+        block_a.y2 - block_a.y1,
+        block_b.y2 - block_b.y1,
+    )
+
+    if shorter <= 0:
+        return 0.0
+
+    return overlap / shorter
+
+
+def _is_adjacent_package_column(
+    block_a, block_b, page_image, content_probe_blocks=None
+) -> bool:
+
+    if (
+        _row_overlap_ratio(block_a, block_b)
+        < PACKAGE_COLUMN_MIN_ROW_OVERLAP_RATIO
+    ):
+        return False
+
+    left, right = (
+        (block_a, block_b)
+        if block_a.x1 <= block_b.x1
+        else (block_b, block_a)
+    )
+
+    gap = right.x1 - left.x2
+
+    if gap < 0:
+        return False
+
+    shorter_height = min(
+        block_a.y2 - block_a.y1,
+        block_b.y2 - block_b.y1,
+    )
+
+    if shorter_height <= 0:
+        return False
+
+    if gap > PACKAGE_COLUMN_MAX_GAP_RATIO * shorter_height:
+
+        # A gap wider than an ordinary gutter is normally good
+        # evidence these are two separate stories -- UNLESS the gap
+        # only looks empty because the layout detector missed a
+        # photo/graphic actually printed there (confirmed on a real
+        # Urdu THE INQUILAB page: an undetected GDP/flag infographic
+        # sat exactly in a "537px gap" between two title columns of
+        # one Gemini-grouped story). Probed across this whole
+        # article's own vertical extent (content_probe_blocks), not
+        # just the two title rows, since such a graphic usually sits
+        # BELOW the headline row, not beside it.
+        if not content_probe_blocks:
+            return False
+
+        probe_y1 = min(b.y1 for b in content_probe_blocks)
+        probe_y2 = max(b.y2 for b in content_probe_blocks)
+
+        if not has_undetected_content(
+            page_image,
+            left.x2,
+            right.x1,
+            probe_y1,
+            probe_y2,
+        ):
+            return False
+
+    return not has_vertical_separator_between(
+        page_image,
+        left.x2,
+        right.x1,
+        min(block_a.y1, block_b.y1),
+        max(block_a.y2, block_b.y2),
+    )
+
+
+def _forms_undivided_column_package(
+    title_blocks, page_image, content_probe_blocks=None
+) -> bool:
+    """
+    Whether every title in `title_blocks` chains to every other
+    through plain, undivided column gutters (see
+    _is_adjacent_package_column) -- i.e. they form ONE connected
+    package rather than including some title that sits apart from
+    the rest with real separation or on a different row.
+
+    `content_probe_blocks` (optional, normally the oversized
+    article's own full block set) lets an otherwise-too-wide gap
+    still count as undivided when the gap itself turns out to hold
+    real printed content the detector never boxed -- see
+    _is_adjacent_package_column.
+    """
+
+    if len(title_blocks) < 2:
+        return True
+
+    remaining = list(title_blocks)
+    connected = [remaining.pop(0)]
+
+    changed = True
+
+    while changed and remaining:
+
+        changed = False
+
+        for block in list(remaining):
+
+            if any(
+                _is_adjacent_package_column(
+                    block, member, page_image, content_probe_blocks
+                )
+                for member in connected
+            ):
+                connected.append(block)
+                remaining.remove(block)
+                changed = True
+
+    return not remaining
 
 
 def _union_bbox(blocks):
@@ -688,6 +1187,175 @@ def _reattach_banner_fragments(sub_groups, fragment_to_primary):
     return merged
 
 
+# ============================================================
+# PRINTED RULE-LINE / BORDER BREAK
+#
+# A newspaper's own layout already marks most story breaks with a
+# visible printed rule line, a colored box edge, or a bordered strip
+# -- exactly the pixels visual_separator.has_visual_separator probes
+# for (see that module; local_grouper.py's OWN root detection already
+# relies on this same probe for the offline path). Everything above
+# this point in the file only ever notices a merge is wrong by
+# counting title-class blocks -- SUBORDINATE_TITLE_RATIO, banner
+# fragments, all of it. That misses a genuine over-merge where the
+# second story's own headline never made it into the layout as a
+# distinct "title" block at all (a common failure on a noisy scan --
+# confirmed on a real Urdu page, "THE INQUILAB": a small headline
+# ("...لندن کے میئر...") did still get boxed as its own title there,
+# but the newspaper had ALSO drawn a printed rule between it and the
+# unrelated banner headline two-thirds of the page above it -- direct
+# pixel evidence of a break that doesn't depend on title sizing at
+# all).
+#
+# _has_internal_rule_line_break below checks the SAME thing
+# local_grouper.py's root detection checks for each title candidate,
+# but as an independent trigger: does a printed separator sit in an
+# unusually large gap (RULE_LINE_MIN_GAP) between any two of THIS
+# article's own blocks that are nearest same-column neighbours? If
+# so, this article is handed to group_blocks() for a real re-check
+# even when title-count evidence alone would have skipped it. The gap
+# floor matters here in a way it doesn't for group_blocks' OWN root
+# detection: unlike the kept_ambiguous safety net below (which only
+# ever protects against an unsafe SPLIT), nothing downstream protects
+# against being handed a genuinely single-story article to re-check
+# in the first place -- group_blocks treats "title with body text
+# below it" as an article root REGARDLESS of gap size (see SUBORDINATE
+# TITLES above, "far too generous"), so a rule line alone, without
+# the gap requirement, would just as happily re-split a bordered
+# inline highlight/pull-quote box that was never a second story. The
+# gap floor is the only thing standing between this trigger and
+# reintroducing that exact over-split.
+# ============================================================
+
+# Fraction of the narrower block's width that must overlap
+# horizontally for two blocks to count as sharing a column, for the
+# rule-line check below. Matches local_grouper.py's COLUMN_OVERLAP --
+# same geometric question, just against Block objects.
+RULE_LINE_COLUMN_OVERLAP = 0.35
+
+# Minimum vertical gap before a printed rule line between two blocks
+# counts as break evidence at all. A rule line ALONE is not enough --
+# a legitimate inline highlight/pull-quote box sitting inside one
+# continuous story is routinely bordered too (that is what makes it
+# read as a highlight box in print), typically sitting within a few
+# tens of pixels of the surrounding text (confirmed elsewhere in this
+# codebase: a real boxed sidebar sat just 17px above its preceding
+# content). Reusing ArticleGrouper.ORPHAN_MAX_VERTICAL_GAP's own
+# measurement (same-column sibling gaps: 5px median, 273px at p99,
+# 419px max, over every LLM-grouped article in three full editions)
+# as the floor: anything below it is ordinary same-story spacing,
+# rule line or not, and anything above it is already outlier
+# territory. Comfortably below the confirmed real Urdu break this
+# trigger targets (2026px).
+RULE_LINE_MIN_GAP = 300.0
+
+
+def _column_overlap_ratio(block_a, block_b) -> float:
+
+    width_a = max(1.0, float(block_a.x2 - block_a.x1))
+    width_b = max(1.0, float(block_b.x2 - block_b.x1))
+
+    overlap = min(block_a.x2, block_b.x2) - max(block_a.x1, block_b.x1)
+
+    return max(0.0, overlap) / min(width_a, width_b)
+
+
+def _has_internal_rule_line_break(blocks, page_image) -> bool:
+    """
+    True when a printed rule line or colored box edge sits in an
+    unusually LARGE gap (see RULE_LINE_MIN_GAP) between two of THIS
+    article's own blocks that are nearest same-column neighbours.
+
+    The gap floor is what keeps this from re-flagging a legitimate
+    inline highlight/pull-quote box inside one continuous story --
+    such a box is bordered too, but sits close to the surrounding
+    text; only a border sitting in an outlier-sized gap is treated as
+    evidence of an actual story break.
+
+    Also skips a gap whose upper block is an image: a caption printed
+    directly under a photo is routinely set on its own colored/
+    bordered background, which belongs to the photo, not to a story
+    break -- the exact carve-out local_grouper.py's own root
+    detection already makes for the same reason.
+    """
+
+    if page_image is None or len(blocks) < 2:
+        return False
+
+    for block in blocks:
+
+        nearest_above = None
+        nearest_gap = None
+
+        for other in blocks:
+
+            if other is block:
+                continue
+
+            if other.y2 > block.y1:
+                continue
+
+            if (
+                _column_overlap_ratio(block, other)
+                < RULE_LINE_COLUMN_OVERLAP
+            ):
+                continue
+
+            gap = block.y1 - other.y2
+
+            if nearest_gap is None or gap < nearest_gap:
+                nearest_gap = gap
+                nearest_above = other
+
+        if nearest_above is None:
+            continue
+
+        if nearest_gap <= RULE_LINE_MIN_GAP:
+            continue
+
+        if (
+            (getattr(nearest_above, "cls", "") or "").strip().lower()
+            in IMAGE_CLASSES
+        ):
+            continue
+
+        # A rule line directly beneath a title/subtitle is routine
+        # newspaper styling separating a headline from ITS OWN body/
+        # figure below it (the same "headline -> rule -> body" strip
+        # every story on the page carries), never evidence that a
+        # DIFFERENT, unrelated story starts here -- confirmed on a
+        # real Malayalam page (doc_000166, page 2): a single-headline
+        # article's own subtitle/byline block sat directly above its
+        # own body paragraph with a large apparent gap between them,
+        # and a printed rule/box-edge pixel band inside that gap was
+        # enough to send the whole article through group_blocks,
+        # which then risked stranding the lower photo/body as a
+        # headless orphan sub-group (see SAFETY and requirement (c)'s
+        # _merge_headless_title_subgroups for the backstop this still
+        # keeps if that ever happens anyway). This carve-out mirrors
+        # the IMAGE_CLASSES one immediately above it -- same
+        # reasoning, just for a title's own content instead of a
+        # photo's own caption.
+        if (
+            (getattr(nearest_above, "cls", "") or "").strip().lower()
+            == "title"
+        ):
+            continue
+
+        probe_height = max(nearest_gap, SEPARATOR_MIN_BAND_HEIGHT)
+
+        if has_visual_separator(
+            page_image,
+            block.x1,
+            block.x2,
+            block.y1 - probe_height,
+            block.y1 + 2,
+        ):
+            return True
+
+    return False
+
+
 def split_oversized_articles(
     articles: List[Article],
     page_image=None,
@@ -699,25 +1367,72 @@ def split_oversized_articles(
     kept_ambiguous = 0
     kept_subordinate = 0
     kept_banner = 0
+    kept_package = 0
     aborted_unsafe = 0
+    rule_line_triggered = 0
 
     for article in articles:
 
+        # An "unknown"-role title-class block (ArticleGrouper.
+        # _is_uncertain_title -- the grouping model could not name a
+        # semantic role for it, most often because its own OCR text is
+        # too garbled to read at all) is never trusted as evidence of
+        # a genuine second headline here. Confirmed on a real
+        # Malayalam page (doc_000166, page 2): a tiny, semantically
+        # meaningless title-class fragment ("ലമ", role "unknown") sat
+        # inside a story's own logo/graphic area, was correctly folded
+        # into that story by the footprint-recovery pass above
+        # (ArticleGrouper._recover_unclaimed_blocks_by_footprint) since
+        # nothing else could claim it, but then registered as this
+        # article's SECOND title -- letting group_blocks below split
+        # the story's own rightmost text column and logo away from its
+        # real headline as a bogus, headless second "article". Such a
+        # block was never excluded from the story it already belongs
+        # to (see IGNORE_ROLES/_is_uncertain_title in article_grouper.py
+        # -- it stays real, claimed content); it just cannot ALSO count
+        # as a second headline candidate here with no reliable
+        # evidence behind it.
         title_blocks = [
             block
             for block in article.blocks
             if getattr(block, "cls", None) == "title"
+            and not ArticleGrouper._is_uncertain_title(block)
         ]
 
+        rule_line_break = _has_internal_rule_line_break(
+            article.blocks, page_image
+        )
+
+        if rule_line_break:
+            rule_line_triggered += 1
+
+        # A rule line alone is never enough to force a re-check when
+        # this article has at most one real headline to begin with --
+        # see requirement (b): with no second title anywhere in the
+        # article, group_blocks has nothing to root a second story on,
+        # so sending it through anyway only risks stranding the body/
+        # photo below as a headless orphan (see SAFETY). A genuine
+        # second, untitled story hiding in the remaining content is a
+        # membership question for the grouping step itself (see the
+        # file docstring's "headline-first invariant" note), not
+        # something this geometric check can safely act on alone.
         if len(title_blocks) <= 1:
             result.append(article)
             continue
 
         # Every extra title is a sub-head/inset heading printed
         # smaller than this article's own headline -- no evidence of a
-        # second story, so never re-check it. See
-        # SUBORDINATE_TITLE_RATIO above.
-        dominant_titles = _dominant_class_titles(title_blocks)
+        # second story, so never re-check it on title evidence alone.
+        # See SUBORDINATE_TITLE_RATIO above. Same reasoning as the
+        # single-title gate just above: at most one DOMINANT title
+        # candidate means there is still no second story for
+        # group_blocks to root, so a rule line alone does not override
+        # this either (requirement (b)) -- only the banner-fragment and
+        # column-package checks below, which already require >=2
+        # dominant titles, still let a rule line override them.
+        dominant_titles = _dominant_class_titles(
+            title_blocks, article.blocks
+        )
 
         if len(dominant_titles) <= 1:
             kept_subordinate += 1
@@ -728,10 +1443,27 @@ def split_oversized_articles(
         # layout detector cut at a column gutter -- again no second
         # story to find, so never re-check it. See BANNER HEADLINE
         # FRAGMENTS above.
-        if len(
-            _collapse_banner_fragments(dominant_titles, page_image)
-        ) <= 1:
+        if (
+            len(_collapse_banner_fragments(dominant_titles, page_image)) <= 1
+            and not rule_line_break
+        ):
             kept_banner += 1
+            result.append(article)
+            continue
+
+        # Every dominant title chains to the others through plain,
+        # undivided column gutters -- a same-event package (main
+        # report plus attributed reaction/blame columns), not
+        # evidence of separate stories. See SAME-EVENT COLUMN
+        # PACKAGE above. A detected rule line still overrides this,
+        # same as the two checks above.
+        if (
+            _forms_undivided_column_package(
+                dominant_titles, page_image, article.blocks
+            )
+            and not rule_line_break
+        ):
+            kept_package += 1
             result.append(article)
             continue
 
@@ -784,6 +1516,12 @@ def split_oversized_articles(
         )
 
         sub_groups = _merge_orphan_content_subgroups(
+            sub_groups,
+            sub_response.get("blocks", []),
+            block_by_id,
+        )
+
+        sub_groups = _merge_headless_title_subgroups(
             sub_groups,
             sub_response.get("blocks", []),
             block_by_id,
@@ -847,7 +1585,9 @@ def split_oversized_articles(
         or kept_ambiguous
         or kept_subordinate
         or kept_banner
+        or kept_package
         or aborted_unsafe
+        or rule_line_triggered
     ):
 
         print()
@@ -866,12 +1606,246 @@ def split_oversized_articles(
                 f"Multi-title articles kept (extra titles are halves "
                 f"of one banner headline) : {kept_banner}"
             )
+        if kept_package:
+            print(
+                f"Multi-title articles kept (extra titles are "
+                f"undivided same-event columns) : {kept_package}"
+            )
         if aborted_unsafe:
             print(
                 f"Multi-title articles left unsplit (unsafe -- "
                 f"would drop a block) : {aborted_unsafe}"
             )
+        if rule_line_triggered:
+            print(
+                f"Articles re-checked because a printed rule line/"
+                f"border was found between two of their own blocks "
+                f"(independent of title count) : {rule_line_triggered}"
+            )
         print(f"Total articles after split : {len(result)}")
+        print("=" * 60)
+        print()
+
+    return result
+
+
+# ============================================================
+# DISTANT ORPHAN BLOCKS
+#
+# A different failure from everything above: not two real headlines
+# merged into one article, but a single-title article that the
+# grouping LLM also handed a body-text block hundreds of pixels away,
+# in a different column, with other complete unrelated articles
+# printed in between. split_oversized_articles never re-examines
+# this (it only re-checks articles with >1 title block; this one has
+# exactly one), so it reaches the final crop untouched -- and because
+# the crop is a plain rectangle over the article's own block union
+# (see article_region_reconstructor.py), a block genuinely hundreds
+# of pixels from the rest of its own article stretches that rectangle
+# across everything printed between the two, producing a crop that
+# visibly contains several other stories' text.
+#
+# Confirmed on a real Urdu (THE INQUILAB) page: the grouping LLM's
+# own raw response put a block from a completely different, already-
+# separately-grouped story (a Jharkhand voter-list report) 1008px
+# below -- and in a barely-overlapping column from -- the two blocks
+# of an unrelated NSA-custody story, inside the SAME article.
+#
+# Deliberately RAW vertical gap here, not ArticleGrouper.
+# _layout_distance -- that metric's column-overlap penalty is tuned
+# for a different question (does this block plausibly ROOT its own
+# story) and misfires on exactly the shape a real multi-column
+# article takes: a title spanning the full width above narrower,
+# non-overlapping body columns beneath it. Confirmed directly: a
+# genuine bus-accident story (one banner title, body text in one
+# column, a photo and its caption in another) was flagged as 4
+# distant orphans by an earlier version of this check that used
+# _layout_distance, purely because a full-width title's column-
+# overlap with any single narrow column under it is inherently low
+# -- see _banner_fragment_plan's own docstring, which already
+# documents this exact metric as untrustworthy for an un-widened
+# title fragment's bbox. A real multi-column story's blocks stay
+# within a comparable Y-band as their own title regardless of which
+# column each sits in; only a genuinely misattributed block sits
+# hundreds of pixels beyond where any of its own article's other
+# blocks reach, in any column.
+#
+# Restricted to non-title blocks only -- a title anchors its own
+# article, so dropping one here is never the safe move; if a title
+# is genuinely misplaced that is a membership question for the
+# grouping step itself, not this geometric safety net.
+#
+# UPDATE: raw vertical gap alone (even to the nearest same-article
+# neighbor) turned out not to be a reliable break signal either --
+# confirmed on a real Urdu page where THREE separate foreign stories'
+# worth of content (183-390px gaps apart from each other and from
+# the real article) chained onto one BCI-president story, each
+# individual gap well within the range this codebase already treats
+# as a normal, legitimate same-story gap elsewhere (IMAGE_CAPTION_
+# MAX_GAP=250, SUBORDINATE_TITLE_MAX_GAP=600). No fixed pixel
+# threshold can separate that from a real long multi-paragraph
+# story without also cutting real ones.
+#
+# The reliable signal instead: whether ANOTHER article's own title
+# is physically printed in the gap between two of THIS article's
+# blocks. A real single story never has a second, independent
+# headline appear in the middle of it -- that is what a headline
+# means. Once a foreign title is found sitting in a gap, that block
+# and everything further from the article's own title (in reading
+# order) is dropped, however small the pixel gaps between those
+# trailing blocks are to each other -- confirmed necessary on the
+# same page: two of the three foreign clusters (12+11 together, 1px
+# apart from EACH OTHER) would each individually look perfectly
+# "close" and pass any single-block distance check.
+#
+# UPDATE: "physically printed in the gap" must be read in BOTH
+# dimensions, not just Y. Confirmed on a real Gujarati page
+# (doc_000167, page 2): a foreign title from the page's RIGHT-hand
+# column had its vertical center land inside a tiny gap between two
+# blocks of a completely unrelated LEFT-hand-column article, purely
+# by coincidence of where each column's content happened to fall on
+# the page -- zero horizontal overlap between the foreign title and
+# the column the gap actually belongs to. See _foreign_title_in_gap's
+# gap_x1/gap_x2 check.
+# ============================================================
+
+
+def _foreign_titles_by_article(articles):
+
+    return {
+        article.article_id: [
+            block
+            for block in article.blocks
+            if getattr(block, "cls", None) == "title"
+        ]
+        for article in articles
+    }
+
+
+def _foreign_title_in_gap(
+    gap_top, gap_bottom, gap_x1, gap_x2, foreign_titles
+):
+    """
+    Whether a foreign title's printed line physically crosses the
+    gap between two of THIS article's own blocks -- both vertically
+    (its center falls inside the gap) AND horizontally (its bbox
+    overlaps the column track those two blocks occupy, `gap_x1` to
+    `gap_x2`).
+
+    The horizontal check is required. A foreign headline sitting in
+    an entirely different column can share this article's Y-range
+    by pure coincidence of newspaper layout -- confirmed on a real
+    Gujarati page (doc_000167, page 2): a Messi-retirement headline
+    in the RIGHT-hand column (x 1400-1728) had its vertical center
+    land in a 7px gap between a leftmost-column (x 48-303) article's
+    own title and photo, with zero horizontal overlap between the
+    two. Without this check that unrelated title was treated as
+    cutting straight through the left-column article, and the
+    article's own photo and body paragraph beneath the gap were
+    dropped as "distant orphans" even though nothing was ever
+    printed between them in their own column.
+    """
+
+    if gap_top >= gap_bottom:
+        return False
+
+    for title in foreign_titles:
+
+        center = (title.y1 + title.y2) / 2.0
+
+        if not (gap_top < center < gap_bottom):
+            continue
+
+        if title.x2 <= gap_x1 or title.x1 >= gap_x2:
+            continue
+
+        return True
+
+    return False
+
+
+def drop_distant_orphan_blocks(articles: List[Article]) -> List[Article]:
+
+    result: List[Article] = []
+    dropped_count = 0
+
+    titles_by_article = _foreign_titles_by_article(articles)
+
+    for article in articles:
+
+        if len(article.blocks) < 2:
+            result.append(article)
+            continue
+
+        foreign_titles = [
+            title
+            for other_id, titles in titles_by_article.items()
+            if other_id != article.article_id
+            for title in titles
+        ]
+
+        ordered = sorted(article.blocks, key=lambda block: block.y1)
+
+        break_index = None
+
+        for index in range(len(ordered) - 1):
+
+            current_block = ordered[index]
+            following_block = ordered[index + 1]
+
+            if _foreign_title_in_gap(
+                current_block.y2,
+                following_block.y1,
+                min(current_block.x1, following_block.x1),
+                max(current_block.x2, following_block.x2),
+                foreign_titles,
+            ):
+                break_index = index + 1
+                break
+
+        if break_index is None:
+            result.append(article)
+            continue
+
+        dropped_this_article = [
+            block
+            for block in ordered[break_index:]
+            if getattr(block, "cls", None) != "title"
+        ]
+
+        if not dropped_this_article:
+            result.append(article)
+            continue
+
+        dropped_ids = {block.id for block in dropped_this_article}
+
+        kept_blocks = [
+            block for block in article.blocks if block.id not in dropped_ids
+        ]
+
+        dropped_count += len(dropped_this_article)
+
+        print(
+            f"Distant orphan block(s) dropped from article "
+            f"{article.article_id}: {sorted(dropped_ids)}"
+        )
+
+        result.append(
+            Article(
+                article_id=article.article_id,
+                blocks=kept_blocks,
+                block_ids=[block.id for block in kept_blocks],
+                confidence=article.confidence,
+            )
+        )
+
+    if dropped_count:
+
+        print()
+        print("=" * 60)
+        print("DISTANT ORPHAN BLOCKS")
+        print("=" * 60)
+        print(f"Blocks dropped : {dropped_count}")
         print("=" * 60)
         print()
 

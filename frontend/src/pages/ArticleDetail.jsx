@@ -14,7 +14,7 @@ import "../styles/archive.css";
 
 
 const API_BASE =
-    import.meta.env.VITE_API_URL ||
+    import.meta.env.VITE_API_URL ??
     "http://127.0.0.1:8000";
 
 
@@ -477,7 +477,11 @@ function ArticleDetail() {
 
                         {article.sentiment && (
 
-                            <span className="article-sentiment">
+                            <span
+                                className={
+                                    `article-sentiment sentiment-${article.sentiment.toLowerCase()}`
+                                }
+                            >
 
                                 {
                                     article.sentiment
@@ -492,7 +496,7 @@ function ArticleDetail() {
 
                     {/* TITLE */}
 
-                    <h1 className="article-title">
+                    <h1 className="article-title" dir="auto">
 
                         {
                             article.title
@@ -567,7 +571,7 @@ function ArticleDetail() {
                             </h2>
 
 
-                            <p className="article-summary">
+                            <p className="article-summary" dir="auto">
 
                                 {
                                     article.summary
@@ -605,6 +609,7 @@ function ArticleDetail() {
                                             key={
                                                 index
                                             }
+                                            dir="auto"
                                         >
                                             {
                                                 paragraph
@@ -872,16 +877,38 @@ function ArchiveHeader({
                 }
             >
 
-                Newspaper Archive
+                <span className="archive-logo-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <rect x="3" y="3" width="18" height="18" rx="4" fill="currentColor" opacity="0.15" />
+                        <path
+                            d="M7 8h10M7 12h10M7 16h6"
+                            stroke="currentColor"
+                            strokeWidth="1.75"
+                            strokeLinecap="round"
+                        />
+                    </svg>
+                </span>
+
+                <span>
+                    Newspaper Archive
+                </span>
 
             </div>
 
 
             <div className="archive-header-search">
 
+                <span className="archive-header-search-icon" aria-hidden="true">
+                    <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="9" cy="9" r="6.5" stroke="currentColor" strokeWidth="1.6" />
+                        <path d="M17 17l-3.8-3.8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                    </svg>
+                </span>
+
                 <input
                     value={query}
                     placeholder="Search articles..."
+                    aria-label="Search articles"
                     onChange={(event) =>
                         setQuery(
                             event.target.value
@@ -901,19 +928,10 @@ function ArchiveHeader({
                     }}
                 />
 
-
-                <button
-                    onClick={
-                        search
-                    }
-                >
-                    🔍
-                </button>
-
             </div>
 
 
-            <nav className="archive-nav">
+            <nav className="archive-nav" aria-label="Primary">
 
                 <button
                     onClick={() =>

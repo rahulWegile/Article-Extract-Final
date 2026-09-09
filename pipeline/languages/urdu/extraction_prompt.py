@@ -1,12 +1,15 @@
 # Article-extraction prompt template for Urdu.
 #
-# Copied verbatim from OpenAIArticleExtractor's previously-hardcoded
-# template. Placeholders (__PAGES__, __KNOWN_PAGES__, __CROP_INVENTORY__,
-# __PENDING_CONTINUATIONS__) are substituted by
-# OpenAIArticleExtractor._build_prompt at call time -- keep them intact.
+# Deliberately a copy of Hindi's extraction prompt, the same one
+# Gujarati/Marathi/Punjabi already reuse verbatim -- see
+# pipeline/languages/urdu/__init__.py for why Urdu is routed through
+# GeminiArticleExtractor (same reasoning Hindi's own comment gives:
+# gpt-5.6-luna cannot reliably read this non-Latin script off a real
+# crop). The placeholders are the same in both extractors, so the
+# template is portable between them.
 #
-# Physically separate per language so this one can be tuned without
-# touching any other language's prompt.
+# Still physically separate so it can diverge from Hindi later
+# without touching Hindi.
 
 URDU_EXTRACTION_PROMPT = """
 You are the newspaper article extraction and
@@ -110,12 +113,6 @@ article text.
 Do NOT summarize article_text.
 
 The summary is a separate field.
-
-Transcribe article_text in the exact language and script shown
-in the image (e.g. Tamil script stays Tamil, Devanagari stays
-Devanagari, Gujarati script stays Gujarati, English stays
-English). Do NOT translate or transliterate it into a different
-language or script.
 
 ============================================================
 STRUCTURED KNOWLEDGE

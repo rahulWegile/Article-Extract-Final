@@ -170,6 +170,135 @@ MAX_RECOVERED_PAGE_AREA_RATIO = 0.25
 CLUSTER_GAP_PAGE_FRACTION = 0.025
 CLUSTER_GAP_MIN = 60.0
 
+# ----------------------------------------------------------------
+# TIGHT HEADLINE+BODY PAIR RECOVERY
+#
+# The cluster-based recovery above is built for a multi-paragraph
+# story (MIN_BODY_BLOCKS paragraphs) and, on a crowded page, its
+# proximity clustering can merge a real one-paragraph dropped story
+# together with OTHER unrelated dropped content sitting nearby into
+# one blob that correctly fails _looks_like_a_story (several
+# unrelated stories is not one story) -- so the real story is never
+# recovered either. Confirmed on a real Urdu (THE INQUILAB,
+# doc_000182 page 1) document: a one-paragraph Election Commission
+# story (a headline classed "figure" -- a real headline the layout
+# detector boxed as an image, the same confirmed Nastaliq styling
+# failure layout_gap_recovery.py's recover_misclassified_text_blocks
+# exists for, which this block fell just under the width floor of --
+# directly above one 835-character body block) proximity-clustered
+# with two OTHER separate dropped items and two loose graphics into
+# a 7-block blob spanning most of the page's lower half.
+#
+# This pass looks for a much narrower, purely LOCAL pattern instead:
+# one heading-like block (title, or figure -- see above) sitting
+# DIRECTLY above one substantial free paragraph, sharing most of its
+# column width, separated by only an ordinary headline-to-first-line
+# gap. Recovered as its OWN two-block article, independent of
+# whatever looser cluster either block would otherwise fall into --
+# confirmed on the same real page that this fires on exactly the one
+# genuine pair (57, 31) and nothing else, out of 6 candidate headings
+# and 3 candidate paragraphs on that page.
+# ----------------------------------------------------------------
+
+# A single recovered paragraph must carry this much text on its own
+# -- there is no second/third paragraph here to average against (see
+# MIN_MEAN_BODY_CHARS above for the multi-paragraph case), so this is
+# deliberately close to what a real short news item actually runs,
+# not a stray caption or a classified-ad line.
+TIGHT_PAIR_MIN_BODY_CHARS = 200
+
+# The two blocks must share this much column width for the pairing
+# to mean "this heading belongs to this paragraph" -- same convention
+# as COLUMN_OVERLAP elsewhere in the pipeline (layout_gap_recovery.py,
+# local_grouper.py), tightened since this pass has no multi-paragraph
+# shape check to fall back on if the pairing itself is wrong.
+TIGHT_PAIR_COLUMN_OVERLAP = 0.5
+
+# Heading directly above body: the vertical gap between them must be
+# tight, an ordinary headline-to-first-line spacing, not a jump
+# across unrelated content in between.
+TIGHT_PAIR_MAX_GAP = 40.0
+
+
+def _column_overlap_ratio(a, b):
+    width_a = max(1.0, a.x2 - a.x1)
+    width_b = max(1.0, b.x2 - b.x1)
+
+    overlap = min(a.x2, b.x2) - max(a.x1, b.x1)
+
+    return max(0.0, overlap) / min(width_a, width_b)
+
+
+def _recover_tight_headline_body_pairs(free_blocks, owned_blocks):
+    """
+    See TIGHT HEADLINE+BODY PAIR RECOVERY above. `free_blocks` must
+    already exclude anything the cluster-based pass recovered, so a
+    block is never claimed twice.
+    """
+
+    headings = [
+        block for block in free_blocks
+        if _cls(block) in ("title", "figure")
+    ]
+
+    paragraphs = [
+        block for block in free_blocks
+        if _cls(block) == "plain text"
+        and len(_text(block)) >= TIGHT_PAIR_MIN_BODY_CHARS
+    ]
+
+    consumed = set()
+
+    recovered = []
+
+    for heading in headings:
+
+        if heading.id in consumed:
+            continue
+
+        best = None
+        best_gap = None
+
+        for paragraph in paragraphs:
+
+            if paragraph.id in consumed:
+                continue
+
+            if paragraph.y1 < heading.y2:
+                continue
+
+            gap = paragraph.y1 - heading.y2
+
+            if gap > TIGHT_PAIR_MAX_GAP:
+                continue
+
+            if (
+                _column_overlap_ratio(heading, paragraph)
+                < TIGHT_PAIR_COLUMN_OVERLAP
+            ):
+                continue
+
+            if best_gap is None or gap < best_gap:
+                best = paragraph
+                best_gap = gap
+
+        if best is None:
+            continue
+
+        group = [heading, best]
+
+        if _encroaches(group, owned_blocks):
+            continue
+
+        consumed.add(heading.id)
+        consumed.add(best.id)
+
+        group.sort(key=lambda block: getattr(block, "reading_order", 0))
+
+        recovered.append(group)
+
+    return recovered
+
 
 def _text(block):
     return (getattr(block, "text", "") or "").strip()
@@ -414,6 +543,26 @@ def recover_dropped_articles(articles, blocks, page_image=None):
 
         group.sort(key=lambda block: getattr(block, "reading_order", 0))
 
+        recovered.append(group)
+
+    # See TIGHT HEADLINE+BODY PAIR RECOVERY above -- a narrower pass
+    # for a one-paragraph story the cluster pass above either merged
+    # into an unrelated blob (and so correctly rejected) or never
+    # clustered at all. Runs on whatever the cluster pass above did
+    # NOT already recover, so nothing is ever claimed twice.
+    cluster_recovered_ids = {
+        block.id for group in recovered for block in group
+    }
+
+    tight_pair_free_blocks = [
+        block
+        for block in free_blocks
+        if block.id not in cluster_recovered_ids
+    ]
+
+    for group in _recover_tight_headline_body_pairs(
+        tight_pair_free_blocks, owned_blocks,
+    ):
         recovered.append(group)
 
     if not recovered:

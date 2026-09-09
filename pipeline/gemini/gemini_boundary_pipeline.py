@@ -11,11 +11,16 @@ from pipeline.article.article_grouper import (
 )
 
 from pipeline.article.article_splitter import (
+    drop_distant_orphan_blocks,
     split_oversized_articles,
 )
 
 from pipeline.article.dropped_article_recovery import (
     recover_dropped_articles,
+)
+
+from pipeline.article.headless_headline_relink import (
+    relink_headless_headlines,
 )
 
 from pipeline.article.boundary_decomposer import (
@@ -100,8 +105,10 @@ class GeminiBoundaryPipeline:
         use_orphan_title_root_repair: bool = True,
         use_unclaimed_kicker_recovery: bool = True,
         use_unclaimed_image_recovery: bool = True,
+        use_unclaimed_footprint_recovery: bool = True,
         use_article_splitter: bool = True,
         use_dropped_article_recovery: bool = True,
+        use_headless_headline_relink: bool = True,
         use_boundary_decomposition: bool = True,
     ):
 
@@ -145,6 +152,33 @@ class GeminiBoundaryPipeline:
         )
 
         #
+        # Load the page image once, up front, whenever ANY
+        # pixel-probing pass below needs it -- orphan-block
+        # reassignment's hard-separator veto (ArticleGrouper.build,
+        # see _has_separator_between) now needs it too, not just the
+        # splitter/recovery passes that used to be the only consumers.
+        #
+        # Only these passes probe page pixels, so a language with all
+        # of them switched off never pays for decoding a
+        # full-resolution page scan here.
+        #
+
+        if (
+            use_orphan_block_reassignment
+            or use_article_splitter
+            or use_dropped_article_recovery
+        ):
+
+            try:
+                page_image = cv2.imread(str(image_path))
+            except Exception:
+                page_image = None
+
+        else:
+
+            page_image = None
+
+        #
         # Build articles
         #
 
@@ -176,6 +210,12 @@ class GeminiBoundaryPipeline:
                 use_unclaimed_image_recovery
             ),
 
+            use_unclaimed_footprint_recovery=(
+                use_unclaimed_footprint_recovery
+            ),
+
+            page_image=page_image,
+
         )
 
         #
@@ -205,27 +245,6 @@ class GeminiBoundaryPipeline:
         # fine.
         #
 
-        # Per-language opt-in (see pipeline/languages/): enabled for
-        # every language except English, whose reference pipeline has
-        # no article-splitter step at all.
-        #
-        # Only the splitter and the recovery pass probe page pixels,
-        # so a language with both switched off never pays for
-        # decoding a full-resolution page scan here.
-        #
-
-        if use_article_splitter or use_dropped_article_recovery:
-
-            try:
-                page_image = cv2.imread(str(image_path))
-            except Exception:
-                page_image = None
-
-        else:
-
-            page_image = None
-
-        #
         # Recover a whole story the model threw away by giving every
         # one of its blocks a non-article role. ArticleGrouper's
         # IGNORE_ROLES drop is terminal -- none of its repair passes
@@ -256,6 +275,38 @@ class GeminiBoundaryPipeline:
                 articles,
                 page_image,
             )
+
+            # A different failure than the multi-title over-merge
+            # above: a single-title article that also picked up a
+            # body-text block hundreds of pixels away, in a
+            # different/misaligned column, with other complete
+            # unrelated stories printed in between -- confirmed on a
+            # real Urdu page. split_oversized_articles never
+            # re-examines this (it only re-checks articles with >1
+            # title), so it would otherwise reach the crop stage
+            # untouched. See DISTANT ORPHAN BLOCKS in
+            # article_splitter.py.
+            articles = drop_distant_orphan_blocks(articles)
+
+        #
+        # Re-link a headline a DIFFERENT article claims back to a
+        # headless neighbour it actually sits directly above -- a
+        # narrower, more targeted case than the general orphan-block
+        # reassignment above (ArticleGrouper._reassign_orphan_blocks),
+        # which requires a block to be nearly isolated from its own
+        # article's other blocks before it is even reconsidered. See
+        # headless_headline_relink.py.
+        #
+        # Runs after the splitter/distant-orphan passes above (so it
+        # acts on membership those have already settled) and before
+        # decomposition below (so a corrected headline is already in
+        # place by the time rectangles are checked for enclosing
+        # content they do not own).
+        #
+
+        if use_headless_headline_relink:
+
+            articles = relink_headless_headlines(articles)
 
         #
         # Re-cut any article whose min/max RECTANGLE encloses content

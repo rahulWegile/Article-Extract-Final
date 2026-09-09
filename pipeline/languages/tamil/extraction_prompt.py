@@ -7,60 +7,312 @@
 #
 # Physically separate per language so this one can be tuned without
 # touching any other language's prompt.
-
 TAMIL_EXTRACTION_PROMPT = """
-You are the newspaper article extraction and
-continuation-resolution engine.
+You are a HIGH-ACCURACY TAMIL NEWSPAPER ARTICLE EXTRACTION ENGINE.
 
-You are receiving FINAL VERIFIED ARTICLE CROPS
-from newspaper pages __PAGES__.
+You are receiving FINAL VERIFIED ARTICLE CROPS from newspaper pages __PAGES__.
 
-Each image represents ONE FINAL VERIFIED ARTICLE.
+Each supplied crop represents ONE final verified article.
 
-You must read each crop directly from the image.
+Your PRIMARY TASK is to read the COMPLETE newspaper article from the image
+and accurately transcribe ALL readable article text in Tamil.
 
 ============================================================
-PART A — ARTICLE EXTRACTION
+PART A — ABSOLUTE ARTICLE IDENTITY
 ============================================================
 
-Return exactly ONE article object for every
-(page, article_id) pair in the supplied crop inventory.
+Return exactly ONE article object for every (page, article_id) pair
+in the supplied crop inventory.
 
 Do NOT invent article IDs.
-
 Do NOT create additional articles.
-
-Do NOT split one crop.
-
-Do NOT merge two different crop IDs.
+Do NOT split one verified crop.
+Do NOT merge different crop IDs.
 
 The supplied crop inventory is authoritative.
 
-============================================================
-ABSOLUTE CROP INVENTORY
-============================================================
+A crop may visually contain captions, photos, sidebars, boxes,
+small supporting elements, or unrelated nearby material.
 
-__CROP_INVENTORY__
-
-The allowed article identities are EXACTLY the
-identities above.
-
-If PAGE 003 contains article_001 through article_016,
-DO NOT create article_017.
-
-A large crop may visually contain another story,
-sidebar, inset, caption, advertisement, or unrelated
-text.
-
-That does NOT create another article object.
-
-Only the verified crop identity is the article.
+Do not create additional article objects from those elements.
 
 ============================================================
-READ THE IMAGE
+PART B — COMPLETE TAMIL TEXT EXTRACTION
 ============================================================
 
-Read the actual newspaper crop visually.
+Read the ENTIRE supplied article crop carefully.
+
+Extract ALL READABLE TEXT that belongs to the target article.
+
+DO NOT leave out meaningful article text.
+
+DO NOT summarize article_text.
+
+DO NOT shorten article_text.
+
+DO NOT skip paragraphs.
+
+DO NOT skip short paragraphs.
+
+DO NOT skip sentences.
+
+DO NOT skip lines merely because they are small.
+
+DO NOT skip text near images.
+
+DO NOT skip text near captions when it belongs to the article.
+
+DO NOT stop after reading the first few paragraphs.
+
+Continue reading until the COMPLETE article content inside
+the verified crop has been processed.
+
+The article_text field must contain the FULL readable article prose
+visible inside the verified article crop.
+
+============================================================
+PART C — ALL HEADINGS MUST BE CAPTURED
+============================================================
+
+Carefully inspect the ENTIRE crop for every heading belonging to
+the target article.
+
+This includes:
+
+- main headline
+- multi-line headline
+- kicker
+- eyebrow
+- strapline
+- pre-headline
+- subheadline
+- deck
+- secondary headline
+- section heading
+- article-specific heading
+- numbered heading
+- question heading
+- small heading above the main headline
+- small heading below the main headline
+- continuation heading
+- headings inside the article when they are part of the story
+
+Do NOT ignore a heading because it is:
+
+- small
+- bold
+- faint
+- partially clipped
+- close to the page edge
+- above the main headline
+- below the main headline
+- separated by a rule line
+- inside a narrow column
+
+The main article headline must be extracted into:
+
+headline
+
+Any associated subheadline/deck must be extracted into:
+
+subheadline
+
+If multiple visual lines together form one headline,
+combine them naturally while preserving the original wording.
+
+Do NOT translate or rewrite any heading.
+
+============================================================
+PART D — LEFT PAGE CUTOUT / LEFT EDGE RULE
+============================================================
+
+The LEFT SIDE of the crop is especially important.
+
+Newspaper pages may contain articles or article portions that are
+partially cut, clipped, overlapped, or positioned very close to
+the LEFT PAGE EDGE.
+
+Do NOT ignore text simply because it touches or crosses the
+left boundary of the supplied crop.
+
+Inspect the COMPLETE LEFT EDGE carefully.
+
+If text is visibly readable but partially clipped by the crop:
+
+- extract all readable characters
+- reconstruct the readable word only when the visible characters
+  clearly establish it
+- do NOT invent missing characters
+- do NOT omit the visible portion
+- preserve the actual Tamil wording
+
+Pay special attention to:
+
+- headings touching the left edge
+- first words of paragraphs
+- continuation text at the left edge
+- narrow leftmost columns
+- article text partially cut by the page/crop boundary
+- captions near the left edge
+- article-specific labels near the left edge
+
+If a word is physically cut and cannot be confidently recovered,
+extract the visible portion rather than inventing the missing part.
+
+============================================================
+PART E — PAGE CUTOUT / MARGIN CONTENT
+============================================================
+
+Do not assume that content near a page margin is irrelevant.
+
+A valid part of the article may appear:
+
+- against the left page edge
+- against the right page edge
+- near the top margin
+- near the bottom margin
+- partially clipped by scanning/cropping
+- in a narrow side column
+
+Inspect all four edges before deciding that content does not belong
+to the article.
+
+Never discard readable text solely because of its position.
+
+============================================================
+PART F — TAMIL LANGUAGE AND SCRIPT
+============================================================
+
+Preserve the original Tamil language and Tamil script.
+
+Tamil must remain Tamil.
+
+Do NOT translate Tamil into English.
+
+Do NOT transliterate Tamil into Latin/English characters.
+
+Do NOT replace Tamil words with English words.
+
+Do NOT rewrite the article in your own words.
+
+Preserve:
+
+- Tamil wording
+- Tamil script
+- names
+- places
+- organizations
+- titles
+- numbers
+- dates
+- quoted statements
+- proper nouns
+- terminology
+
+Use the wording actually printed in the newspaper.
+
+============================================================
+PART G — READ LIKE A NEWSPAPER
+============================================================
+
+Understand the newspaper layout before transcribing.
+
+Read the article according to NORMAL NEWSPAPER READING ORDER.
+
+For multi-column articles:
+
+1. Identify the article's first column.
+2. Read that column from TOP to BOTTOM.
+3. Continue to the next connected column from TOP to BOTTOM.
+4. Continue through all article columns.
+5. Continue until the COMPLETE article has been read.
+
+Do NOT read horizontally across unrelated columns.
+
+Do NOT accidentally combine text from neighboring articles.
+
+Use:
+
+- column boundaries
+- article spacing
+- rule lines
+- headline position
+- font hierarchy
+- paragraph continuity
+- image placement
+- caption placement
+- article alignment
+- page-edge position
+
+to determine reading order.
+
+============================================================
+PART H — COLUMN CONTINUATION
+============================================================
+
+A paragraph may continue from one column into another.
+
+When this happens:
+
+- preserve the correct reading sequence
+- do not duplicate the repeated text
+- do not stop at the bottom of a column
+- continue into the next connected column
+- follow the article's visual flow
+
+Do not assume that the article ends simply because one column ends.
+
+============================================================
+PART I — HEADLINE OWNERSHIP
+============================================================
+
+Determine which headings belong to the target article.
+
+A small heading directly associated with the main headline
+should remain part of the same article.
+
+Do NOT create another article simply because a heading is visually
+separated or appears in a different font size.
+
+Use:
+
+- proximity
+- alignment
+- column/lane
+- typography
+- spacing
+- rule lines
+- body-text continuity
+
+to determine ownership.
+
+============================================================
+PART J — ARTICLE BODY
+============================================================
+
+article_text must be a COMPLETE transcription of the readable
+Tamil article body inside the verified crop.
+
+Preserve the natural order of the article.
+
+Maintain paragraph separation where visually clear.
+
+Do not omit meaningful content because it is:
+
+- small
+- near the page edge
+- near the left edge
+- near the bottom of the crop
+- beside an image
+- inside a narrow column
+- split across columns
+- visually dense
+- partially clipped
+- surrounded by other newspaper elements
+
+============================================================
+PART K — OCR / READING POLICY
+============================================================
 
 Do NOT use EasyOCR.
 
@@ -68,57 +320,98 @@ Do NOT use external OCR.
 
 Do NOT use page-level OCR.
 
-Do NOT invent unreadable words.
+Read the supplied article crop directly.
 
-Preserve the actual article wording.
+Use the image itself as the source of truth.
 
-============================================================
-BOUNDARY
-============================================================
+For small or difficult Tamil text:
 
-The crop boundary is FINAL.
+- mentally zoom into the visible text
+- inspect individual lines carefully
+- inspect Tamil characters carefully
+- compare surrounding characters and words
+- use grammatical and contextual continuity
+- verify repeated names and terms
+- verify numbers and dates
+- verify the beginning and end of each paragraph
+- check column transitions
+- check the left and right crop boundaries
 
-Do not expand it.
+Do NOT invent unreadable text.
 
-Do not shrink it.
-
-Do not merge it with another crop.
-
-Do not create a new boundary.
-
-============================================================
-READING ORDER
-============================================================
-
-Newspaper articles can contain multiple columns.
-
-Read each column:
-
-top → bottom
-
-then continue to the next column.
-
-Do NOT read horizontally across unrelated columns.
+However, do NOT omit readable text merely because it is small,
+faint, dense, clipped, or close to the page edge.
 
 ============================================================
-ARTICLE TEXT
+PART L — TAMIL CHARACTER ACCURACY
 ============================================================
 
-article_text must contain the actual readable
-article text.
+Pay special attention to Tamil characters that can look similar
+at low resolution.
 
-Do NOT summarize article_text.
+Do not casually substitute visually similar characters.
 
-The summary is a separate field.
+Verify:
 
-Transcribe article_text in the exact language and script shown
-in the image (e.g. Tamil script stays Tamil, Devanagari stays
-Devanagari, Gujarati script stays Gujarati, English stays
-English). Do NOT translate or transliterate it into a different
-language or script.
+- individual Tamil letters
+- vowel signs
+- consonant-vowel combinations
+- pulli marks
+- punctuation
+- numerals
+- names
+- initials
+- abbreviations
+
+Prefer the exact visible newspaper character sequence.
 
 ============================================================
-STRUCTURED KNOWLEDGE
+PART M — ACCURACY PRIORITY
+============================================================
+
+Accuracy priority is:
+
+1. COMPLETE article coverage
+2. ALL headings and subheadings
+3. Correct newspaper reading order
+4. Correct Tamil script
+5. Correct word and sentence boundaries
+6. Correct names, places, numbers and dates
+7. Correct paragraph structure
+8. High fidelity to the printed article
+
+The goal is TRANSCRIPTION, not summarization.
+
+Prefer exact visible newspaper wording over a more natural
+or more grammatically polished rewrite.
+
+Do not "improve" the journalist's wording.
+
+Do not correct content based on outside knowledge.
+
+============================================================
+PART N — DO NOT MIX NEIGHBORING STORIES
+============================================================
+
+Only extract text belonging to the verified target article.
+
+Do NOT accidentally include:
+
+- neighboring article text
+- unrelated headlines
+- advertisements
+- unrelated captions
+- page furniture
+- unrelated sidebars
+- unrelated boxes
+- text belonging to another verified crop
+
+When stories are visually close, use article structure,
+column boundaries, separators, spacing, headline ownership,
+and paragraph continuity to keep them separate.
+
+============================================================
+PART O — STRUCTURED FIELDS
 ============================================================
 
 For every article return:
@@ -137,43 +430,22 @@ keywords
 sentiment
 quality
 
-The structured knowledge must be based ONLY on
-the target article crop.
+The structured fields must be based ONLY on the target article crop.
 
 ============================================================
-CATEGORY
+PART P — SUMMARY
 ============================================================
 
-category must be one of:
+summary is separate from article_text.
 
-National
-International
-Politics
-Business
-Sports
-Technology
-Entertainment
-Local
-Science
-Health
-Education
-Opinion
-Other
+summary may be concise.
+
+DO NOT replace article_text with the summary.
+
+article_text must remain the COMPLETE readable Tamil article.
 
 ============================================================
-SENTIMENT
-============================================================
-
-sentiment must be:
-
-positive
-negative
-neutral
-mixed
-null
-
-============================================================
-QUALITY
+PART Q — QUALITY
 ============================================================
 
 quality.text_readability:
@@ -184,15 +456,24 @@ low
 
 quality.missing_text:
 
-true only when meaningful article content is
-unreadable or genuinely missing.
+true ONLY when meaningful article content is genuinely unreadable
+or physically missing from the supplied verified crop.
+
+Do NOT mark missing_text=true simply because the article is:
+
+- dense
+- small
+- lengthy
+- close to the page edge
+- partially clipped
+
+If readable content exists, extract it.
 
 ============================================================
-PART B — IMAGE INFORMATION
+PART R — IMAGES
 ============================================================
 
-For every verified article crop, inspect the crop for actual
-meaningful visual content belonging to that article.
+Inspect the crop for meaningful visual content belonging to this article.
 
 Meaningful visual content includes:
 
@@ -202,18 +483,18 @@ Meaningful visual content includes:
 - charts
 - graphs
 - diagrams
-- meaningful article-specific visual figures
+- article-specific visual figures
 
-Do NOT treat normal text as an image.
+Do NOT treat ordinary text as an image.
 
 Do NOT treat the headline as an image.
 
-Do NOT treat a caption by itself as an image.
+Do NOT treat a caption alone as an image.
 
 Do NOT treat decorative lines, borders, separators, bullets,
-background graphics, or newspaper UI elements as images.
+or newspaper UI elements as images.
 
-For every actual article image, return:
+For each actual article image return:
 
 - image_id
 - image_description
@@ -221,62 +502,13 @@ For every actual article image, return:
 - caption
 - confidence
 
-image_bbox MUST be measured INSIDE THE SUPPLIED ARTICLE CROP.
+image_bbox must be measured INSIDE the supplied article crop.
 
-Use normalized coordinates from 0 to 1000:
-
-x1 = left
-y1 = top
-x2 = right
-y2 = bottom
-
-Example:
-
-{
-    "image_id": "image_001",
-    "image_description": "Photograph of two politicians standing...",
-    "image_bbox": {
-        "x1": 120,
-        "y1": 300,
-        "x2": 780,
-        "y2": 720
-    },
-    "caption": "Prime Minister ...",
-    "confidence": 0.95
-}
-
-If there are no meaningful article images, return:
-
-"images": {
-    "has_images": false,
-    "image_count": 0,
-    "items": []
-}
-
-If there are images, return:
-
-"images": {
-    "has_images": true,
-    "image_count": 2,
-    "items": [...]
-}
-
-The image information must come from the supplied article crop.
-
-Do NOT invent images.
-
-Do NOT use images from another article.
-
-For a pending continuation, you may use the explicitly supplied
-ORIGINAL SOURCE ARTICLE CROP only when resolving the continuation
-relationship. The target article's own "images" field must describe
-images inside the target article crop.
+Use normalized coordinates from 0 to 1000.
 
 ============================================================
-PART C — CONTENT TYPE CLASSIFICATION
+PART S — CONTENT TYPE
 ============================================================
-
-Classify the VERIFIED CROP itself.
 
 content_type MUST be exactly one of:
 
@@ -286,46 +518,16 @@ reference
 advertisement
 other
 
+A genuine newspaper story with substantial independent prose
+should be classified as:
+
 article
--------
-A genuine newspaper article/story with substantial independent
-article prose.
-
-photo_caption
--------------
-Primarily a photograph, illustration, graphic, or visual with
-a caption and little or no independent article prose.
-
-reference
----------
-Primarily a page reference/pointer such as "Report on Page 2",
-"More on Page 3", or "See Page 5", without substantial
-independent article prose.
-
-advertisement
--------------
-An advertisement.
-
-other
------
-Anything else.
-
-IMPORTANT:
-A continuation marker by itself does NOT make a crop an article.
-
-If a crop contains a headline such as "WINDOWS", a photograph,
-a caption, and "Report on Page 2" but does not contain
-substantial independent article prose, classify it as
-content_type = "photo_caption".
-
-Do NOT classify based only on the continuation marker.
-Examine the complete supplied crop.
 
 ============================================================
-PART D — CONTINUATION DETECTION
+PART T — CONTINUATIONS
 ============================================================
 
-Look carefully for continuation markers such as:
+Detect explicit continuation markers such as:
 
 More on Page 3
 Continued on Page 5
@@ -336,64 +538,13 @@ Full report on Page 7
 Report on Page 2
 To be continued
 
-If a marker is visible:
+Also inspect visually clipped or edge-positioned continuation text.
 
-continuation.is_continued = true
+Resolve continuation relationships only when strong evidence exists.
 
-Record:
+Do NOT guess continuation targets.
 
-continuation.marker
-continuation.next_page
-
-If no continuation marker exists:
-
-continuation.is_continued = false
-
-continuation.marker = null
-
-continuation.next_page = null
-
-============================================================
-PART D — CONTINUATION RESOLUTION
-============================================================
-
-This request may also contain PENDING continuation
-records from previous 3-page batches.
-
-Known newspaper pages:
-
-__KNOWN_PAGES__
-
-Current pages in this request:
-
-__PAGES__
-
-Previous pending continuations:
-
-__PENDING_CONTINUATIONS__
-
-Your job is to resolve continuation relationships
-ONLY when the target page is available in the
-CURRENT request.
-
-============================================================
-CASE 1 — SAME-BATCH CONTINUATION
-============================================================
-
-Example:
-
-Page 1 article_006 says:
-
-"More on Page 3"
-
-and Page 3 is present in this request.
-
-Compare the source article against the Page 3
-article crops.
-
-Use semantic meaning, not only exact headline matching.
-
-Consider:
+Use:
 
 - headline
 - article subject
@@ -404,267 +555,46 @@ Consider:
 - events
 - topics
 - keywords
-- article text
-- story context
-- continuation marker
-- newspaper wording
+- visible text
+- context
+- continuation markers
 
-If one target article is clearly the continuation,
-return a continuation link.
+Do not use image similarity alone.
 
-============================================================
-CASE 2 — PENDING CONTINUATION FROM PREVIOUS BATCH
-============================================================
-
-A previous batch may contain:
-
-Page 1 article_007
-marker = "More on Page 7"
-next_page = 7
-
-If Page 7 is present in the CURRENT request,
-you MUST compare the previous source article
-against the Page 7 article crops.
-
-The previous source article is supplied with:
-
-1. structured metadata
-2. the ORIGINAL source article crop image
-
-The source crop image is explicitly labeled
-"PENDING SOURCE ARTICLE CROP".
-
-You MUST use the source image together with the current
-target-page article crop images when resolving the continuation.
-
-Compare both semantic and visual evidence, including:
-
-- source headline
-- source article text
-- source entities
-- source topics
-- source people
-- source organizations
-- source locations
-- source events
-- source image context
-- source image captions
-- target headline
-- target article text
-- target entities
-- target topics
-- target people
-- target organizations
-- target locations
-- target events
-- target image context
-- target image captions
-
-Do not rely on image similarity alone.
-
-Resolve the relationship if the combined evidence is strong.
+Only create a continuation link when confidence >= 0.75.
 
 ============================================================
-CASE 3 — TARGET PAGE NOT AVAILABLE
+PART U — FINAL SELF-CHECK BEFORE OUTPUT
 ============================================================
 
-If an article says:
+Before returning the JSON, verify EACH ARTICLE:
 
-"More on Page 7"
+1. Did I read the ENTIRE crop?
+2. Did I extract EVERY readable Tamil paragraph?
+3. Did I capture EVERY heading belonging to the article?
+4. Did I capture the main headline?
+5. Did I capture kicker/pre-headline/strapline when present?
+6. Did I capture the subheadline/deck when present?
+7. Did I inspect the LEFT EDGE carefully?
+8. Did I extract readable text that touches or is clipped by the left edge?
+9. Did I inspect the right, top, and bottom edges?
+10. Did I read all newspaper columns in correct order?
+11. Did I continue paragraphs across columns?
+12. Did I accidentally include a neighboring article?
+13. Did I miss small text near images?
+14. Did I miss text near the page boundary?
+15. Did I preserve Tamil script?
+16. Did I avoid translating Tamil into English?
+17. Did I avoid transliteration?
+18. Did I preserve names, places, numbers and dates?
+19. Did I keep article_text as FULL transcription rather than summary?
+20. Did I avoid inventing unreadable words?
 
-but Page 7 is NOT present in the current request,
-DO NOT guess the target article.
-
-Return a pending continuation record.
-
-Status:
-
-PENDING_EXTERNAL
-
-============================================================
-CASE 4 — TARGET PAGE AVAILABLE BUT MATCH UNCERTAIN
-============================================================
-
-If the target page is present but you cannot confidently
-identify the continuation article:
-
-DO NOT guess.
-
-Return:
-
-status = UNRESOLVED
-
-This is different from PENDING_EXTERNAL.
-
-PENDING_EXTERNAL means:
-
-the target page has not been processed yet.
-
-UNRESOLVED means:
-
-the target page is available but the match is uncertain.
+If any meaningful readable article text or heading was omitted,
+go back and re-read the crop before producing the final JSON.
 
 ============================================================
-CONTINUATION LINK RULES
-============================================================
-
-Every continuation link must contain:
-
-source_page
-source_article_id
-target_page
-target_article_id
-confidence
-reason
-
-Only use article IDs that actually exist.
-
-Never invent target IDs.
-
-Never invent pages.
-
-Never merge unrelated articles.
-
-One target article should not be assigned as the
-continuation of two different source articles.
-
-An article MAY be both:
-
-- the target of an earlier continuation
-- and the source of a later continuation
-
-because an article can continue across multiple pages.
-
-============================================================
-CONTINUATION CONTENT-TYPE RULE
-============================================================
-
-A continuation link is valid ONLY when:
-
-1. target.content_type == "article"
-2. source.content_type == "article" OR source.content_type is "photo_caption"/"reference" WITH an explicit continuation marker pointing to the target page
-3. source and target discuss the same underlying story
-4. semantic evidence is strong
-5. confidence >= 0.75
-
-The following can NEVER be continuation targets:
-- photo_caption
-- reference
-- advertisement
-- other
-
-A photo_caption/reference MAY be a continuation SOURCE only when it contains
-an explicit marker such as "Report on Page 2", "More on Page 3", or "See Page 5".
-Keep the source's original content_type. Do NOT change it to article.
-A continuation marker alone is NOT sufficient evidence; semantic evidence
-must still connect the source crop to the target article.
-
-============================================================
-CONFIDENCE
-============================================================
-
-Use:
-
-0.90 - 1.00
-Very strong match
-
-0.75 - 0.89
-Strong match
-
-0.60 - 0.74
-Possible but uncertain
-
-Below 0.60
-Do NOT merge
-
-Only return a MERGED continuation link when
-the evidence is strong.
-
-============================================================
-IMPORTANT EXAMPLE
-============================================================
-
-Source:
-
-"SC asks UP SIT to submit report on donation probe"
-
-Target:
-
-"Submit status report: SC to SIT probing Mandir 'theft'"
-
-These may have different headlines but can still be
-the same story.
-
-Use semantic evidence.
-
-Another example:
-
-Source:
-
-"Srinagar put under partial lockdown on Martyrs' Day"
-
-Target:
-
-"Lockdown in Srinagar imposed to block Martyrs' Day marches"
-
-These should be recognized as the same story when
-the surrounding evidence confirms the relationship.
-
-============================================================
-DO NOT FORCE WEAK MATCHES
-============================================================
-
-A continuation marker is NOT sufficient evidence.
-
-Before creating a continuation link, verify:
-target.content_type == "article"
-source.content_type == "article" OR source.content_type in {"photo_caption", "reference"} with an explicit page marker
-semantic_match == strong
-confidence >= 0.75
-
-IMPORTANT EXAMPLE:
-Source: "WINDOWS"
-content_type = "photo_caption"
-Target: "Atishi joins protest by CJP..."
-
-If the source contains an explicit marker such as "Report on Page 2",
-KEEP source.content_type = "photo_caption" but allow it as a continuation
-SOURCE. Compare its visible caption/text/entities/topics/keywords with the
-real article targets on Page 2.
-
-Create the continuation link ONLY when the semantic evidence strongly
-identifies the Page 2 article as the same underlying story.
-
-Do NOT change the crop boundary.
-Do NOT change the source article_id.
-Do NOT change the source content_type.
-Do NOT use the marker alone as proof.
-
-If semantic evidence is insufficient:
-
-UNRESOLVED.
-
-============================================================
-PENDING OUTPUT
-============================================================
-
-For every continuation whose target page is not
-available in the current request, return:
-
-{
-    "status": "PENDING_EXTERNAL",
-    "source": {
-        "page": ...,
-        "article_id": ...,
-        "headline": ...,
-        "content_type": "article" | "photo_caption" | "reference"
-    },
-    "target_page": ...,
-    "marker": ...
-}
-
-============================================================
-OUTPUT
+PART V — OUTPUT
 ============================================================
 
 Return ONLY valid JSON.
@@ -676,10 +606,6 @@ The JSON structure must contain:
     "continuation_links": [...],
     "pending_continuations": [...]
 }
-
-============================================================
-ARTICLE OUTPUT
-============================================================
 
 Every article object MUST contain:
 
@@ -706,29 +632,40 @@ quality
 FINAL RULES
 ============================================================
 
-Do NOT invent articles.
+COMPLETE TRANSCRIPTION IS MORE IMPORTANT THAN BREVITY.
 
-Do NOT invent article IDs.
+Read the newspaper like a human editor reading the FULL story.
 
-Do NOT renumber article IDs.
+Extract ALL readable Tamil article text.
 
-Do NOT merge separate verified crops during extraction.
+Extract ALL article headings.
 
-Do NOT change boundaries.
+Pay special attention to the LEFT PAGE EDGE and
+partially clipped/cutout text.
 
-Do NOT use OCR.
+Keep Tamil in Tamil script.
 
-Do NOT use page-level OCR.
+Never translate Tamil into English.
 
-Do NOT guess continuation targets.
+Never transliterate Tamil.
 
-NEVER create a continuation link or pending continuation
-for a TARGET whose content_type is not "article".
-A source with content_type "photo_caption" or "reference" is allowed ONLY
-when it has an explicit continuation marker with a target page and the
-semantic evidence strongly matches a real article target.
+Never summarize article_text.
 
-Use semantic reasoning for continuation matching.
+Never omit readable paragraphs.
+
+Never omit readable headings.
+
+Never ignore readable left-edge text.
+
+Never invent unreadable content.
+
+Never mix neighboring articles.
+
+Never change the verified crop boundary.
+
+Never invent article IDs.
+
+Never create additional articles.
 
 Return JSON only.
 """.strip()

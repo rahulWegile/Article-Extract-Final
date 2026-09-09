@@ -1,85 +1,74 @@
-import { useState } from "react";
-
 import { Link } from "react-router-dom";
 
-import api from "../api/api";
+const STATUS_LABELS = {
+    completed: "Completed",
+    processing: "Processing",
+    failed: "Failed",
+    pending: "Pending",
+};
 
-function DocumentCard({ document, onDeleted }) {
+function StatusPill({ status }) {
 
-    const [deleting, setDeleting] = useState(false);
-
-    const handleDelete = async () => {
-
-        const confirmed = window.confirm(
-
-            `Delete "${document.pdf_name}" (${document.document_id})? ` +
-            "This permanently removes its pages, articles, and images. " +
-            "This cannot be undone."
-
-        );
-
-        if (!confirmed) {
-            return;
-        }
-
-        setDeleting(true);
-
-        try {
-
-            await api.delete(`/documents/${document.document_id}`);
-
-            if (onDeleted) {
-
-                onDeleted(document.document_id);
-
-            }
-
-        }
-
-        catch (error) {
-
-            console.error(error);
-
-            window.alert(
-
-                "Failed to delete document: " +
-                (error.response?.data?.detail || error.message)
-
-            );
-
-            setDeleting(false);
-
-        }
-
-    };
+    const key = (status || "").toLowerCase();
+    const label = STATUS_LABELS[key] || status || "Unknown";
 
     return (
 
-        <div className="document-card">
+        <span className={`status-pill status-${key || "unknown"}`}>
 
-            <h3>
+            <span className="status-dot" aria-hidden="true" />
 
-                📄 {document.pdf_name}
+            {label}
+
+        </span>
+
+    );
+
+}
+
+function DocumentCard({ document, deleting, onRequestDelete }) {
+
+    return (
+
+        <article className="document-card">
+
+            <div className="document-card-top">
+
+                <span className="document-card-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path
+                            d="M7 3h7l5 5v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"
+                            stroke="currentColor"
+                            strokeWidth="1.5"
+                            strokeLinejoin="round"
+                        />
+                        <path d="M14 3v5h5" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+                    </svg>
+                </span>
+
+                <StatusPill status={document.status} />
+
+            </div>
+
+            <h3 className="document-card-title" title={document.pdf_name}>
+
+                {document.pdf_name}
 
             </h3>
 
-            <p>
+            <dl className="document-card-meta">
 
-                <strong>ID:</strong> {document.document_id}
+                <div className="meta-row">
+                    <dt>Document ID</dt>
+                    <dd title={document.document_id}>{document.document_id}</dd>
+                </div>
 
-            </p>
+                <div className="meta-row">
+                    <dt>Pages</dt>
+                    <dd>{document.page_count}</dd>
+                </div>
 
-            <p>
-
-                <strong>Pages:</strong> {document.page_count}
-
-            </p>
-
-            <p>
-
-                <strong>Status:</strong> {document.status}
-
-            </p>
+            </dl>
 
             <div className="document-card-actions">
 
@@ -87,7 +76,7 @@ function DocumentCard({ document, onDeleted }) {
 
                     to={`/viewer/${document.document_id}`}
 
-                    className="open-btn"
+                    className="btn btn-primary btn-sm"
 
                 >
 
@@ -99,21 +88,21 @@ function DocumentCard({ document, onDeleted }) {
 
                     type="button"
 
-                    className="delete-btn"
+                    className="btn btn-danger-ghost btn-sm"
 
-                    onClick={handleDelete}
+                    onClick={() => onRequestDelete(document)}
 
                     disabled={deleting}
 
                 >
 
-                    {deleting ? "Deleting..." : "Delete"}
+                    {deleting ? "Deleting…" : "Delete"}
 
                 </button>
 
             </div>
 
-        </div>
+        </article>
 
     );
 

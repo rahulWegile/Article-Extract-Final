@@ -145,9 +145,9 @@
         "edition_primary_token": "BENGALURU",
         "date_format_hint": "",
         "sample_source": "output\\temp\\run_96982b00151c\\pages\\page_001.png",
-        "verified": false,
+        "verified": true,
         "notes": "auto-learned from a Gemini fallback result",
-        "confirmation_count": 1
+        "confirmation_count": 3
     },
     {
         "template_id": "sambad_bhubaneswar",
@@ -184,5 +184,41 @@
         "verified": true,
         "notes": "auto-learned from a Gemini fallback result",
         "confirmation_count": 3
+    },
+    {
+        "template_id": "the_tribune_delhi",
+        "newspaper_name": "The Tribune",
+        "edition": "Delhi",
+        "language": "English",
+        "name_ocr_variants": [
+            "The Tribune"
+        ],
+        "masthead_region": [
+            0.1901008007529848,
+            0.0,
+            0.8104032030119392,
+            0.09591055729131683
+        ],
+        "date_region": [
+            0.0,
+            0.09090585551807664,
+            1.0,
+            0.11559188621393908
+        ],
+        "edition_region": [
+            0.0,
+            0.07653536411717911,
+            1.0,
+            0.10278340777807629
+        ],
+        "edition_patterns": [
+            "DELHI"
+        ],
+        "edition_primary_token": "DELHI",
+        "date_format_hint": "",
+        "sample_source": "output\\temp\\run_6d163eff5fc0\\pages\\page_001.png",
+        "verified": false,
+        "notes": "auto-learned from a Gemini fallback result",
+        "confirmation_count": 1
     }
 ]

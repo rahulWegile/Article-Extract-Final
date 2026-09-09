@@ -2,8 +2,11 @@ import json
 import os
 import time
 
+import cv2
+
 from pipeline.block_parser import parse_results
 from pipeline.sort_blocks import sort_blocks
+from pipeline.article.visual_separator import recover_missing_titles
 
 from pipeline.knowledge.block_knowledge_builder import (
     BlockKnowledgeBuilder,
@@ -61,6 +64,7 @@ def prepare_page(
     document_id,
     document_dir,
     is_rtl=False,
+    layout_confidence=None,
 ):
 
     # =====================================================
@@ -87,8 +91,15 @@ def prepare_page(
 
     stage_start = time.perf_counter()
 
+    detect_kwargs = (
+        {"conf": layout_confidence}
+        if layout_confidence is not None
+        else {}
+    )
+
     results = detector.detect(
-        page_path
+        page_path,
+        **detect_kwargs,
     )
 
     blocks = parse_results(
@@ -98,6 +109,22 @@ def prepare_page(
     print(
         f"Detected {len(blocks)} layout blocks"
     )
+
+    if is_rtl:
+
+        recovered_titles = recover_missing_titles(
+            cv2.imread(str(page_path)),
+            blocks,
+        )
+
+        if recovered_titles:
+
+            print(
+                f"Recovered {len(recovered_titles)} missing "
+                "title block(s) from page image geometry"
+            )
+
+            blocks.extend(recovered_titles)
 
     blocks = sort_blocks(
         blocks,
@@ -403,6 +430,7 @@ def finish_page(
     use_orphan_title_root_repair: bool = True,
     use_unclaimed_kicker_recovery: bool = True,
     use_unclaimed_image_recovery: bool = True,
+    use_unclaimed_footprint_recovery: bool = True,
     use_article_splitter: bool = True,
 ):
 
@@ -520,6 +548,9 @@ def finish_page(
             ),
             use_unclaimed_image_recovery=(
                 use_unclaimed_image_recovery
+            ),
+            use_unclaimed_footprint_recovery=(
+                use_unclaimed_footprint_recovery
             ),
             use_article_splitter=use_article_splitter,
         )

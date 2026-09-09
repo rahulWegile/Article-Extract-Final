@@ -1,4 +1,5 @@
 import threading
+import traceback
 from pathlib import Path
 
 import httpx
@@ -10,6 +11,10 @@ from openai import APIStatusError as OpenAIStatusError
 from backend.core.config import settings
 from backend.services.pipeline_service import PipelineService
 from backend.services import upload_jobs
+from backend.services.ai_error_messages import (
+    gemini_error_detail as _gemini_error_detail,
+    openai_error_detail as _openai_error_detail,
+)
 
 router = APIRouter()
 
@@ -19,72 +24,6 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 MAX_UPLOAD_SIZE_BYTES = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
 _UPLOAD_CHUNK_SIZE = 1024 * 1024
-
-
-def _retry_delay_seconds(exc: APIError) -> str | None:
-    """Extract Google's own suggested retryDelay (e.g. '54s') from the
-    error payload, if present, so the message we show is accurate
-    instead of a vague 'a few minutes'."""
-
-    try:
-        violations = exc.details.get("error", {}).get("details", [])
-        for item in violations:
-            if item.get("@type", "").endswith("RetryInfo"):
-                return item.get("retryDelay")
-    except Exception:
-        pass
-
-    return None
-
-
-def _gemini_error_detail(exc: APIError) -> str:
-
-    retry_delay = _retry_delay_seconds(exc)
-
-    if exc.status == "RESOURCE_EXHAUSTED":
-
-        wait_clause = f" Please retry in {retry_delay}." if retry_delay else ""
-
-        return (
-            "The Gemini API quota has been exhausted for this API key/plan "
-            f"(free-tier limits are low; e.g. 20 requests/day for some "
-            f"models).{wait_clause} Check https://ai.dev/rate-limit or "
-            "upgrade your plan if this happens often."
-        )
-
-    wait_clause = f" Please try again in {retry_delay}." if retry_delay else (
-        " Please try uploading again in a few minutes."
-    )
-
-    return f"The AI service is temporarily unavailable (high demand).{wait_clause}"
-
-
-def _openai_error_detail(exc: OpenAIStatusError) -> str:
-
-    retry_after = None
-
-    try:
-        header_value = exc.response.headers.get("retry-after")
-        if header_value:
-            retry_after = max(0.0, float(header_value))
-    except Exception:
-        retry_after = None
-
-    if exc.status_code == 429:
-
-        wait_clause = f" Please retry in {retry_after}s." if retry_after else ""
-
-        return (
-            "The OpenAI API quota/rate limit has been exhausted for this "
-            f"API key/plan.{wait_clause} Check your OpenAI usage dashboard "
-            "or upgrade your plan if this happens often."
-        )
-
-    wait_clause = f" Please try again in {retry_after}s." if retry_after else (
-        " Please try uploading again in a few minutes."
-    )
-
-    return f"The AI service is temporarily unavailable (high demand).{wait_clause}"
 
 
 @router.post("/upload")
@@ -212,6 +151,9 @@ def upload_pdf(
             )
 
         except Exception as exc:
+
+            print(f"\n[PIPELINE ERROR] Pipeline failed while processing '{file.filename}': {exc}", flush=True)
+            traceback.print_exc()
 
             upload_jobs.update_job(
                 job_id,

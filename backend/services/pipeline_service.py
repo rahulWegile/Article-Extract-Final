@@ -7,6 +7,10 @@ from pathlib import Path
 
 from backend.services.workspace_manager import WorkspaceManager
 from backend.services.document_manager import DocumentManager
+from backend.services.ai_error_messages import (
+    gemini_error_detail,
+    openai_error_detail,
+)
 
 from pipeline.render_pdf import render_pdf
 from pipeline.layout_detector import LayoutDetector
@@ -470,6 +474,38 @@ class PipelineService:
                 )
             )
 
+        # ----------------------------------------------------
+        # Language hint
+        #
+        # Urdu's Perso-Arabic script is the case most prone to
+        # silently defaulting to English (see
+        # _build_document_metadata) when masthead-based language
+        # detection is unresolved or wrong, so a filename that
+        # names Urdu outright or a known Urdu masthead is checked
+        # here as a strong, cheap signal. "siasat" covers The
+        # Siasat Daily (uploads/siasat-daily-*.pdf), a real Urdu
+        # paper whose filename contains neither "urdu" nor
+        # "inqilab"/"inquilab".
+        # ----------------------------------------------------
+
+        filename_lower = name.lower()
+
+        urdu_filename_hints = (
+            "urdu",
+            "siasat",
+            "inqilab",
+            "inquilab",
+        )
+
+        language = None
+
+        if any(
+            hint in filename_lower
+            for hint in urdu_filename_hints
+        ):
+
+            language = "Urdu"
+
         return {
             "newspaper_name":
                 newspaper_name,
@@ -479,6 +515,9 @@ class PipelineService:
 
             "publish_date":
                 publish_date,
+
+            "language":
+                language,
         }
 
     # --------------------------------------------------------
@@ -577,7 +616,32 @@ class PipelineService:
 
         if not language:
 
+            language = filename_metadata.get(
+                "language"
+            )
+
+        if not language:
+
             language = "English"
+
+        # ----------------------------------------------------
+        # Urdu filename override
+        #
+        # A filename that names Urdu outright or a known Urdu
+        # masthead (e.g. "inqilab", "siasat") is a stronger signal
+        # than a language value that is still unresolved or was
+        # misclassified as English -- Urdu's Perso-Arabic script
+        # is the case most prone to that failure. Only overrides
+        # when the resolved language isn't already Urdu, so a
+        # correct non-Urdu classification is never touched.
+        # ----------------------------------------------------
+
+        if (
+            filename_metadata.get("language") == "Urdu"
+            and resolve_language_pipeline(language).code != "urdu"
+        ):
+
+            language = "Urdu"
 
         return {
             "newspaper_name":
@@ -608,6 +672,7 @@ class PipelineService:
         gemini_status=None,
         finalization_status=None,
         database_status=None,
+        boundaries_ready=None,
     ):
         """
         Write document.json.
@@ -745,6 +810,12 @@ class PipelineService:
                 "database_import"
             ] = database_status
 
+        if boundaries_ready is not None:
+
+            document_metadata[
+                "boundaries_ready"
+            ] = boundaries_ready
+
         # ----------------------------------------------------
         # Save
         # ----------------------------------------------------
@@ -820,10 +891,23 @@ class PipelineService:
             )
         )
 
+        # Never surface the raw SDK error (a multi-line dict dump for
+        # Gemini's 429s) to the frontend -- run it through the same
+        # friendly formatter used for the upload job's status message
+        # so both surfaces agree and the operator sees plain wording.
+        if is_gemini_api_error and status_code in (429, 503):
+            message = gemini_error_detail(error)
+        elif is_openai_api_error and openai_status_code in (429, 500, 502, 503, 504):
+            message = openai_error_detail(error)
+        elif provider_unavailable:
+            message = "The AI service is temporarily unavailable. Please try uploading again in a few minutes."
+        else:
+            message = str(error)
+
         document_metadata["status"] = "failed"
         document_metadata["error"] = {
             "type": error_type_name,
-            "message": str(error),
+            "message": message,
             "transient": provider_unavailable,
             "api_status": (
                 getattr(error, "status", None) if is_gemini_api_error
@@ -1154,10 +1238,19 @@ class PipelineService:
             # rendered page catches this before OCR runs for real.
             # -------------------------------------------------
 
+            # Urdu is not one of this probe's two candidates (Latin vs
+            # Devanagari), so it must never run once Urdu is already
+            # resolved -- otherwise a Nastaliq page's Devanagari-probe
+            # confidence can false-positive and silently swap the
+            # correct UTRNet Urdu engine for the Hindi/Devanagari
+            # RapidOCR engine.
             if (
                 self.llm_provider == "local"
                 and metadata.get("metadata_source")
                 == "local_unresolved"
+                and resolve_language_pipeline(
+                    metadata.get("language", "")
+                ).code != "urdu"
             ):
 
                 detected_language = (
@@ -1442,6 +1535,27 @@ class PipelineService:
                 )
             )
 
+            # Hard ceiling on page-boundary/article-grouping LLM
+            # concurrency, applied on top of the provider-specific
+            # setting above -- too many boundary requests in flight
+            # at once was overloading the API and degrading
+            # page-boundary accuracy (missed boundaries, weak
+            # grouping decisions). Additional page-boundary requests
+            # beyond this cap simply queue on the executor below and
+            # run as soon as a slot frees up -- see
+            # PAGE_BOUNDARY_MAX_CONCURRENCY.
+            page_boundary_max_concurrency = int(
+                os.getenv(
+                    "PAGE_BOUNDARY_MAX_CONCURRENCY",
+                    "2",
+                )
+            )
+
+            gemini_concurrency = min(
+                gemini_concurrency,
+                page_boundary_max_concurrency,
+            )
+
             # OCR/prepare concurrency: RapidOCR + YOLO both release
             # the GIL during their actual compute (ONNX Runtime /
             # torch inference), so a small thread pool here gives a
@@ -1488,6 +1602,7 @@ class PipelineService:
                         document_id=document_id,
                         document_dir=document_dir,
                         is_rtl=lang_pipeline.is_rtl,
+                        layout_confidence=lang_pipeline.layout_confidence,
                     ): page_number
                     for page_number, page_path in enumerate(
                         pages,
@@ -1643,6 +1758,10 @@ class PipelineService:
                         lang_pipeline
                         .use_unclaimed_image_recovery
                     ),
+                    use_unclaimed_footprint_recovery=(
+                        lang_pipeline
+                        .use_unclaimed_footprint_recovery
+                    ),
                     use_article_splitter=(
                         lang_pipeline.use_article_splitter
                     ),
@@ -1714,6 +1833,22 @@ class PipelineService:
                     "No final article crops were created."
                 )
 
+            # -------------------------------------------------
+            # Article boundaries are now final for every page --
+            # reported as its own distinct event (rather than folded
+            # into the generic "Finalizing article crops" stage
+            # above) so the frontend can reliably show a one-time
+            # notification exactly at this point, before batching
+            # for article-level extraction begins below (STEP 12).
+            # -------------------------------------------------
+
+            _report(
+                "Article boundaries created",
+                70,
+                event="boundaries_created",
+                article_count=len(all_final_article_crops),
+            )
+
             # =================================================
             # STEP 10
             # Move Rendered Pages
@@ -1741,6 +1876,29 @@ class PipelineService:
             print(
                 "✓ Page images moved to "
                 "document storage"
+            )
+
+            # -------------------------------------------------
+            # Everything the Viewer needs to open this document
+            # (plain page images, final boundary visualizations,
+            # and per-page article crops) is now on disk, even
+            # though article-level extraction/batching (STEP 12)
+            # and finalization haven't run yet -- persist that so
+            # the frontend can let the document be opened and
+            # boundary-edited immediately, instead of waiting for
+            # `status` to reach "completed".
+            # -------------------------------------------------
+
+            self._save_document_metadata(
+                document_dir=document_dir,
+                metadata=metadata,
+                page_count=len(pages),
+                status="processing",
+                boundaries_ready=True,
+            )
+
+            print(
+                "✓ document.json marked boundaries_ready"
             )
 
             # =================================================
@@ -2345,11 +2503,12 @@ class PipelineService:
 
         except Exception as exc:
 
+            import traceback
             print()
             print("=" * 60)
             print("PIPELINE FAILED")
             print("=" * 60)
-            print(f"{type(exc).__name__}: {exc}")
+            traceback.print_exc()
             print("=" * 60)
 
             if document_dir is not None:

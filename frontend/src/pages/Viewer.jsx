@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import api from "../api/api";
@@ -7,16 +7,23 @@ import {
     TransformComponent,
 } from "react-zoom-pan-pinch";
 
+import ViewerTopBar from "../components/viewer/ViewerTopBar";
+import PageSidebar from "../components/viewer/PageSidebar";
+import CanvasToolbar from "../components/viewer/CanvasToolbar";
+import BoundaryLayer from "../components/viewer/BoundaryLayer";
+import ArticleInspector from "../components/viewer/ArticleInspector";
+import StatusBar from "../components/viewer/StatusBar";
+import ConfirmDialog from "../components/ConfirmDialog";
+import ToastStack from "../components/ToastStack";
+
+const API_BASE = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
+
 const MIN_BOX_SIZE = 10;
-
-// The image is already sized to fit the viewer at scale 1 (via
-// object-fit: contain on .boundary-image), so anything below 1 would
-// just shrink it smaller than the viewer -- there's no reason to zoom
-// out past the fit size for a single page.
 const MIN_SCALE = 1;
-
 const MAX_SCALE = 10;
 const MAX_HISTORY = 100;
+const TOAST_LIFETIME_MS = 5000;
+const DOCUMENT_STATUS_POLL_MS = 4000;
 
 function clampBox(bbox, naturalSize) {
     return {
@@ -81,12 +88,7 @@ function isBoxValid(bbox) {
 }
 
 function bboxEqual(a, b) {
-    return (
-        a.x1 === b.x1 &&
-        a.y1 === b.y1 &&
-        a.x2 === b.x2 &&
-        a.y2 === b.y2
-    );
+    return a.x1 === b.x1 && a.y1 === b.y1 && a.x2 === b.x2 && a.y2 === b.y2;
 }
 
 function toDraftItem(boundary) {
@@ -96,19 +98,13 @@ function toDraftItem(boundary) {
         bbox: { ...boundary.bbox },
         is_multi_page: boundary.is_multi_page,
         isNew: false,
-        // Precise sub-rectangles the backend gives an article whose
-        // single bbox would otherwise cross into a neighbouring
-        // article (see Article.sub_rects, pipeline side). Empty for
-        // the overwhelming majority of articles, which render as
-        // `bbox` alone exactly as before.
         sub_rects: (boundary.sub_rects || []).map((r) => ({ ...r })),
+        block_count: boundary.block_count || 0,
+        boundary_source: boundary.boundary_source || null,
+        logical_article_id: boundary.logical_article_id || null,
     };
 }
 
-// Diffs the working draft against the last-loaded-from-server state so a
-// single "Save & extract" can batch every staged create/edit/delete
-// instead of round-tripping to the backend (and re-running OpenAI
-// extraction) after every single drag.
 function diffBoundaries(original, draft) {
 
     const originalByArticleId = new Map(
@@ -141,30 +137,51 @@ function diffBoundaries(original, draft) {
 
 }
 
+function getDefaultPanelState() {
+
+    if (typeof window === "undefined") {
+        return { sidebar: true, inspector: true };
+    }
+
+    return {
+        sidebar: window.innerWidth > 1024,
+        inspector: window.innerWidth > 1280,
+    };
+
+}
+
 function Viewer() {
 
     const { documentId } = useParams();
 
     const [pageData, setPageData] = useState(null);
+    const [documentDetail, setDocumentDetail] = useState(null);
+    const [documentUuid, setDocumentUuid] = useState(null);
     const [page, setPage] = useState(1);
 
     const [originalBoundaries, setOriginalBoundaries] = useState([]);
     const [draftBoundaries, setDraftBoundaries] = useState([]);
     const [naturalSize, setNaturalSize] = useState(null);
+    const [pageBoundaryCounts, setPageBoundaryCounts] = useState({});
 
     const [addMode, setAddMode] = useState(false);
     const [editMode, setEditMode] = useState(false);
     const [selectedKey, setSelectedKey] = useState(null);
+    const [hoveredKey, setHoveredKey] = useState(null);
     const [isDragging, setIsDragging] = useState(false);
     const [canUndo, setCanUndo] = useState(false);
 
     const [saving, setSaving] = useState(false);
     const [saveProgress, setSaveProgress] = useState(null);
-    const [resultSummary, setResultSummary] = useState(null);
+    const [lastSaveHadError, setLastSaveHadError] = useState(false);
+    const [extractionResults, setExtractionResults] = useState({});
 
-    // TransformWrapper drives pan/zoom imperatively for performance and
-    // doesn't re-render its render-prop children on every change, so the
-    // slider needs its own state kept in sync via onTransform below.
+    const [confirmDialog, setConfirmDialog] = useState(null);
+    const [toasts, setToasts] = useState([]);
+
+    const [sidebarOpen, setSidebarOpen] = useState(() => getDefaultPanelState().sidebar);
+    const [inspectorOpen, setInspectorOpen] = useState(() => getDefaultPanelState().inspector);
+
     const [transform, setTransformState] = useState({
         scale: 1,
         positionX: 0,
@@ -175,6 +192,10 @@ function Viewer() {
     const dragRef = useRef(null);
     const historyRef = useRef([]);
     const newKeyCounterRef = useRef(0);
+    const transformRef = useRef(null);
+    const canvasStageRef = useRef(null);
+    const toastCounterRef = useRef(0);
+    const failedToastShownRef = useRef(false);
 
     const { creates, edits, deletes } = diffBoundaries(
         originalBoundaries,
@@ -185,6 +206,17 @@ function Viewer() {
     const navigationLocked = saving || pendingCount > 0;
 
     const editedArticleIds = new Set(edits.map((item) => item.article_id));
+
+    const dismissToast = (id) => {
+        setToasts((current) => current.filter((toast) => toast.id !== id));
+    };
+
+    const pushToast = (type, text) => {
+        toastCounterRef.current += 1;
+        const id = toastCounterRef.current;
+        setToasts((current) => [...current, { id, type, text }]);
+        setTimeout(() => dismissToast(id), TOAST_LIFETIME_MS);
+    };
 
     const toSvgPoint = (clientX, clientY) => {
 
@@ -211,38 +243,20 @@ function Viewer() {
     };
 
     const pushHistory = (snapshot) => {
-
-        historyRef.current = [
-            ...historyRef.current,
-            snapshot,
-        ].slice(-MAX_HISTORY);
-
+        historyRef.current = [...historyRef.current, snapshot].slice(-MAX_HISTORY);
         setCanUndo(true);
-
     };
 
     const loadPage = async (pageNumber) => {
-
         try {
-
-            const response = await api.get(
-                `/documents/${documentId}/page/${pageNumber}`
-            );
-
+            const response = await api.get(`/documents/${documentId}/page/${pageNumber}`);
             setPageData(response.data);
-
-        }
-
-        catch (error) {
-
+        } catch (error) {
             console.error(error);
-
         }
-
     };
 
     const loadBoundaries = async (pageNumber) => {
-
         try {
 
             const response = await api.get(
@@ -253,21 +267,111 @@ function Viewer() {
 
             setOriginalBoundaries(list);
             setDraftBoundaries(list.map(toDraftItem));
+            setPageBoundaryCounts((prev) => ({ ...prev, [pageNumber]: list.length }));
+            setDocumentUuid(response.data.document_uuid || null);
 
-        }
-
-        catch (error) {
+        } catch (error) {
 
             console.error(error);
-
             setOriginalBoundaries([]);
             setDraftBoundaries([]);
 
         }
-
     };
 
     useEffect(() => {
+
+        setPage(1);
+
+    }, [documentId]);
+
+    useEffect(() => {
+
+        setPageBoundaryCounts({});
+        setDocumentDetail(null);
+
+        let cancelled = false;
+        let pollTimer = null;
+
+        const fetchDetail = () => {
+
+            api.get(`/documents/${documentId}`)
+                .then((response) => {
+
+                    if (cancelled) {
+                        return;
+                    }
+
+                    const detail = response.data;
+
+                    setDocumentDetail(detail);
+
+                    const status = detail?.status;
+
+                    // Still being processed (no terminal status yet) --
+                    // keep checking in the background so the viewer
+                    // opens automatically the moment it's ready, instead
+                    // of the user having to manually refresh.
+                    if (status && status !== "completed" && status !== "failed") {
+                        pollTimer = setTimeout(fetchDetail, DOCUMENT_STATUS_POLL_MS);
+                    }
+
+                })
+                .catch(() => {
+                    if (!cancelled) {
+                        setDocumentDetail(null);
+                    }
+                });
+
+        };
+
+        fetchDetail();
+
+        return () => {
+            cancelled = true;
+            if (pollTimer) {
+                clearTimeout(pollTimer);
+            }
+        };
+
+    }, [documentId]);
+
+    const documentStatus = documentDetail?.status;
+
+    // Boundary editing only needs page images + article crops, both
+    // already on disk once `boundaries_ready` is set (before article
+    // extraction/batching and finalization have run) -- no need to
+    // wait for the full pipeline (`status === "completed"`) just to
+    // open and edit boundaries.
+    const documentReady =
+        documentStatus === "completed" || documentDetail?.boundaries_ready === true;
+
+    useEffect(() => {
+
+        // The failed screen itself only ever shows a generic message
+        // (see below) -- the actual reason (e.g. a provider quota/rate
+        // limit error) is surfaced as a toast instead, once per
+        // failure, rather than left permanently baked into the page.
+        if (documentStatus === "failed" && !failedToastShownRef.current) {
+            failedToastShownRef.current = true;
+            pushToast(
+                "error",
+                documentDetail?.error?.message ||
+                    "This document could not be processed."
+            );
+        }
+
+    }, [documentStatus, documentDetail]);
+
+    useEffect(() => {
+
+        // Page images and boundaries don't exist on disk until
+        // `documentReady` (see above), so fetching them any earlier
+        // just surfaces broken images/404s -- wait for it instead
+        // (see the wait/failed screens rendered below).
+        if (!documentReady) {
+            return;
+        }
 
         loadPage(page);
         loadBoundaries(page);
@@ -276,12 +380,35 @@ function Viewer() {
         setAddMode(false);
         setEditMode(false);
         setSelectedKey(null);
-        setResultSummary(null);
+        setLastSaveHadError(false);
 
         historyRef.current = [];
         setCanUndo(false);
 
-    }, [page]);
+    }, [documentId, page, documentReady]);
+
+    const handleZoomIn = useCallback(() => transformRef.current?.zoomIn(0.25), []);
+    const handleZoomOut = useCallback(() => transformRef.current?.zoomOut(0.25), []);
+    const handleResetZoom = useCallback(() => transformRef.current?.resetTransform(), []);
+
+    const handleFitWidth = useCallback(() => {
+
+        const stage = canvasStageRef.current;
+        const controls = transformRef.current;
+
+        if (!stage || !naturalSize || !controls) {
+            return;
+        }
+
+        const stageW = stage.clientWidth;
+        const stageH = stage.clientHeight;
+
+        const containScale = Math.min(stageW / naturalSize.width, stageH / naturalSize.height);
+        const widthScale = (stageW / naturalSize.width) / containScale;
+
+        controls.centerView(Math.max(MIN_SCALE, widthScale), 200);
+
+    }, [naturalSize]);
 
     const handleUndo = () => {
 
@@ -307,6 +434,10 @@ function Viewer() {
                 return;
             }
 
+            if (confirmDialog) {
+                return;
+            }
+
             const isUndoShortcut =
                 (event.ctrlKey || event.metaKey) &&
                 !event.shiftKey &&
@@ -318,6 +449,46 @@ function Viewer() {
                 return;
             }
 
+            if (!event.ctrlKey && !event.metaKey && !event.altKey) {
+
+                if (event.key === "+" || event.key === "=") {
+                    event.preventDefault();
+                    handleZoomIn();
+                    return;
+                }
+
+                if (event.key === "-" || event.key === "_") {
+                    event.preventDefault();
+                    handleZoomOut();
+                    return;
+                }
+
+                if (event.key === "0") {
+                    event.preventDefault();
+                    handleResetZoom();
+                    return;
+                }
+
+                if (event.key.toLowerCase() === "f") {
+                    event.preventDefault();
+                    handleResetZoom();
+                    return;
+                }
+
+                if (event.key.toLowerCase() === "w") {
+                    event.preventDefault();
+                    handleFitWidth();
+                    return;
+                }
+
+                if (event.key === "Escape") {
+                    setSelectedKey(null);
+                    setAddMode(false);
+                    return;
+                }
+
+            }
+
             if (navigationLocked) {
                 return;
             }
@@ -326,11 +497,7 @@ function Viewer() {
                 setPage((current) => current - 1);
             }
 
-            if (
-                event.key === "ArrowRight" &&
-                pageData &&
-                page < pageData.page_count
-            ) {
+            if (event.key === "ArrowRight" && pageData && page < pageData.page_count) {
                 setPage((current) => current + 1);
             }
 
@@ -340,7 +507,7 @@ function Viewer() {
 
         return () => window.removeEventListener("keydown", handleKeyDown);
 
-    }, [page, pageData, navigationLocked]);
+    }, [page, pageData, navigationLocked, confirmDialog, handleZoomIn, handleZoomOut, handleResetZoom, handleFitWidth]);
 
     useEffect(() => {
 
@@ -369,9 +536,7 @@ function Viewer() {
                         drag.historyPushed = true;
                     }
 
-                    const withoutDraft = prev.filter(
-                        (item) => item.key !== drag.newKey
-                    );
+                    const withoutDraft = prev.filter((item) => item.key !== drag.newKey);
 
                     return [
                         ...withoutDraft,
@@ -410,9 +575,7 @@ function Viewer() {
                         drag.historyPushed = true;
                     }
 
-                    return prev.map((item) => (
-                        item.key === drag.key ? { ...item, bbox } : item
-                    ));
+                    return prev.map((item) => (item.key === drag.key ? { ...item, bbox } : item));
 
                 });
 
@@ -427,9 +590,7 @@ function Viewer() {
                         drag.historyPushed = true;
                     }
 
-                    return prev.map((item) => (
-                        item.key === drag.key ? { ...item, bbox } : item
-                    ));
+                    return prev.map((item) => (item.key === drag.key ? { ...item, bbox } : item));
 
                 });
 
@@ -473,12 +634,10 @@ function Viewer() {
     }, [isDragging, naturalSize]);
 
     const handleImageLoad = (event) => {
-
         setNaturalSize({
             width: event.target.naturalWidth,
             height: event.target.naturalHeight,
         });
-
     };
 
     const handleBackgroundPointerDown = (event) => {
@@ -505,14 +664,14 @@ function Viewer() {
 
     const handleBoxPointerDown = (item) => (event) => {
 
-        if (!editMode || addMode || item.is_multi_page) {
-            return;
-        }
-
         event.preventDefault();
         event.stopPropagation();
 
         setSelectedKey(item.key);
+
+        if (!editMode || item.is_multi_page) {
+            return;
+        }
 
         dragRef.current = {
             type: "move",
@@ -544,43 +703,62 @@ function Viewer() {
     };
 
     const handleToggleAddMode = () => {
-
         setAddMode((current) => !current);
         setEditMode(false);
         setSelectedKey(null);
-
     };
 
     const handleToggleEditMode = () => {
-
-        setEditMode((current) => !current);
+        setEditMode((current) => {
+            const next = !current;
+            if (!next) {
+                setSelectedKey(null);
+            }
+            return next;
+        });
         setAddMode(false);
-        setSelectedKey(null);
-
     };
 
-    const handleDeleteSelected = () => {
+    const handleEditSelected = () => {
+        setEditMode(true);
+        setAddMode(false);
+    };
 
+    const handleBoxHover = (key) => setHoveredKey(key);
+    const handleBoxHoverEnd = (key) => setHoveredKey((current) => (current === key ? null : current));
+
+    const handleRequestDeleteSelected = () => {
         if (!selectedKey) {
             return;
         }
+        setConfirmDialog("delete");
+    };
+
+    const handleConfirmDelete = () => {
 
         pushHistory(draftBoundaries);
 
-        setDraftBoundaries((prev) => (
-            prev.filter((item) => item.key !== selectedKey)
-        ));
+        setDraftBoundaries((prev) => prev.filter((item) => item.key !== selectedKey));
 
         setSelectedKey(null);
+        setConfirmDialog(null);
 
     };
 
-    const handleDiscardAll = () => {
+    const handleRequestDiscard = () => {
+        if (pendingCount === 0) {
+            return;
+        }
+        setConfirmDialog("discard");
+    };
+
+    const handleConfirmDiscard = () => {
 
         setDraftBoundaries(originalBoundaries.map(toDraftItem));
         historyRef.current = [];
         setCanUndo(false);
         setSelectedKey(null);
+        setConfirmDialog(null);
 
     };
 
@@ -616,9 +794,7 @@ function Viewer() {
                     db_error: response.data.db_error,
                 });
 
-            }
-
-            catch (error) {
+            } catch (error) {
 
                 results.push({
                     article_id: item.article_id,
@@ -653,9 +829,7 @@ function Viewer() {
                     db_error: response.data.db_error,
                 });
 
-            }
-
-            catch (error) {
+            } catch (error) {
 
                 results.push({
                     article_id: item.article_id,
@@ -690,9 +864,7 @@ function Viewer() {
                     db_error: response.data.db_error,
                 });
 
-            }
-
-            catch (error) {
+            } catch (error) {
 
                 results.push({
                     article_id: null,
@@ -708,531 +880,305 @@ function Viewer() {
 
         await loadBoundaries(page);
 
+        const failed = results.filter((r) => r.error);
+        const succeeded = results.length - failed.length;
+        const dbSyncFailures = results.filter((r) => r.db_synced === false);
+
+        if (succeeded > 0) {
+            pushToast("success", `${succeeded} boundary change${succeeded === 1 ? "" : "s"} saved.`);
+        }
+
+        if (failed.length > 0) {
+            pushToast("error", `${failed.length} change${failed.length === 1 ? "" : "s"} failed: ${failed[0].error}`);
+        }
+
+        if (dbSyncFailures.length > 0) {
+            pushToast("error", `${dbSyncFailures.length} change${dbSyncFailures.length === 1 ? "" : "s"} saved but failed to sync to the database.`);
+        }
+
+        setExtractionResults((prev) => {
+
+            const next = { ...prev };
+
+            results.forEach((r) => {
+                if (r.article_id && (r.headline || r.article_text)) {
+                    next[r.article_id] = { headline: r.headline, article_text: r.article_text };
+                }
+            });
+
+            return next;
+
+        });
+
+        setLastSaveHadError(failed.length > 0);
+
         historyRef.current = [];
         setCanUndo(false);
         setSelectedKey(null);
-        setResultSummary(results);
         setSaving(false);
         setSaveProgress(null);
 
     };
 
-    if (!pageData) {
+    if (!documentDetail) {
 
         return (
-
-            <div className="viewer-loading">
-
-                <div className="viewer-spinner" />
-
-                <p>Loading page...</p>
-
+            <div className="studio-loading">
+                <div className="studio-spinner" />
+                <p>Loading document…</p>
             </div>
-
         );
 
     }
 
-    const handleSize = naturalSize
-        ? Math.max(18, naturalSize.width / 120)
-        : 20;
+    if (documentStatus === "failed" && !documentReady) {
+
+        return (
+            <div className="studio-loading">
+                <h2 className="studio-loading-title">Processing failed</h2>
+                <p className="studio-loading-detail">
+                    This document could not be processed. Try uploading it again.
+                </p>
+                <div className="studio-loading-actions">
+                    <Link to="/" className="btn btn-secondary">
+                        Back to documents
+                    </Link>
+                </div>
+                <ToastStack toasts={toasts} onDismiss={dismissToast} />
+            </div>
+        );
+
+    }
+
+    if (!documentReady) {
+
+        return (
+            <div className="studio-loading">
+                <div className="studio-spinner" />
+                <h2 className="studio-loading-title">Document under processing</h2>
+                <p className="studio-loading-detail">
+                    Please wait — this document is still being processed. It will
+                    open automatically as soon as it's ready.
+                </p>
+                <div className="studio-loading-actions">
+                    <Link to="/" className="btn btn-secondary">
+                        Back to documents
+                    </Link>
+                </div>
+            </div>
+        );
+
+    }
+
+    if (!pageData) {
+
+        return (
+            <div className="studio-loading">
+                <div className="studio-spinner" />
+                <p>Loading document…</p>
+            </div>
+        );
+
+    }
+
+    const handleSize = naturalSize ? Math.max(18, naturalSize.width / 120) : 20;
 
     const selectedItem = draftBoundaries.find((item) => item.key === selectedKey);
+    const isSelectedEdited = selectedItem ? editedArticleIds.has(selectedItem.article_id) : false;
+    const extractionResult = selectedItem && !selectedItem.isNew
+        ? extractionResults[selectedItem.article_id]
+        : null;
+
+    const saveState = saving
+        ? "saving"
+        : lastSaveHadError
+            ? "error"
+            : pendingCount > 0
+                ? "unsaved"
+                : "saved";
+
+    const scalePercent = Math.round(transform.scale * 100);
 
     return (
 
-        <div className="viewer-container">
+        <div className="studio-shell">
 
-            <div className="viewer-header">
+            <ViewerTopBar
+                pdfName={pageData.pdf_name}
+                page={page}
+                pageCount={pageData.page_count}
+                onPrevPage={() => setPage((current) => current - 1)}
+                onNextPage={() => setPage((current) => current + 1)}
+                navigationLocked={navigationLocked}
+                editMode={editMode}
+                onToggleEditMode={handleToggleEditMode}
+                addMode={addMode}
+                onToggleAddMode={handleToggleAddMode}
+                canUndo={canUndo}
+                onUndo={handleUndo}
+                pendingCount={pendingCount}
+                onDiscard={handleRequestDiscard}
+                saving={saving}
+                onSaveAll={handleSaveAll}
+                exportHref={`${API_BASE}/documents/${documentId}/export/pdf`}
+                sidebarOpen={sidebarOpen}
+                onToggleSidebar={() => setSidebarOpen((current) => !current)}
+                inspectorOpen={inspectorOpen}
+                onToggleInspector={() => setInspectorOpen((current) => !current)}
+            />
 
-                <Link
-                    to="/"
-                    className="back-button"
-                >
-                    ← Back
-                </Link>
+            <div className="studio-body">
 
-                <h2>
+                <PageSidebar
+                    collapsed={!sidebarOpen}
+                    pdfName={pageData.pdf_name}
+                    documentId={documentId}
+                    page={page}
+                    pageCount={pageData.page_count}
+                    pageBoundaryCounts={pageBoundaryCounts}
+                    navigationLocked={navigationLocked}
+                    onSelectPage={setPage}
+                    thumbBaseUrl={API_BASE}
+                />
 
-                    {pageData.pdf_name}
+                <div className="studio-canvas" ref={canvasStageRef}>
 
-                </h2>
+                    <TransformWrapper
+                        ref={transformRef}
+                        initialScale={1}
+                        minScale={MIN_SCALE}
+                        maxScale={MAX_SCALE}
+                        centerOnInit={true}
+                        centerZoomedOut={true}
+                        limitToBounds={true}
+                        wheel={{ step: 0.15, wheelDisabled: true }}
+                        trackPadPanning={{ disabled: addMode }}
+                        doubleClick={{ disabled: false }}
+                        panning={{ disabled: addMode, velocityDisabled: false }}
+                        pinch={{ disabled: false }}
+                        alignmentAnimation={{ disabled: true }}
+                        onTransform={(_ref, state) => setTransformState(state)}
+                    >
 
-                <div className="page-badge">
+                        <TransformComponent
+                            wrapperStyle={{ width: "100%", height: "100%" }}
+                            contentStyle={{
+                                width: "100%",
+                                height: "100%",
+                                display: "flex",
+                                justifyContent: "center",
+                                alignItems: "center",
+                            }}
+                        >
 
-                    Page {pageData.page} of {pageData.page_count}
+                            <div className="boundary-editor-frame">
+
+                                <img
+                                    src={`${API_BASE}${pageData.plain_image}`}
+                                    alt="Newspaper page"
+                                    className="boundary-image"
+                                    onLoad={handleImageLoad}
+                                    draggable={false}
+                                />
+
+                                {naturalSize && (
+                                    <BoundaryLayer
+                                        ref={svgRef}
+                                        naturalSize={naturalSize}
+                                        items={draftBoundaries}
+                                        selectedKey={selectedKey}
+                                        hoveredKey={hoveredKey}
+                                        addMode={addMode}
+                                        editMode={editMode}
+                                        editedArticleIds={editedArticleIds}
+                                        handleSize={handleSize}
+                                        onBackgroundPointerDown={handleBackgroundPointerDown}
+                                        onBoxPointerDown={handleBoxPointerDown}
+                                        onBoxHover={handleBoxHover}
+                                        onBoxHoverEnd={handleBoxHoverEnd}
+                                        onResizePointerDown={handleResizePointerDown}
+                                    />
+                                )}
+
+                            </div>
+
+                        </TransformComponent>
+
+                    </TransformWrapper>
+
+                    <CanvasToolbar
+                        scalePercent={scalePercent}
+                        onZoomOut={handleZoomOut}
+                        onZoomIn={handleZoomIn}
+                        onFit={handleResetZoom}
+                        onFitWidth={handleFitWidth}
+                        onReset={handleResetZoom}
+                    />
+
+                    {addMode && (
+                        <div className="studio-hint">
+                            Drag on the page to draw a new article boundary.
+                        </div>
+                    )}
+
+                    {editMode && !selectedItem && (
+                        <div className="studio-hint">
+                            Click a boundary to select it, then drag to move or use the corner handles to resize.
+                        </div>
+                    )}
 
                 </div>
 
-                <button
-                    type="button"
-                    className={
-                        "edit-boundary-toggle" + (editMode ? " active" : "")
-                    }
-                    onClick={handleToggleEditMode}
-                    title="Select and drag/resize/delete existing boundaries"
-                >
-                    {editMode ? "Done editing" : "✎ Edit boundary"}
-                </button>
-
-                <button
-                    type="button"
-                    className={
-                        "add-boundary-toggle" + (addMode ? " active" : "")
-                    }
-                    onClick={handleToggleAddMode}
-                    title="Draw a new article boundary"
-                >
-                    {addMode ? "Cancel drawing" : "+ Add boundary"}
-                </button>
-
-                <a
-                    className="save-pdf-button"
-                    href={`${import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"}/documents/${documentId}/export/pdf`}
-                    target="_blank"
-                    rel="noreferrer"
-                >
-                    Save as PDF
-                </a>
+                <ArticleInspector
+                    collapsed={!inspectorOpen}
+                    page={page}
+                    pageCount={pageData.page_count}
+                    naturalSize={naturalSize}
+                    articleCount={draftBoundaries.length}
+                    pendingCount={pendingCount}
+                    documentLanguage={documentDetail?.language}
+                    selectedItem={selectedItem}
+                    isEdited={isSelectedEdited}
+                    editMode={editMode}
+                    saving={saving}
+                    documentUuid={documentUuid}
+                    onEditBoundary={handleEditSelected}
+                    onRequestDelete={handleRequestDeleteSelected}
+                    extractionResult={extractionResult}
+                />
 
             </div>
 
-            <div className="image-container">
-
-                <TransformWrapper
-
-                    initialScale={1}
-
-                    minScale={MIN_SCALE}
-
-                    maxScale={MAX_SCALE}
-
-                    centerOnInit={true}
-
-                    centerZoomedOut={true}
-
-                    // Keeps the page from being panned completely off-screen
-                    // (into blank space) at any zoom level.
-                    limitToBounds={true}
-
-                    wheel={{
-                        step: 0.15,
-
-                        // Two-finger trackpad scroll fires the same
-                        // wheel event as a mouse wheel, so it would
-                        // zoom by default. Disable that and let
-                        // trackPadPanning below turn it into page
-                        // scrolling instead. Pinch-to-zoom (which
-                        // browsers report as ctrl+wheel) still zooms.
-                        wheelDisabled: true,
-                    }}
-
-                    trackPadPanning={{
-                        disabled: addMode,
-                    }}
-
-                    doubleClick={{
-                        disabled: false,
-                    }}
-
-                    panning={{
-                        disabled: addMode,
-                        velocityDisabled: false,
-                    }}
-
-                    pinch={{
-                        disabled: false,
-                    }}
-
-                    alignmentAnimation={{
-                        disabled: true,
-                    }}
-
-                    onTransform={(_ref, state) =>
-                        setTransformState(state)
-                    }
-
-                >
-
-                    {({ zoomIn, zoomOut, resetTransform, centerView }) => (
-
-                        <>
-
-                            <div className="zoom-toolbar">
-
-                                <button title="Zoom out" onClick={() => zoomOut()}>
-                                    −
-                                </button>
-
-                                <input
-                                    className="zoom-slider"
-                                    type="range"
-                                    title="Zoom"
-                                    min={MIN_SCALE}
-                                    max={MAX_SCALE}
-                                    step={0.1}
-                                    value={transform.scale}
-                                    onChange={(event) =>
-                                        // centerView (rather than setTransform) recomputes a
-                                        // centered position for the new scale, so the page can
-                                        // never end up scaled into a corner or off-screen after
-                                        // panning around at a different zoom level.
-                                        centerView(
-                                            Number(event.target.value),
-                                            0,
-                                        )
-                                    }
-                                />
-
-                                <button title="Zoom in" onClick={() => zoomIn()}>
-                                    +
-                                </button>
-
-                                <button title="Reset zoom" onClick={() => resetTransform()}>
-                                    Reset
-                                </button>
-
-                            </div>
-
-                            <TransformComponent
-                                wrapperStyle={{
-                                    width: "100%",
-                                    height: "100%",
-                                }}
-                                contentStyle={{
-                                    width: "100%",
-                                    height: "100%",
-                                    display: "flex",
-                                    justifyContent: "center",
-                                    alignItems: "center",
-                                }}
-                            >
-
-                                <div className="boundary-editor-frame">
-
-                                    <img
-                                        src={`${import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"}${pageData.plain_image}`}
-                                        alt="Page"
-                                        className="boundary-image"
-                                        onLoad={handleImageLoad}
-                                        draggable={false}
-                                    />
-
-                                    {naturalSize && (
-
-                                        <svg
-                                            ref={svgRef}
-                                            className={
-                                                "boundary-overlay-svg" +
-                                                (addMode ? " add-mode" : "")
-                                            }
-                                            viewBox={`0 0 ${naturalSize.width} ${naturalSize.height}`}
-                                            preserveAspectRatio="xMidYMid meet"
-                                        >
-
-                                            {addMode && (
-
-                                                <rect
-                                                    x={0}
-                                                    y={0}
-                                                    width={naturalSize.width}
-                                                    height={naturalSize.height}
-                                                    className="boundary-draw-catcher"
-                                                    onPointerDown={handleBackgroundPointerDown}
-                                                />
-
-                                            )}
-
-                                            {draftBoundaries.map((item) => {
-
-                                                const hasSubRects = item.sub_rects && item.sub_rects.length > 0;
-
-                                                const boxClassName =
-                                                    "boundary-box" +
-                                                    // (item.is_multi_page ? " multi-page" : "") +
-                                                    (!editMode || addMode ? " not-editable" : "") +
-                                                    (item.key === selectedKey ? " selected" : "") +
-                                                    (item.isNew ? " pending-new" : "") +
-                                                    (editedArticleIds.has(item.article_id) ? " pending-edited" : "");
-
-                                                return (
-
-                                                    <g key={item.key}>
-
-                                                        <rect
-                                                            x={item.bbox.x1}
-                                                            y={item.bbox.y1}
-                                                            width={item.bbox.x2 - item.bbox.x1}
-                                                            height={item.bbox.y2 - item.bbox.y1}
-                                                            className={
-                                                                boxClassName +
-                                                                // The precise pieces below carry the visible
-                                                                // fill/stroke instead -- this rect stays only
-                                                                // as the drag/select hit-target so editing
-                                                                // (which always acts on the single bbox) is
-                                                                // unaffected.
-                                                                (hasSubRects ? " boundary-box-hit-only" : "")
-                                                            }
-                                                            onPointerDown={
-                                                                editMode && !addMode && !item.is_multi_page
-                                                                    ? handleBoxPointerDown(item)
-                                                                    : undefined
-                                                            }
-                                                        >
-
-                                                            {item.is_multi_page && (
-                                                                <title>
-                                                                    Spans multiple pages — not editable here
-                                                                </title>
-                                                            )}
-
-                                                        </rect>
-
-                                                        {hasSubRects && item.sub_rects.map((r, index) => (
-
-                                                            <rect
-                                                                key={`${item.key}-sub-${index}`}
-                                                                x={r.x1}
-                                                                y={r.y1}
-                                                                width={r.x2 - r.x1}
-                                                                height={r.y2 - r.y1}
-                                                                className={boxClassName + " boundary-sub-rect"}
-                                                            />
-
-                                                        ))}
-
-                                                    </g>
-
-                                                );
-
-                                            })}
-
-                                            {editMode && selectedItem && !selectedItem.is_multi_page && (
-
-                                                ["nw", "ne", "sw", "se"].map((handle) => (
-
-                                                    <rect
-                                                        key={handle}
-                                                        x={
-                                                            (handle === "nw" || handle === "sw"
-                                                                ? selectedItem.bbox.x1
-                                                                : selectedItem.bbox.x2) - handleSize / 2
-                                                        }
-                                                        y={
-                                                            (handle === "nw" || handle === "ne"
-                                                                ? selectedItem.bbox.y1
-                                                                : selectedItem.bbox.y2) - handleSize / 2
-                                                        }
-                                                        width={handleSize}
-                                                        height={handleSize}
-                                                        className={`boundary-handle handle-${handle}`}
-                                                        onPointerDown={handleResizePointerDown(selectedItem, handle)}
-                                                    />
-
-                                                ))
-
-                                            )}
-
-                                        </svg>
-
-                                    )}
-
-                                </div>
-
-                            </TransformComponent>
-
-                        </>
-
-                    )}
-
-                </TransformWrapper>
-
-                {addMode && (
-
-                    <div className="boundary-hint">
-                        Drag on the page to draw a new article boundary.
-                    </div>
-
-                )}
-
-                {editMode && !selectedItem && (
-
-                    <div className="boundary-hint">
-                        Click a boundary to select it, then drag to move
-                        or use the corner handles to resize.
-                    </div>
-
-                )}
-
-                {editMode && selectedItem && !selectedItem.is_multi_page && (
-
-                    <div className="boundary-select-panel">
-
-                        <p className="boundary-edit-title">
-                            {selectedItem.isNew
-                                ? "New boundary"
-                                : selectedItem.article_id}
-                        </p>
-
-                        <button
-                            type="button"
-                            className="boundary-delete-button"
-                            onClick={handleDeleteSelected}
-                            disabled={saving}
-                        >
-                            Delete boundary
-                        </button>
-
-                    </div>
-
-                )}
-
-                {resultSummary && (
-
-                    <div className="boundary-result-panel">
-
-                        <div className="boundary-result-header">
-
-                            <strong>
-                                Save results
-                            </strong>
-
-                            <button
-                                type="button"
-                                className="boundary-result-close"
-                                onClick={() => setResultSummary(null)}
-                            >
-                                ×
-                            </button>
-
-                        </div>
-
-                        {resultSummary.map((result, index) => (
-
-                            <div
-                                key={`${result.article_id || "new"}-${index}`}
-                                className={
-                                    "boundary-summary-item" +
-                                    (result.error ? " failed" : "")
-                                }
-                            >
-
-                                <p className="boundary-summary-title">
-                                    {result.article_id || "(new article)"} — {result.action}
-                                </p>
-
-                                {result.error && (
-                                    <p className="boundary-summary-error">
-                                        {result.error}
-                                    </p>
-                                )}
-
-                                {result.db_synced === false && (
-                                    <p className="boundary-edit-warning">
-                                        Saved on disk, but the database sync failed
-                                        {result.db_error ? `: ${result.db_error}` : "."}
-                                    </p>
-                                )}
-
-                                {result.headline && (
-                                    <p className="boundary-result-headline">
-                                        {result.headline}
-                                    </p>
-                                )}
-
-                                {"article_text" in result && (
-                                    <p className="boundary-result-text">
-                                        {result.article_text || "(no text extracted)"}
-                                    </p>
-                                )}
-
-                            </div>
-
-                        ))}
-
-                    </div>
-
-                )}
-
-            </div>
-
-            {/* Lives outside .image-container (in normal document flow,
-                not overlaid on top of it) so it never covers part of the
-                page -- a page's last articles are often near the bottom
-                edge, right where this bar would otherwise sit. */}
-            <div className="boundary-toolbar">
-
-                <span className="boundary-pending-count">
-                    {pendingCount > 0
-                        ? `${pendingCount} unsaved change${pendingCount === 1 ? "" : "s"}`
-                        : "No unsaved changes"}
-                </span>
-
-                <button
-                    type="button"
-                    className="boundary-undo-button"
-                    onClick={handleUndo}
-                    disabled={!canUndo || saving}
-                    title="Undo (Ctrl+Z)"
-                >
-                    ↶ Undo
-                </button>
-
-                <button
-                    type="button"
-                    className="boundary-discard-button"
-                    onClick={handleDiscardAll}
-                    disabled={pendingCount === 0 || saving}
-                >
-                    Discard changes
-                </button>
-
-                <button
-                    type="button"
-                    className="boundary-save-all-button"
-                    onClick={handleSaveAll}
-                    disabled={pendingCount === 0 || saving}
-                >
-                    {saving
-                        ? `Saving ${saveProgress ? saveProgress.done : 0}/${saveProgress ? saveProgress.total : pendingCount}…`
-                        : `Save & extract (${pendingCount})`}
-                </button>
-
-            </div>
-
-            <div className="viewer-navigation">
-
-                <button
-
-                    disabled={page <= 1 || navigationLocked}
-
-                    onClick={() => setPage(page - 1)}
-
-                >
-
-                    ⬅ Previous
-
-                </button>
-
-                <span className="nav-page-indicator">
-
-                    {page} / {pageData.page_count}
-
-                </span>
-
-                <button
-
-                    disabled={page >= pageData.page_count || navigationLocked}
-
-                    onClick={() => setPage(page + 1)}
-
-                >
-
-                    Next ➡
-
-                </button>
-
-            </div>
+            <StatusBar
+                saveState={saveState}
+                pendingCount={pendingCount}
+                saveProgress={saveProgress}
+                selectedItem={selectedItem}
+                naturalSize={naturalSize}
+                scalePercent={scalePercent}
+            />
+
+            <ConfirmDialog
+                open={confirmDialog === "delete"}
+                title="Delete boundary?"
+                message={`This will remove ${selectedItem?.isNew ? "this new boundary" : selectedItem?.article_id || "this article"} from the page.`}
+                confirmLabel="Delete"
+                danger
+                onConfirm={handleConfirmDelete}
+                onCancel={() => setConfirmDialog(null)}
+            />
+
+            <ConfirmDialog
+                open={confirmDialog === "discard"}
+                title="Discard changes?"
+                message={`This will revert every unsaved add, edit, and delete on this page (${pendingCount} change${pendingCount === 1 ? "" : "s"}).`}
+                confirmLabel="Discard"
+                danger
+                onConfirm={handleConfirmDiscard}
+                onCancel={() => setConfirmDialog(null)}
+            />
+
+            <ToastStack toasts={toasts} onDismiss={dismissToast} />
 
         </div>
 
