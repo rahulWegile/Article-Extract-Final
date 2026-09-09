@@ -49,7 +49,7 @@ htmlcov/
 input/
 
 # ML models
-models/
+/models/
 *.pt
 *.pth
 *.onnx
