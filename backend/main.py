@@ -122,6 +122,7 @@ app.include_router(
 # DO NOT REMOVE.
 # ============================================================
 
+DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount(
     "/documents",
 

@@ -12,11 +12,13 @@ DOCUMENTS_DIR = OUTPUT_DIR / "documents"
 TEMP_DIR = OUTPUT_DIR / "temp"
 
 
-#
-# Uploads
-#
-
 UPLOAD_DIR = Path("uploads")
+
+# Ensure runtime directories exist
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 #
