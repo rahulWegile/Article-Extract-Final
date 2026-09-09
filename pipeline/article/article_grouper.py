@@ -674,7 +674,34 @@ class ArticleGrouper:
                 # headline sit on opposite sides of a printed rule
                 # line, but were otherwise close enough in the raw
                 # column-penalty metric to pass as a normal claim.
-                own_title_ids = [
+                #
+                # Only meaningful for a non-title candidate: the whole
+                # premise is "is this piece of content still connected
+                # to ITS OWN headline", which does not apply when
+                # `block` already IS a title/headline itself -- a
+                # multi-headline article routinely has a second,
+                # unrelated title-class block (a sub-head, a caption
+                # -style credit line) sitting far below with a photo
+                # or rule line between them, and that is completely
+                # normal layout, not evidence the FIRST headline is
+                # misattached. Confirmed on a real Marathi (Divya
+                # Marathi, doc_000186 page 2) page: headline block 36
+                # ("कळसाने झळाळले मंदिर", column 5) sat 1701px away
+                # (near-zero column overlap) from its own article's
+                # unrelated second title ("सप्तचक्रांचे प्रतीक", a
+                # photo caption 576px further down, separated by the
+                # photo itself) -- own_distance to its REAL body
+                # paragraph directly below it was a tight 1701, but
+                # this check still fired and forced it to be treated
+                # as isolated, which let a coincidental banner-pair
+                # false-match (see _is_plausible_banner_pair) steal it
+                # into a completely unrelated article two columns
+                # away.
+                block_is_title = (
+                    getattr(block, "cls", "") or ""
+                ).strip().lower() == "title"
+
+                own_title_ids = [] if block_is_title else [
                     other_id
                     for other_id in own_reference_ids
                     if (
@@ -1999,6 +2026,74 @@ class ArticleGrouper:
                 block
                 for block in unclaimed_content_blocks
                 if block.id not in recovered_footprint_ids
+            ]
+
+        # Absolute last resort: a genuinely orphaned headline (see
+        # _is_uncertain_title) that survived every recovery pass above
+        # -- no kicker/headless-article match, no unclaimed-image
+        # pairing, no footprint overlap -- still gets a boundary of
+        # its own rather than silently vanishing with only a warning.
+        #
+        # Confirmed on a real Marathi (Divya Marathi, doc_000186 page
+        # 2) page: headline block 83 ("भक्तिमय वातावरणात भाविकांचा
+        # श्रीक्षेत्र चांदवड..." ) had a real body paragraph directly
+        # beneath it that the LAYOUT DETECTOR missed entirely (a
+        # separate bug -- see
+        # pipeline/ocr/layout_gap_recovery.py's recover_missed_blocks,
+        # which now recovers it at OCR time). With no body block
+        # existing in page_json at all, none of the recovery passes
+        # above had anything to pair block 83 with, and it reached
+        # this exact point completely alone, with only a warning
+        # print and no article, boundary, or crop at all.
+        #
+        # This is intentionally the LAST thing tried, after every
+        # narrower, more specific recovery above has already had its
+        # chance -- a headline that genuinely belongs with a nearby
+        # article (a kicker, a headless article's missing title, an
+        # image's caption-title) is still reattached there first, and
+        # only a headline with no such match left standing is
+        # promoted to a lone one-block article here. Never touches or
+        # merges with an EXISTING article, so it cannot reproduce the
+        # nearest-geometry regression the general unclaimed-block
+        # auto-attach was reverted for (see the "Report unclaimed
+        # content blocks" comment above).
+        standalone_orphan_titles = [
+            block
+            for block in unclaimed_content_blocks
+            if self._is_uncertain_title(block)
+        ]
+
+        if standalone_orphan_titles:
+
+            next_article_id = (
+                max(
+                    (article.article_id for article in articles),
+                    default=0,
+                )
+                + 1
+            )
+
+            for block in standalone_orphan_titles:
+
+                articles.append(
+                    Article(
+                        article_id=next_article_id,
+                        blocks=[block],
+                        block_ids=[block.id],
+                        confidence=0.5,
+                    )
+                )
+
+                next_article_id += 1
+
+            claimed_block_ids.update(
+                block.id for block in standalone_orphan_titles
+            )
+
+            unclaimed_content_blocks = [
+                block
+                for block in unclaimed_content_blocks
+                if block not in standalone_orphan_titles
             ]
 
         print()

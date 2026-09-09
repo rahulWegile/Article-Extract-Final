@@ -1,0 +1,107 @@
+# One-command deployment: `docker compose up -d --build`.
+#
+# `${VAR:-default}` below is Compose's own variable substitution --
+# it reads from a `.env` file in this same directory (already used
+# for local dev, see .env.example) and from the shell environment,
+# independently of the backend service's `env_file:` passthrough.
+
+services:
+
+  # ================================================================
+  # DATABASE
+  # ================================================================
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-newspaper_archive}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init_db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-newspaper_archive}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ================================================================
+  # BACKEND (GPU)
+  # ================================================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+
+    # Everything else in .env.example (LLM_PROVIDER, OPENAI_MODEL,
+    # timeouts, concurrency knobs, CORS_ORIGINS, ...) passes through
+    # here so new pipeline settings don't also need a compose edit.
+    # The `environment:` block below overrides the handful of values
+    # that MUST point at the container topology rather than whatever
+    # a local-dev .env has in it.
+    env_file:
+      - .env
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-newspaper_archive}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      OCR_DEVICE: cuda
+
+    volumes:
+      - ./output:/app/output
+      - ./uploads:/app/uploads
+      - ./models:/app/models
+      - ./cache:/app/cache
+
+    # Not published to the host on purpose -- the frontend's Nginx
+    # reverse-proxies to it over the internal compose network
+    # (`http://backend:8000`), which is the single-public-URL /
+    # no-CORS point of this whole setup. Add `ports: ["8000:8000"]`
+    # here temporarily if you need to hit it directly while debugging.
+    expose:
+      - "8000"
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ================================================================
+  # FRONTEND
+  # ================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ""
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "80:80"
+
+volumes:
+  postgres_data:
