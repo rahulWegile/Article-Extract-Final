@@ -57,6 +57,7 @@ services:
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       OCR_DEVICE: cuda
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
     volumes:
       - ./output:/app/output

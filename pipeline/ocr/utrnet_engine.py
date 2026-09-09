@@ -53,7 +53,7 @@ MODEL_PATH = (
 
 VOCAB_PATH = Path(__file__).resolve().parent / "utrnet" / "UrduGlyphs.txt"
 
-BATCH_SIZE = 20
+BATCH_SIZE = 10
 
 IMG_H = 32
 IMG_W = 400
@@ -576,6 +576,9 @@ class UTRNetOCREngine:
         print(f"Non-empty results : {non_empty}")
 
         print("=" * 60)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return results
 

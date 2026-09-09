@@ -70,7 +70,7 @@ RUN set -eux; \
 
 EXPOSE 8000
 
-# 2 workers, not 4 -- each gunicorn worker loads its own copy of
-# DocLayout-YOLO/UTRNet onto the GPU, and VRAM (not CPU core count)
-# is the binding constraint once inference has moved off the CPU.
-CMD ["gunicorn", "backend.main:app", "-k", "uvicorn.workers.UvicornWorker", "--workers", "2", "--bind", "0.0.0.0:8000"]
+# 1 worker for GPU deployment -- each worker loads DocLayout-YOLO/UTRNet
+# onto the GPU (6-8 GB). On a 16GB GPU, running 2 workers causes CUDA OOM.
+CMD ["gunicorn", "backend.main:app", "-k", "uvicorn.workers.UvicornWorker", "--workers", "1", "--bind", "0.0.0.0:8000"]
+
