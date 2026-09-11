@@ -107,10 +107,11 @@ class UTRNetRecognizer:
         self.model = Model(opt)
 
         checkpoint = torch.load(
-            model_path, map_location=self.device,
+            model_path, map_location="cpu",
         )
 
         self.model.load_state_dict(checkpoint, strict=True)
+        del checkpoint
 
         self.model.to(self.device)
         self.model.eval()
@@ -167,9 +168,13 @@ class UTRNetRecognizer:
 
         batch = torch.stack(tensors, dim=0).to(self.device)
 
-        preds = self.model(batch)
+        if self.device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                preds = self.model(batch)
+        else:
+            preds = self.model(batch)
 
-        probs = torch.softmax(preds, dim=2)
+        probs = torch.softmax(preds.float(), dim=2)
 
         preds_size = torch.IntTensor(
             [preds.size(1)] * len(crops)
@@ -534,6 +539,18 @@ class UTRNetOCREngine:
             confidence_reference=confidence_reference,
             page_number=page_number,
             line_heights=line_heights,
+            # Nastaliq's connected diacritics/ligatures routinely
+            # defeat the OCR-free ink-projection band splitter this
+            # pass uses as a cheap pre-filter -- confirmed on a real
+            # page (THE INQUILAB, doc_000194 page 1): two genuine
+            # headlines at aspect 4.0 and 6.3 (below the ribbon-shape
+            # exemption) each projected to a single ink band despite
+            # being real 2+ line headlines, and were rejected before
+            # OCR ever ran. Both read back cleanly (0.92/0.95
+            # confidence, correct text) once let through with just 1
+            # band -- the confidence/char-count/digit-ratio checks
+            # are the real safety net here, same as the ribbon case.
+            min_multiline_bands=1,
         ):
 
             index = index_by_block_id.get(reclassified_block.id)
@@ -576,9 +593,6 @@ class UTRNetOCREngine:
         print(f"Non-empty results : {non_empty}")
 
         print("=" * 60)
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         return results
 

@@ -65,6 +65,10 @@ def get_documents():
         except (json.JSONDecodeError, OSError):
             continue
 
+        crop_dir = document_dir / "final_articles_crops"
+        if crop_dir.is_dir() and any(crop_dir.iterdir()):
+            metadata["boundaries_ready"] = True
+
         documents.append(metadata)
 
     return documents
@@ -97,6 +101,10 @@ def get_document(document_id: str):
     ) as f:
 
         metadata = json.load(f)
+
+    crop_dir = document_dir / "final_articles_crops"
+    if crop_dir.is_dir() and any(crop_dir.iterdir()):
+        metadata["boundaries_ready"] = True
 
     return metadata
 
@@ -132,21 +140,29 @@ def get_page(
 
         metadata = json.load(f)
 
-    image_path = (
+    boundary_image_path = (
         document_dir
         / "final"
         / f"page_{page_number:03d}_final_boundaries.png"
     )
 
-    if not image_path.exists():
-        return {
-            "error": "Page not found"
-        }
+    has_boundary_image = boundary_image_path.exists()
 
-    image_url = (
-        f"/documents/{document_id}/final/"
-        f"page_{page_number:03d}_final_boundaries.png"
-    )
+    if has_boundary_image:
+        image_url = (
+            f"/documents/{document_id}/final/"
+            f"page_{page_number:03d}_final_boundaries.png"
+        )
+    else:
+        plain_path = document_dir / "pages" / f"page_{page_number:03d}.png"
+        if not plain_path.exists():
+            return {
+                "error": "Page not found"
+            }
+        image_url = (
+            f"/documents/{document_id}/pages/"
+            f"page_{page_number:03d}.png"
+        )
 
     plain_image_url = (
         f"/documents/{document_id}/pages/"

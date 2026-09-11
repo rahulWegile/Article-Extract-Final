@@ -1,6 +1,8 @@
 import difflib
 import re
 
+from pipeline.block_parser import LayoutBlock
+
 
 class PageCleaner:
     """
@@ -62,6 +64,7 @@ class PageCleaner:
             self.detect_masthead(
                 blocks,
                 page_height,
+                page_width=page_width,
             )
 
         else:
@@ -77,6 +80,7 @@ class PageCleaner:
         self.detect_page_header(
             blocks,
             page_height,
+            page_number=page_number,
         )
 
         #
@@ -192,6 +196,12 @@ class PageCleaner:
 
         dropped = set()
 
+        carved = []
+
+        next_block_id = (
+            max((b.id for b in blocks), default=0) + 1
+        )
+
         for i, block_a in enumerate(blocks):
 
             if id(block_a) in dropped:
@@ -221,7 +231,38 @@ class PageCleaner:
                     else block_a
                 )
 
+                winner = block_a if loser is block_b else block_b
+
                 dropped.add(id(loser))
+
+                # The loser is usually just a noisier re-detection of
+                # the SAME text the winner already covers -- but when
+                # the loser's own box extends well above the winner's
+                # top edge (Block 29 enclosing Block 23, with real
+                # headline text in the gap above Block 23), that top
+                # strip is not covered by the winner at all. Dropping
+                # the loser outright would silently lose that
+                # headline, so carve the uncovered strip out as its
+                # own title block instead of discarding it with the
+                # rest.
+                if (
+                    winner.y1 - loser.y1
+                    >= self.MIN_ENCLOSURE_HEADLINE_HEIGHT
+                ):
+
+                    carved.append(
+                        LayoutBlock(
+                            id=next_block_id,
+                            cls="title",
+                            x1=loser.x1,
+                            y1=loser.y1,
+                            x2=loser.x2,
+                            y2=winner.y1,
+                            confidence=loser.confidence,
+                        )
+                    )
+
+                    next_block_id += 1
 
                 if loser is block_a:
                     break
@@ -230,13 +271,19 @@ class PageCleaner:
             block
             for block in blocks
             if id(block) not in dropped
-        ]
+        ] + carved
 
-        removed = len(blocks) - len(merged)
+        removed = len(blocks) - len(merged) + len(carved)
 
         if removed:
             print(
                 f"Duplicate Detections Merged : {removed}"
+            )
+
+        if carved:
+            print(
+                f"Headline Regions Carved From Duplicates : "
+                f"{len(carved)}"
             )
 
         return merged
@@ -259,7 +306,7 @@ class PageCleaner:
     # existing HEIGHT check alone never caught it) sat directly on
     # top of four properly-detected column blocks and was handed to
     # the LLM as if it were real content of its own.
-    MAX_TEXT_BLOCK_WIDTH_RATIO = 0.45
+    MAX_TEXT_BLOCK_WIDTH_RATIO = 0.55
 
     # A block wider than the ratio above is still legitimate when it
     # is a single-line horizontal banner headline -- confirmed real
@@ -281,6 +328,15 @@ class PageCleaner:
     # covering several real blocks at once, regardless of its own
     # width/height ratios -- the confirmed case above enclosed four.
     MIN_ENCLOSED_BLOCKS = 2
+
+    # Before discarding an enclosing blob outright, check whether it
+    # extends at least this far ABOVE the topmost block it encloses --
+    # a real headline sitting over a body block the detector also
+    # boxed separately (Block 29 enclosing Block 23, with its own
+    # headline text in the gap above Block 23's top edge). Below this
+    # height the leftover strip is just rounding/padding around the
+    # enclosed blocks, not a distinct headline worth keeping.
+    MIN_ENCLOSURE_HEADLINE_HEIGHT = 20
 
     def remove_noise(
         self,
@@ -317,6 +373,12 @@ class PageCleaner:
             )
 
         cleaned = []
+
+        next_block_id = (
+            max((b.id for b in blocks), default=0) + 1
+        )
+
+        headline_blocks_carved = 0
 
         visual_classes = {
             "object",
@@ -542,9 +604,53 @@ class PageCleaner:
 
                     enclosed.append(other)
 
-                if len(enclosed) >= self.MIN_ENCLOSED_BLOCKS:
-                    oversized_removed += 1
-                    continue
+                if enclosed:
+
+                    # Don't discard a real headline along with the
+                    # blob -- if this block extends well above the
+                    # topmost block it encloses, that leftover strip
+                    # is a plausible title region none of the enclosed
+                    # blocks cover. Carve it out as its own block
+                    # instead of dropping it with the rest.
+                    enclosed_top = min(b.y1 for b in enclosed)
+
+                    has_headline_gap = (
+                        enclosed_top - block.y1
+                        >= self.MIN_ENCLOSURE_HEADLINE_HEIGHT
+                    )
+
+                    # Normally only a blob enclosing >= 2 distinct
+                    # blocks is a confirmed detector artifact worth
+                    # discarding -- but a single enclosed block with a
+                    # real headline gap above it (Block 29 enclosing
+                    # just Block 23, with headline text in the gap) is
+                    # just as much evidence the enclosing box isn't
+                    # its own real content, so also fires with only
+                    # one enclosed block in that specific case.
+                    if (
+                        len(enclosed) >= self.MIN_ENCLOSED_BLOCKS
+                        or has_headline_gap
+                    ):
+
+                        if has_headline_gap:
+
+                            cleaned.append(
+                                LayoutBlock(
+                                    id=next_block_id,
+                                    cls="title",
+                                    x1=block.x1,
+                                    y1=block.y1,
+                                    x2=block.x2,
+                                    y2=enclosed_top,
+                                    confidence=block.confidence,
+                                )
+                            )
+
+                            next_block_id += 1
+                            headline_blocks_carved += 1
+
+                        oversized_removed += 1
+                        continue
 
             cleaned.append(
                 block
@@ -569,6 +675,12 @@ class PageCleaner:
                 f"{oversized_removed}"
             )
 
+        if headline_blocks_carved:
+            print(
+                f"Headline Regions Carved From Enclosures : "
+                f"{headline_blocks_carved}"
+            )
+
         print("=" * 60)
 
         return cleaned
@@ -581,6 +693,7 @@ class PageCleaner:
         self,
         blocks,
         page_height,
+        page_width=None,
     ):
 
         mastheads = [
@@ -591,6 +704,8 @@ class PageCleaner:
             "HINDUSTAN TIMES",
             "THE TELEGRAPH",
             "DECCAN CHRONICLE",
+            "SIASAT",
+            "INQUILAB",
         ]
 
         # Devanagari has no case, so these are matched against the
@@ -607,6 +722,13 @@ class PageCleaner:
             "जनसत्ता",
             "नई दुनिया",
             "पत्रिका",
+        ]
+
+        # Urdu has no case either, so these are matched against the
+        # raw text, same as the Devanagari names above.
+        mastheads_urdu = [
+            "سیاست",
+            "انقلاب",
         ]
 
         top_limit = page_height * 0.12
@@ -645,16 +767,50 @@ class PageCleaner:
             # Masthead must be near top.
             #
 
-            if block.y2 > top_limit:
-                continue
+            matched_name = False
 
-            if any(
-                name in text
-                for name in mastheads
-            ) or any(
-                name in raw_text
-                for name in mastheads_devanagari
+            if block.y2 <= top_limit:
+
+                if any(
+                    name in text
+                    for name in mastheads
+                ) or any(
+                    name in raw_text
+                    for name in mastheads_devanagari
+                ) or any(
+                    name in raw_text
+                    for name in mastheads_urdu
+                ):
+
+                    matched_name = True
+
+            #
+            # Pure geometric fallback.
+            #
+            # A block sitting right at the top of the page and
+            # spanning almost the full page width is a masthead
+            # banner even when OCR found no text -- e.g. artistic
+            # logo banners like The Siasat Daily, which the layout
+            # detector boxes as a "figure" with an empty OCR string.
+            #
+
+            geometric_match = False
+
+            if (
+                not matched_name
+                and page_width
+                and block.y1 < page_height * 0.15
             ):
+
+                block_width = (
+                    block.x2 - block.x1
+                )
+
+                if block_width >= 0.75 * page_width:
+
+                    geometric_match = True
+
+            if matched_name or geometric_match:
 
                 block.type = "masthead"
 
@@ -676,6 +832,7 @@ class PageCleaner:
         self,
         blocks,
         page_height,
+        page_number=None,
     ):
         """
         Detect TRUE newspaper page metadata/header blocks.
@@ -758,6 +915,38 @@ class PageCleaner:
             "दिसम्बर",
         ]
 
+        # Urdu equivalents. Urdu script has no case either, so these
+        # are matched against the raw text, same as Devanagari above.
+        keywords_urdu = [
+            "چہارشنبہ",
+            "پنجشنبہ",
+            "جمعہ",
+            "ہفتہ",
+            "اتوار",
+            "پیر",
+            "منگل",
+            "بدھ",
+            "جمعرات",
+
+            "قیمت",
+            "جلد",
+            "شمارہ",
+            "صفحہ",
+
+            "جنوری",
+            "فروری",
+            "مارچ",
+            "اپریل",
+            "مئی",
+            "جون",
+            "جولائی",
+            "اگست",
+            "ستمبر",
+            "اکتوبر",
+            "نومبر",
+            "دسمبر",
+        ]
+
         top_limit = page_height * 0.15
 
         detected = 0
@@ -805,6 +994,14 @@ class PageCleaner:
             r"पृष्ठ\s+\d+",
             r"अंक\s*\d+",
             r"वर्ष\s*\d+",
+        ]
+
+        # Urdu equivalents (checked against the raw text).
+        metadata_patterns_urdu = [
+            r"قیمت\s*[:₹]?\s*\d+",
+            r"جلد\s*\d+",
+            r"شمارہ\s*\d+",
+            r"صفحہ\s+\d+",
         ]
 
         #
@@ -874,6 +1071,30 @@ class PageCleaner:
             re.VERBOSE,
         )
 
+        # Urdu equivalent (day and/or month name, optionally followed
+        # by a day number and/or year). Urdu script has no case, so
+        # this is matched against the raw text, not upper().
+        standalone_day_or_date_urdu = re.compile(
+            r"""
+            ^
+            \s*
+            (
+                چہارشنبہ|پنجشنبہ|جمعہ|ہفتہ|اتوار|پیر|منگل|بدھ|جمعرات|
+                جنوری|فروری|مارچ|اپریل|مئی|جون|
+                جولائی|اگست|ستمبر|اکتوبر|نومبر|دسمبر
+            )
+            (
+                \s+\d{1,2}
+            )?
+            (
+                \s*,?\s+\d{4}
+            )?
+            \s*
+            $
+            """,
+            re.VERBOSE,
+        )
+
         #
         # Article-like indicators.
         #
@@ -916,6 +1137,47 @@ class PageCleaner:
                 False,
             ):
                 continue
+
+            #
+            # Pure geometric fallback.
+            #
+            # A thin horizontal strip sitting right at the top of
+            # page 1 and spanning at least half the page width is
+            # page metadata chrome (e.g. a date/edition bar) even
+            # without OCR text or a keyword match.
+            #
+
+            if (
+                page_number is None
+                or page_number == 1
+            ) and block.y1 < page_height * 0.16:
+
+                strip_height = max(
+                    1,
+                    block.y2 - block.y1,
+                )
+
+                strip_width = max(
+                    1,
+                    block.x2 - block.x1,
+                )
+
+                if (
+                    strip_width
+                    >= 0.50 * estimated_page_width
+                    and strip_height
+                    <= page_height * 0.05
+                ):
+
+                    block.type = "page_header"
+
+                    block.is_global = True
+
+                    block.column = -1
+
+                    detected += 1
+
+                    continue
 
             text = getattr(
                 block,
@@ -1028,6 +1290,9 @@ class PageCleaner:
             ) or any(
                 word in text
                 for word in keywords_devanagari
+            ) or any(
+                word in text
+                for word in keywords_urdu
             )
 
             if not matched_keyword:
@@ -1051,6 +1316,12 @@ class PageCleaner:
                     text,
                 )
                 for pattern in metadata_patterns_devanagari
+            ) or any(
+                re.search(
+                    pattern,
+                    text,
+                )
+                for pattern in metadata_patterns_urdu
             )
 
             #
@@ -1063,6 +1334,10 @@ class PageCleaner:
                 )
             ) or bool(
                 standalone_day_or_date_devanagari.fullmatch(
+                    text
+                )
+            ) or bool(
+                standalone_day_or_date_urdu.fullmatch(
                     text
                 )
             )

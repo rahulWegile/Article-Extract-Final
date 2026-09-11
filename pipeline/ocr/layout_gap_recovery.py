@@ -1161,6 +1161,32 @@ MIN_FIGURE_BLOCK_WIDTH = 250.0
 # masthead. Nothing was up there to protect: page 2 has no masthead.
 TOP_OF_PAGE_FRACTION = 0.15
 
+# TOP_OF_PAGE_FRACTION is a crude upper CAP, not the real masthead
+# edge -- confirmed on a different real Urdu (THE INQUILAB,
+# doc_000194 page 1) document: the actual masthead + edition/price
+# banner underneath it (a near-full-page-width block at y=18-295,
+# followed by a narrower publication-info line ending at y=324) is
+# real, but the fixed 15% fraction of this page's 3004px height
+# (450px) reaches 126px past where it actually ends -- rejecting a
+# genuine lead headline ("دہلی عمارت حادثہ...", a "figure"-
+# misclassified banner at y=345-428, sitting in the exact same row
+# as an adjacent block the layout detector DID correctly label
+# "title") purely because 428 < 450.
+#
+# A real masthead/banner is reliably near-full-page-width (this is
+# also PageCleaner's own assumption for its keyword-based masthead
+# detector); an article headline below it is virtually never that
+# wide, even a two-or-three-column one. So: look for a block within
+# the fixed-fraction cap that spans at least this fraction of the
+# page's width, and if one exists, use ITS bottom edge (plus a small
+# buffer for a thin info-strip directly beneath it) as the real
+# limit instead -- strictly SHRINKING the guard's rejection zone,
+# never growing it. No wide block found (or none available -- older
+# callers that never pass `blocks` still work) falls back to the
+# original fixed fraction exactly as before.
+MASTHEAD_WIDTH_RATIO = 0.85
+MASTHEAD_LIMIT_BUFFER = 50.0
+
 
 def recover_misclassified_text_blocks(
     blocks: list,
@@ -1169,6 +1195,7 @@ def recover_misclassified_text_blocks(
     confidence_reference=None,
     page_number=None,
     line_heights=None,
+    min_multiline_bands: int = MIN_FIGURE_TEXT_LINES,
 ) -> list[tuple]:
     """
     Check every "figure"-class block for real text the layout
@@ -1190,9 +1217,24 @@ def recover_misclassified_text_blocks(
     previous absolute-only behaviour.
 
     `page_number` gates the masthead/banner position guard to page 1,
-    where a masthead actually is -- see TOP_OF_PAGE_FRACTION. None
-    (a caller that does not know its page number) applies the guard,
-    exactly as before.
+    where a masthead actually is -- see TOP_OF_PAGE_FRACTION and
+    MASTHEAD_WIDTH_RATIO. None (a caller that does not know its page
+    number) applies the guard, exactly as before.
+
+    `min_multiline_bands` overrides MIN_FIGURE_TEXT_LINES for a
+    below-ribbon-aspect block -- see its call site in
+    _split_into_line_bands's usage below. Confirmed necessary for
+    Urdu: real headlines at aspect 4.0-6.3 (below SINGLE_LINE_MIN_
+    ASPECT=8.0) read back perfectly (0.92-0.95 confidence, correct
+    text) once actually OCR'd, but Nastaliq's connected diacritics
+    and ligatures routinely fill in the blank row a Latin/Devanagari
+    line-break would leave, so the OCR-free ink-projection band
+    splitter (_split_into_line_bands) undercounts them to a single
+    band and the default 2-band floor rejects them before OCR ever
+    runs. UTRNetOCREngine passes 1 here for exactly this reason; the
+    confidence/char-count/digit-ratio checks below are what actually
+    guards against a genuine photograph either way, same reasoning
+    SINGLE_LINE_MIN_ASPECT's own docstring already gives.
     """
 
     if page_image is None:
@@ -1207,11 +1249,30 @@ def recover_misclassified_text_blocks(
         page_number is None or int(page_number) == 1
     )
 
-    top_of_page_limit = (
-        height * TOP_OF_PAGE_FRACTION
-        if apply_top_of_page_guard
-        else 0.0
-    )
+    fixed_top_of_page_limit = height * TOP_OF_PAGE_FRACTION
+
+    top_of_page_limit = 0.0
+
+    if apply_top_of_page_guard:
+
+        top_of_page_limit = fixed_top_of_page_limit
+
+        # See MASTHEAD_WIDTH_RATIO: shrink the guard to the real
+        # masthead's own measured extent when one is identifiable,
+        # rather than trusting the fixed fraction blindly.
+        masthead_bottoms = [
+            float(candidate.y2)
+            for candidate in blocks
+            if candidate.y1 < fixed_top_of_page_limit
+            and (candidate.x2 - candidate.x1) >= MASTHEAD_WIDTH_RATIO * width
+        ]
+
+        if masthead_bottoms:
+
+            top_of_page_limit = min(
+                fixed_top_of_page_limit,
+                max(masthead_bottoms) + MASTHEAD_LIMIT_BUFFER,
+            )
 
     min_confidence = _effective_confidence_floor(
         MIN_FIGURE_TEXT_CONFIDENCE,
@@ -1266,7 +1327,7 @@ def recover_misclassified_text_blocks(
         min_lines = (
             1
             if block_aspect >= SINGLE_LINE_MIN_ASPECT
-            else MIN_FIGURE_TEXT_LINES
+            else min_multiline_bands
         )
 
         # Cheap, OCR-free pre-filter -- see SAFETY check 1 above.

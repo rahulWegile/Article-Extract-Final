@@ -272,6 +272,74 @@ class ArticleGrouper:
         return cls._layout_distance(block_a, block_b)
 
     @staticmethod
+    def _has_competing_title_between(
+        block_lookup, block_a, block_b, exclude_ids=frozenset()
+    ) -> bool:
+        """
+        Whether some OTHER story's own headline sits vertically
+        between block_a and block_b, in the column they share -- a
+        column-continuity veto distinct from _has_separator_between's
+        printed-rule check: two stories stacked in the same column
+        with no rule or border between them at all still are not one
+        continuous chain if a third headline runs between them.
+
+        Pure block geometry, no page image needed -- unlike
+        _has_separator_between this never has a "cannot evaluate"
+        case, so it applies even when no image was loaded.
+
+        `exclude_ids` should carry both blocks' own current article
+        memberships: a candidate target's OWN headline sitting near
+        one end of the gap is exactly what makes it a plausible home,
+        not a competing story, and a source block's own headline is
+        irrelevant to whether IT continues into the candidate.
+
+        Confirmed necessary on a real Punjabi (Punjabi Jagran,
+        doc_000188 page 2) page: a story's own byline line sat in the
+        same narrow column, 76px below a different, already-finished
+        story's last paragraph -- geometrically the closest possible
+        match by raw distance -- with the byline's OWN headline
+        printed in between (a wide banner spanning that whole
+        column). Nothing was printed to visually separate the two
+        (no rule line), so only checking for a competing headline
+        catches it.
+        """
+
+        if block_a.y2 <= block_b.y1:
+            top, bottom = block_a, block_b
+        elif block_b.y2 <= block_a.y1:
+            top, bottom = block_b, block_a
+        else:
+            # Vertically overlapping -- no "in between" band exists.
+            return False
+
+        x_lo = max(top.x1, bottom.x1)
+        x_hi = min(top.x2, bottom.x2)
+
+        if x_hi <= x_lo:
+            # No shared column -- nothing meaningful to test.
+            return False
+
+        for other_id, other in block_lookup.items():
+
+            if other_id in exclude_ids:
+                continue
+
+            if (getattr(other, "cls", "") or "").strip().lower() != "title":
+                continue
+
+            midpoint = (other.y1 + other.y2) / 2.0
+
+            if not (top.y2 <= midpoint <= bottom.y1):
+                continue
+
+            overlap = min(other.x2, x_hi) - max(other.x1, x_lo)
+
+            if overlap > 0:
+                return True
+
+        return False
+
+    @staticmethod
     def _has_separator_between(page_image, block_a, block_b) -> bool:
         """
         Whether a printed rule line or colored border sits between
@@ -308,10 +376,38 @@ class ArticleGrouper:
                 else (block_b, block_a)
             )
 
-            if has_visual_separator(
+            # Scan only the column the two blocks actually share, not
+            # the union of their widths. A multi-column headline
+            # paired with a narrower single-column body block below
+            # it (the common case this runs on) would otherwise sweep
+            # a totally unrelated neighboring column's own box border
+            # into the scan and misreport it as a separator between
+            # the two -- confirmed on a real Punjabi (Punjabi Jagran,
+            # doc_000188 page 2) page: a two-column-wide headline
+            # ("ਮਿਸ਼ਨ ਕਲੀਨ ਪੰਜਾਬ...") paired with its own single-column
+            # body paragraph below picked up the neighboring infobox's
+            # border, which sat inside the union band but outside the
+            # body block's actual column -- wrongly vetoing the
+            # ORPHAN_ISOLATION_FLOOR trust-the-claim shortcut and
+            # letting a later pass sweep that paragraph into an
+            # unrelated story two rows down.
+            #
+            # When the two blocks share no horizontal band at all
+            # (diagonally offset -- e.g. a title in one column paired
+            # with a block several columns over), there is no shared
+            # column left to probe: skip the check rather than guess
+            # at a substitute band. Confirmed necessary on the same
+            # page: falling back to either block's own width there
+            # picked up an unrelated box's internal title-rule (real
+            # print styling, but not something separating that box
+            # from a block outside it) as a false positive.
+            x_lo = max(top.x1, bottom.x1)
+            x_hi = min(top.x2, bottom.x2)
+
+            if x_hi > x_lo and has_visual_separator(
                 page_image,
-                min(top.x1, bottom.x1),
-                max(top.x2, bottom.x2),
+                x_lo,
+                x_hi,
                 top.y2,
                 bottom.y1,
             ):
@@ -701,6 +797,26 @@ class ArticleGrouper:
                     getattr(block, "cls", "") or ""
                 ).strip().lower() == "title"
 
+                # Also requires the title to be no farther than
+                # own_distance's own reference point -- a title on
+                # the OTHER side of the article from the block's real,
+                # unseparated neighbor is not a rival explanation for
+                # where this block belongs, it is simply a different,
+                # more distant part of the same multi-section article.
+                # Confirmed necessary on a real Punjabi (Punjabi
+                # Jagran, doc_000188 page 2) page: a 16-block front-
+                # page package with five title-class sub-heads had a
+                # body paragraph whose true nearest sibling sat a
+                # legitimately close 52532 (well under
+                # ORPHAN_ISOLATION_FLOOR), yet EVERY one of the five
+                # sub-heads registered a printed separator against it
+                # (real internal section rules within its own multi-
+                # part story) at distances of 80000+ -- unconditionally
+                # overriding the trust-the-claim shortcut on the
+                # strength of a far less relevant reference than the
+                # one that already vouches for the claim, and handing
+                # the paragraph to a genuinely unrelated next-door
+                # story it happened to sit near.
                 own_title_ids = [] if block_is_title else [
                     other_id
                     for other_id in own_reference_ids
@@ -708,6 +824,10 @@ class ArticleGrouper:
                         getattr(block_lookup[other_id], "cls", "")
                         or ""
                     ).strip().lower() == "title"
+                    and cls._reassignment_distance(
+                        block,
+                        block_lookup[other_id],
+                    ) <= own_distance
                 ]
 
                 separated_from_own_title = any(
@@ -763,6 +883,25 @@ class ArticleGrouper:
                         page_image,
                         block,
                         block_lookup[nearest_id],
+                    ):
+                        continue
+
+                    # Same hard-veto treatment for a competing
+                    # headline sitting between the two, even when
+                    # nothing is printed to mark it -- see
+                    # _has_competing_title_between. Only the
+                    # CANDIDATE's own headline(s) are excluded (that
+                    # is what makes it a plausible single target, not
+                    # a competing story). The block's OWN current
+                    # article's headline is deliberately NOT excluded
+                    # here: finding it in the gap is exactly the
+                    # evidence the block should stay put, not proof
+                    # the gap is clear.
+                    if cls._has_competing_title_between(
+                        block_lookup,
+                        block,
+                        block_lookup[nearest_id],
+                        exclude_ids=set(candidate_ids),
                     ):
                         continue
 

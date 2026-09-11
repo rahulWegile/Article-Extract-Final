@@ -627,6 +627,9 @@ def finish_page(
             page_number=page_number,
             boundaries=boundaries,
             page_image_path=page_path,
+            page_json_path=str(
+                json_path
+            ),
         )
     )
 

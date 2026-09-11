@@ -617,6 +617,9 @@ def _find_logical_article(
 
         for part in logical.get("source_parts") or []:
 
+            if not isinstance(part, dict):
+                continue
+
             if (
                 str(part.get("article_id")) == str(article_id)
                 and int(part.get("page", -1)) == page_number
@@ -644,6 +647,9 @@ def _multi_page_article_ids(
             continue
 
         for part in source_parts:
+
+            if not isinstance(part, dict):
+                continue
 
             if int(part.get("page", -1)) == page_number:
                 ids.add(str(part.get("article_id")))

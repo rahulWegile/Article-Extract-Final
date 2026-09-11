@@ -21,6 +21,7 @@ does that anyway; rounding explicitly here avoids its warning on
 every single call.
 """
 
+import threading
 from pathlib import Path
 
 from ultralytics import YOLO
@@ -80,6 +81,21 @@ class UrduLineDetector:
 
         self.model = YOLO(str(self.model_path))
 
+        # A page's OCR-eligible blocks are detected concurrently
+        # across pages (backend/services/pipeline_service.py's
+        # prepare_executor, OCR_PAGE_CONCURRENCY threads sharing this
+        # SAME UrduLineDetector instance for the whole document) --
+        # Ultralytics YOLO is not safe to call predict() on from more
+        # than one thread at a time against the same model instance,
+        # for exactly the reason pipeline/layout_detector.py's own
+        # lock exists (its comment has the confirmed repro: concurrent
+        # predict() calls came back with 0 blocks each). Same fix
+        # here: a plain lock around the predict() call, serializing
+        # only the GPU/CPU inference itself -- this does NOT change
+        # detect_lines()'s own single-crop inference in any way, only
+        # when two threads may enter it at once.
+        self._lock = threading.Lock()
+
         print("Urdu line detector loaded")
 
     def detect_lines(self, crop):
@@ -102,23 +118,24 @@ class UrduLineDetector:
 
         imgsz = _round_imgsz(max(height, width))
 
-        results = self.model.predict(
-            source=crop,
-            conf=self.confidence,
-            imgsz=imgsz,
-            # Ultralytics defaults max_det to 300 -- fine for a
-            # normal paragraph/headline block, but a layout
-            # misclassification that merges a whole dense column
-            # into one "plain text" block could plausibly exceed
-            # that and silently drop lines past the 300th. Raised
-            # to match the same fix applied upstream (colleague's
-            # urdu-text-detection, which runs this model per whole
-            # PAGE rather than per block and hits this far more
-            # easily).
-            max_det=1000,
-            device=self.device,
-            verbose=False,
-        )
+        with self._lock:
+            results = self.model.predict(
+                source=crop,
+                conf=self.confidence,
+                imgsz=imgsz,
+                # Ultralytics defaults max_det to 300 -- fine for a
+                # normal paragraph/headline block, but a layout
+                # misclassification that merges a whole dense column
+                # into one "plain text" block could plausibly exceed
+                # that and silently drop lines past the 300th. Raised
+                # to match the same fix applied upstream (colleague's
+                # urdu-text-detection, which runs this model per whole
+                # PAGE rather than per block and hits this far more
+                # easily).
+                max_det=1000,
+                device=self.device,
+                verbose=False,
+            )
 
         result = results[0]
 

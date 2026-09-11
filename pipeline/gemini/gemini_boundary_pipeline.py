@@ -11,6 +11,7 @@ from pipeline.article.article_grouper import (
 )
 
 from pipeline.article.article_splitter import (
+    detach_wide_top_banner_blocks,
     drop_distant_orphan_blocks,
     split_oversized_articles,
 )
@@ -21,6 +22,10 @@ from pipeline.article.dropped_article_recovery import (
 
 from pipeline.article.headless_headline_relink import (
     relink_headless_headlines,
+)
+
+from pipeline.article.sidebox_absorption import (
+    absorb_composite_sideboxes,
 )
 
 from pipeline.article.boundary_decomposer import (
@@ -107,8 +112,10 @@ class GeminiBoundaryPipeline:
         use_unclaimed_image_recovery: bool = True,
         use_unclaimed_footprint_recovery: bool = True,
         use_article_splitter: bool = True,
+        use_wide_top_banner_detachment: bool = True,
         use_dropped_article_recovery: bool = True,
         use_headless_headline_relink: bool = True,
+        use_sidebox_absorption: bool = True,
         use_boundary_decomposition: bool = True,
     ):
 
@@ -157,6 +164,12 @@ class GeminiBoundaryPipeline:
         # reassignment's hard-separator veto (ArticleGrouper.build,
         # see _has_separator_between) now needs it too, not just the
         # splitter/recovery passes that used to be the only consumers.
+        # Sidebox absorption's own hard-separator veto (see
+        # sidebox_absorption.py) is the same probe again, applied to a
+        # different pair of blocks -- it works fine without a page
+        # image (every OTHER guard there is pure geometry), so it is
+        # included here only to give that one extra check a page image
+        # to use when everything else already loaded one anyway.
         #
         # Only these passes probe page pixels, so a language with all
         # of them switched off never pays for decoding a
@@ -167,6 +180,7 @@ class GeminiBoundaryPipeline:
             use_orphan_block_reassignment
             or use_article_splitter
             or use_dropped_article_recovery
+            or use_sidebox_absorption
         ):
 
             try:
@@ -289,6 +303,33 @@ class GeminiBoundaryPipeline:
             articles = drop_distant_orphan_blocks(articles)
 
         #
+        # A masthead/banner block PageCleaner failed to flag as
+        # global chrome can still get pulled into a real story when
+        # it sits directly above that story's own narrow column
+        # blocks -- the article's bounding rectangle then stretches
+        # to the banner's near-full-page width even though the real
+        # content underneath stays in one or two narrow columns. See
+        # WIDE TOP BANNER DETACHMENT in article_splitter.py.
+        #
+        # Runs after the splitter/distant-orphan passes above (so it
+        # acts on membership those have already settled) and before
+        # decomposition below, for the same reason as the other
+        # passes in this sequence.
+        #
+
+        if use_wide_top_banner_detachment:
+
+            page_width_estimate = max(
+                (block.x2 for block in blocks),
+                default=0.0,
+            )
+
+            articles = detach_wide_top_banner_blocks(
+                articles,
+                page_width=page_width_estimate,
+            )
+
+        #
         # Re-link a headline a DIFFERENT article claims back to a
         # headless neighbour it actually sits directly above -- a
         # narrower, more targeted case than the general orphan-block
@@ -307,6 +348,25 @@ class GeminiBoundaryPipeline:
         if use_headless_headline_relink:
 
             articles = relink_headless_headlines(articles)
+
+        #
+        # Fold a small callout/sidebar article (a pull-quote panel, a
+        # boxed reactions strip) that the model gave its own complete
+        # article into the dominant, plain story it actually belongs
+        # to -- see sidebox_absorption.py for the full geometric-
+        # safety writeup (why this only ever fires on a narrow,
+        # corpus-validated shape).
+        #
+        # Runs after the splitter/relink passes above (so it acts on
+        # membership those have already settled) and before
+        # decomposition below (so a newly-absorbed satellite is
+        # already part of its parent by the time rectangles are
+        # checked for enclosing content they do not own).
+        #
+
+        if use_sidebox_absorption:
+
+            articles = absorb_composite_sideboxes(articles, page_image)
 
         #
         # Re-cut any article whose min/max RECTANGLE encloses content

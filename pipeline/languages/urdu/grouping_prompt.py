@@ -584,6 +584,12 @@ it belongs to the same article.
 STRICT ARTICLE SEPARATION
 =========================================================
 
+CRITICAL: Do NOT group the newspaper name banner, top masthead
+logo, or publication date/edition bar into any article. Each
+article must strictly begin with its own headline, and distinct
+articles stacked in the same column must NEVER be merged together
+into one article.
+
 =========================================================
 IMAGE-ONLY ARTICLE REJECTION
 =========================================================

@@ -230,6 +230,10 @@ function UploadCard({ onUploadSuccess, onNotify, onBoundariesCreated }) {
 
             onNotify?.("error", `Upload failed: ${error.message || error}`);
 
+            if (onUploadSuccess) {
+                onUploadSuccess();
+            }
+
         } finally {
 
             if (pollTimer) {

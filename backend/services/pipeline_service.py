@@ -57,6 +57,8 @@ from pipeline.database.import_final_articles import (
     import_document_directory,
 )
 
+from backend.services.urdu_pipeline_service import UrduPipelineService
+
 
 class PipelineService:
     """
@@ -150,10 +152,12 @@ class PipelineService:
         print("=" * 60)
 
         # =====================================================
-        # Layout Detector
+        # Layout Detector (lazy -- see the `detector` property
+        # below; skips loading DocLayout-YOLO into VRAM for
+        # documents that route to a dedicated pipeline, e.g. Urdu)
         # =====================================================
 
-        self.detector = LayoutDetector()
+        self._detector = None
 
         # =====================================================
         # RapidOCR
@@ -172,8 +176,13 @@ class PipelineService:
         # instead of EnglishPipeline.ocr_engine_factory building a
         # second, redundant one.
         self._ocr_engine_cache = {
-            
+
         }
+
+        # Lazily constructed on the first Urdu document -- avoids
+        # loading yolov8m_UrduDoc.pt/UTRNet on every process start for
+        # documents that never turn out to be Urdu.
+        self._urdu_pipeline_service = None
 
         # =====================================================
         # Newspaper Metadata Client
@@ -224,6 +233,12 @@ class PipelineService:
             "✓ Local Masthead Extractor Loaded "
             f"({len(self.local_masthead_extractor.templates)} templates)"
         )
+
+    @property
+    def detector(self):
+        if self._detector is None:
+            self._detector = LayoutDetector()
+        return self._detector
 
     def _detect_script_locally(self, page_image_path):
         """
@@ -916,6 +931,10 @@ class PipelineService:
             ),
         }
 
+        crop_dir = document_dir / "final_articles_crops"
+        if crop_dir.is_dir() and any(crop_dir.iterdir()):
+            document_metadata["boundaries_ready"] = True
+
         with open(metadata_file, "w", encoding="utf-8") as f:
             json.dump(document_metadata, f, indent=4, ensure_ascii=False)
 
@@ -1279,6 +1298,79 @@ class PipelineService:
             lang_pipeline = resolve_language_pipeline(
                 metadata.get("language", "")
             )
+
+            # -------------------------------------------------
+            # URDU: dedicated pipeline.
+            #
+            # Bypasses DocLayout-YOLO/PageCleaner/article_splitter/
+            # sidebox_absorption entirely -- yolov8m_UrduDoc.pt
+            # detects raw text regions directly, UTRNet reads them,
+            # and a single Gemini call groups OCR region ids into
+            # articles (Gemini never sees or returns pixel
+            # coordinates). See backend/services/
+            # urdu_pipeline_service.py.
+            # -------------------------------------------------
+
+            if lang_pipeline.code == "urdu":
+
+                document = DocumentManager().create_document(pdf_path)
+                document_id = document["document_id"]
+                document_dir = Path(document["document_dir"])
+
+                _report("Document created", 10, document_id=document_id)
+
+                self._save_document_metadata(
+                    document_dir=document_dir,
+                    metadata=metadata,
+                    page_count=len(pages),
+                    status="processing",
+                )
+
+                destination_pages = document_dir / "pages"
+                if destination_pages.exists():
+                    shutil.rmtree(destination_pages)
+                shutil.move(str(workspace / "pages"), str(destination_pages))
+
+                moved_pages = [
+                    destination_pages / f"page_{index:03d}.png"
+                    for index in range(1, len(pages) + 1)
+                ]
+
+                if self._urdu_pipeline_service is None:
+                    self._urdu_pipeline_service = UrduPipelineService()
+
+                urdu_result = self._urdu_pipeline_service.process_document(
+                    document_dir=document_dir,
+                    pages=moved_pages,
+                    metadata=metadata,
+                    progress_callback=progress_callback,
+                )
+
+                final_article_crops = urdu_result.get("final_article_crops", [])
+
+                self._save_document_metadata(
+                    document_dir=document_dir,
+                    metadata=metadata,
+                    page_count=len(pages),
+                    article_count=len(final_article_crops),
+                    final_article_count=len(final_article_crops),
+                    status="completed",
+                    gemini_status="completed",
+                    finalization_status="completed",
+                    database_status="completed",
+                    boundaries_ready=True,
+                )
+
+                _report("Completed", 100, document_id=document_id, status="completed")
+
+                return {
+                    "document_id": document_id,
+                    "document_dir": document_dir,
+                    "pages": moved_pages,
+                    "metadata": metadata,
+                    "final_article_crops": final_article_crops,
+                    "status": "completed",
+                }
 
             if lang_pipeline.code not in self._ocr_engine_cache:
                 self._ocr_engine_cache[lang_pipeline.code] = (

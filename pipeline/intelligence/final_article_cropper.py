@@ -2,7 +2,39 @@ from pathlib import Path
 from typing import Any
 import json
 
-from PIL import Image
+from PIL import Image, ImageDraw
+
+
+# A foreign block's own rectangle must fall THIS much inside the
+# rectangle being cropped before it is worth masking out -- a block
+# merely clipped by the crop's edge is not evidence of anything.
+# Deliberately the same value as boundary_decomposer.py's
+# INTRUSION_INSIDE_RATIO, which already diagnoses this exact
+# geometric situation (an article's plain rectangle enclosing
+# another article's owned content) for logging; this reuses the same
+# threshold so the two stay in agreement about what counts.
+_FOREIGN_INSIDE_RATIO = 0.75
+
+# A foreign block that also heavily overlaps one of THIS crop's own
+# blocks is a duplicate detection of content this article already
+# owns, not a neighbour's content -- never mask that. Same value and
+# reasoning as boundary_decomposer.py's INTRUSION_OWN_OVERLAP_MAX.
+_FOREIGN_OWN_OVERLAP_MAX = 0.30
+
+_FOREIGN_CONTENT_CLASSES = {"title", "plain text", "figure", "figure_caption"}
+
+
+def _rect_area(rect):
+    return max(0, rect[2] - rect[0]) * max(0, rect[3] - rect[1])
+
+
+def _rect_intersection(a, b):
+    return (
+        max(a[0], b[0]),
+        max(a[1], b[1]),
+        min(a[2], b[2]),
+        min(a[3], b[3]),
+    )
 
 
 class FinalArticleCropper:
@@ -39,6 +71,23 @@ class FinalArticleCropper:
     - Does NOT expand the boundary.
     - Does NOT add padding.
     - Does NOT resize the crop.
+
+    A crop's rectangle can still geometrically enclose content owned
+    by a DIFFERENT article -- boundary_decomposer.py deliberately
+    leaves this membership/geometry alone (see its own docstring:
+    reshaping a real multi-column article's rectangle to avoid this
+    broke more than it fixed). But the crop IMAGE itself is a plain
+    pixel rectangle, so that foreign content is still visibly baked
+    into it -- confirmed on a real Urdu (THE INQUILAB, doc_000194
+    page 1) page: a boxed callout ("عمارت کا مالک...") sits inside
+    its own parent story's rectangle (the parent's blocks wrap around
+    it in an L-shape), and the parent's crop -- which the vision-
+    based article extractor reads directly, see
+    GeminiArticleExtractor -- visibly duplicates the callout's full
+    text in the corner, right where the callout's OWN separate crop
+    already has it. When `page_json_path` is given, any such foreign
+    block is white-filled out of the crop before saving -- membership
+    and every other article's own geometry are completely untouched.
     """
 
     def crop_articles(
@@ -47,6 +96,7 @@ class FinalArticleCropper:
         page_number: int,
         boundaries: list[Any],
         page_image_path=None,
+        page_json_path=None,
     ) -> list[dict]:
 
         document_dir = Path(document_dir)
@@ -82,6 +132,26 @@ class FinalArticleCropper:
         image = Image.open(
             page_path
         ).convert("RGB")
+
+        # =====================================================
+        # FOREIGN-CONTENT MASKING DATA (optional)
+        #
+        # See the class docstring. Every block, keyed by id, plus
+        # which future article_id (the SAME "article_{index:03d}"
+        # scheme the main loop below assigns) owns each one -- so a
+        # block belonging to a DIFFERENT article than the one being
+        # cropped can be white-filled out of that crop.
+        # =====================================================
+
+        blocks_by_id = {}
+        owner_of = {}
+
+        if page_json_path is not None:
+
+            blocks_by_id, owner_of = self._load_masking_data(
+                page_json_path,
+                boundaries,
+            )
 
         # =====================================================
         # PAGE OUTPUT DIRECTORY
@@ -262,7 +332,7 @@ class FinalArticleCropper:
             #
             # No padding.
             # No resizing.
-            # No modification.
+            # No geometry modification -- still exactly x1..y2.
             # =================================================
 
             crop = image.crop(
@@ -273,6 +343,25 @@ class FinalArticleCropper:
                     y2,
                 )
             )
+
+            # =================================================
+            # MASK FOREIGN CONTENT (optional)
+            #
+            # See the class docstring. Only ever paints over pixels
+            # belonging to a block a DIFFERENT article owns -- never
+            # touches this article's own content, never changes the
+            # crop's rectangle.
+            # =================================================
+
+            if blocks_by_id:
+
+                self._mask_foreign_content(
+                    crop,
+                    (x1, y1, x2, y2),
+                    article_id,
+                    blocks_by_id,
+                    owner_of,
+                )
 
             # =================================================
             # IMAGE NAME
@@ -553,3 +642,145 @@ class FinalArticleCropper:
         except Exception:
 
             return []
+
+    @staticmethod
+    def _load_masking_data(page_json_path, boundaries):
+        """
+        Loads page_json's blocks (keyed by id) and, from `boundaries`
+        themselves, which future article_id (the same
+        "article_{index:03d}" scheme the main loop assigns) owns
+        each block id. See the class docstring for why this exists.
+
+        Degrades to ({}, {}) on any failure -- masking is a purely
+        additive safety pass and must never break cropping itself,
+        same convention as _get_block_ids/_get_sub_rects above.
+        """
+
+        try:
+
+            with open(page_json_path, "r", encoding="utf-8") as f:
+                page = json.load(f)
+
+            blocks_by_id = {
+                item["id"]: item for item in page.get("blocks", [])
+            }
+
+            owner_of = {}
+
+            for index, boundary in enumerate(boundaries, start=1):
+
+                article_id = f"article_{index:03d}"
+
+                for block_id in FinalArticleCropper._get_block_ids(
+                    boundary
+                ):
+                    owner_of[block_id] = article_id
+
+            return blocks_by_id, owner_of
+
+        except Exception:
+
+            return {}, {}
+
+    @staticmethod
+    def _block_rect(item):
+        bbox = item["bbox"]
+        return (bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"])
+
+    @staticmethod
+    def _mask_foreign_content(
+        crop,
+        rect,
+        own_article_id,
+        blocks_by_id,
+        owner_of,
+    ):
+        """
+        White-fills any block a DIFFERENT article owns out of `crop`
+        (already cropped to `rect` in page-space coordinates) when
+        that block's own rectangle mostly falls inside `rect`. See
+        the class docstring for the confirmed real case this exists
+        for. Mutates `crop` in place; never touches this article's
+        own content.
+        """
+
+        x1, y1, x2, y2 = rect
+
+        own_ids = {
+            block_id
+            for block_id, article_id in owner_of.items()
+            if article_id == own_article_id
+        }
+
+        own_rects = [
+            FinalArticleCropper._block_rect(blocks_by_id[block_id])
+            for block_id in own_ids
+            if block_id in blocks_by_id
+        ]
+
+        draw = None
+
+        for block_id, item in blocks_by_id.items():
+
+            if block_id in own_ids:
+                continue
+
+            owner_id = owner_of.get(block_id)
+
+            if owner_id is None or owner_id == own_article_id:
+                # Unowned by any article, or owned by this one under
+                # a block_id mismatch -- never mask on a guess.
+                continue
+
+            if (
+                (item.get("class") or "").strip().lower()
+                not in _FOREIGN_CONTENT_CLASSES
+            ):
+                continue
+
+            block_rect = FinalArticleCropper._block_rect(item)
+
+            block_area = _rect_area(block_rect)
+
+            if block_area <= 0:
+                continue
+
+            inside_ratio = (
+                _rect_area(_rect_intersection(block_rect, rect))
+                / block_area
+            )
+
+            if inside_ratio < _FOREIGN_INSIDE_RATIO:
+                continue
+
+            own_overlap = max(
+                (
+                    _rect_area(
+                        _rect_intersection(block_rect, own_rect)
+                    )
+                    / block_area
+                    for own_rect in own_rects
+                ),
+                default=0.0,
+            )
+
+            if own_overlap > _FOREIGN_OWN_OVERLAP_MAX:
+                continue
+
+            local_rect = (
+                max(0, block_rect[0] - x1),
+                max(0, block_rect[1] - y1),
+                min(x2 - x1, block_rect[2] - x1),
+                min(y2 - y1, block_rect[3] - y1),
+            )
+
+            if (
+                local_rect[2] <= local_rect[0]
+                or local_rect[3] <= local_rect[1]
+            ):
+                continue
+
+            if draw is None:
+                draw = ImageDraw.Draw(crop)
+
+            draw.rectangle(local_rect, fill=(255, 255, 255))

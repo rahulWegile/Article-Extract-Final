@@ -1707,34 +1707,67 @@ def split_oversized_articles(
 # the page -- zero horizontal overlap between the foreign title and
 # the column the gap actually belongs to. See _foreign_title_in_gap's
 # gap_x1/gap_x2 check.
+#
+# UPDATE: a foreign TITLE is sufficient evidence but was never
+# necessary -- confirmed on a real Urdu (THE INQUILAB, doc_000194
+# page 4) page, a "continued from page 1" tag + its body paragraph
+# sat 1437px below the rest of their own article, in the same
+# column as two OTHER, already fully-grouped articles with no title
+# block of their own (headless single/multi-paragraph snippets).
+# Neither intervening article ever registered as a "foreign title in
+# the gap", so the giant span was never caught. Any real content
+# block another article already OWNS is exactly as reliable a
+# signal: a prior pass already gave that content a home, which is
+# no weaker a claim than a headline is. See _foreign_blocks_by_
+# article / _GAP_CONTENT_CLASSES.
 # ============================================================
 
 
-def _foreign_titles_by_article(articles):
+_GAP_CONTENT_CLASSES = ("title", "plain text", "figure", "figure_caption")
+
+
+def _foreign_blocks_by_article(articles):
 
     return {
         article.article_id: [
             block
             for block in article.blocks
-            if getattr(block, "cls", None) == "title"
+            if (getattr(block, "cls", None) or "") in _GAP_CONTENT_CLASSES
         ]
         for article in articles
     }
 
 
 def _foreign_title_in_gap(
-    gap_top, gap_bottom, gap_x1, gap_x2, foreign_titles
+    gap_top, gap_bottom, gap_x1, gap_x2, foreign_blocks
 ):
     """
-    Whether a foreign title's printed line physically crosses the
-    gap between two of THIS article's own blocks -- both vertically
-    (its center falls inside the gap) AND horizontally (its bbox
-    overlaps the column track those two blocks occupy, `gap_x1` to
-    `gap_x2`).
+    Whether some OTHER, already-established article's own content
+    physically crosses the gap between two of THIS article's own
+    blocks -- both vertically (its center falls inside the gap) AND
+    horizontally (its bbox overlaps the column track those two
+    blocks occupy, `gap_x1` to `gap_x2`).
 
-    The horizontal check is required. A foreign headline sitting in
-    an entirely different column can share this article's Y-range
-    by pure coincidence of newspaper layout -- confirmed on a real
+    `foreign_blocks` covers every real content-class block (title,
+    plain text, figure, figure_caption) another article already
+    owns, not just titles -- confirmed necessary on a real Urdu (THE
+    INQUILAB, doc_000194 page 4) page: article_001's own blocks
+    included a "بقیہ صفحہ اول" (continued from page 1) tag and its
+    body paragraph sitting 1437px below the rest of the article, in
+    the SAME column, with two other complete, already-grouped
+    articles (headless single/multi-paragraph snippets, no title
+    block of their own) physically occupying that column in between.
+    Restricting this check to titles alone never caught it, because
+    neither intervening article had one -- a title is sufficient
+    evidence a gap is real, but for an already-OWNED foreign block
+    (not merely unclaimed noise) it was never necessary: an article
+    a prior pass already built and gave a home to is exactly as good
+    evidence that new content starts there as its own headline would
+    be.
+
+    The horizontal check is required. A foreign block sitting in an
+    entirely different column can share this article's Y-range by
+    pure coincidence of newspaper layout -- confirmed on a real
     Gujarati page (doc_000167, page 2): a Messi-retirement headline
     in the RIGHT-hand column (x 1400-1728) had its vertical center
     land in a 7px gap between a leftmost-column (x 48-303) article's
@@ -1749,14 +1782,14 @@ def _foreign_title_in_gap(
     if gap_top >= gap_bottom:
         return False
 
-    for title in foreign_titles:
+    for block in foreign_blocks:
 
-        center = (title.y1 + title.y2) / 2.0
+        center = (block.y1 + block.y2) / 2.0
 
         if not (gap_top < center < gap_bottom):
             continue
 
-        if title.x2 <= gap_x1 or title.x1 >= gap_x2:
+        if block.x2 <= gap_x1 or block.x1 >= gap_x2:
             continue
 
         return True
@@ -1769,7 +1802,7 @@ def drop_distant_orphan_blocks(articles: List[Article]) -> List[Article]:
     result: List[Article] = []
     dropped_count = 0
 
-    titles_by_article = _foreign_titles_by_article(articles)
+    blocks_by_article = _foreign_blocks_by_article(articles)
 
     for article in articles:
 
@@ -1777,11 +1810,11 @@ def drop_distant_orphan_blocks(articles: List[Article]) -> List[Article]:
             result.append(article)
             continue
 
-        foreign_titles = [
-            title
-            for other_id, titles in titles_by_article.items()
+        foreign_blocks = [
+            block
+            for other_id, owned in blocks_by_article.items()
             if other_id != article.article_id
-            for title in titles
+            for block in owned
         ]
 
         ordered = sorted(article.blocks, key=lambda block: block.y1)
@@ -1793,12 +1826,38 @@ def drop_distant_orphan_blocks(articles: List[Article]) -> List[Article]:
             current_block = ordered[index]
             following_block = ordered[index + 1]
 
+            # The gap's own column track is the two blocks' shared
+            # (intersected) x-range, not the union of both. Sorting
+            # purely by y1 routinely places two blocks that sit in
+            # DIFFERENT columns of the same multi-column article next
+            # to each other (e.g. a kicker line in one column next to
+            # a body paragraph in another, both part of the same
+            # story package) -- unioning their x-ranges then invents
+            # a wide "track" that a genuinely foreign column's own
+            # title can fall inside purely by coincidence. Confirmed
+            # on a real Punjabi (Punjabi Jagran, doc_000188 page 2)
+            # page: a column-1 kicker line and a column-0 body
+            # paragraph, both kept in the same split article, unioned
+            # into a track wide enough to catch a completely
+            # unrelated column-1 infobox's own title sitting between
+            # them by pure y-sort adjacency -- and dropped that
+            # column-0 paragraph and everything below it as "distant"
+            # even though nothing was printed between them in their
+            # own column. When the two blocks share no column at all,
+            # there is no real "track" to test either -- skip rather
+            # than guess at a substitute band.
+            gap_x1 = max(current_block.x1, following_block.x1)
+            gap_x2 = min(current_block.x2, following_block.x2)
+
+            if gap_x2 <= gap_x1:
+                continue
+
             if _foreign_title_in_gap(
                 current_block.y2,
                 following_block.y1,
-                min(current_block.x1, following_block.x1),
-                max(current_block.x2, following_block.x2),
-                foreign_titles,
+                gap_x1,
+                gap_x2,
+                foreign_blocks,
             ):
                 break_index = index + 1
                 break
@@ -1826,8 +1885,9 @@ def drop_distant_orphan_blocks(articles: List[Article]) -> List[Article]:
         dropped_count += len(dropped_this_article)
 
         print(
-            f"Distant orphan block(s) dropped from article "
-            f"{article.article_id}: {sorted(dropped_ids)}"
+            f"Distant orphan block(s) detached from article "
+            f"{article.article_id} into their own article: "
+            f"{sorted(dropped_ids)}"
         )
 
         result.append(
@@ -1839,13 +1899,182 @@ def drop_distant_orphan_blocks(articles: List[Article]) -> List[Article]:
             )
         )
 
+        # Detached into their OWN article rather than discarded --
+        # confirmed necessary on the real Urdu (THE INQUILAB,
+        # doc_000194 page 4) page this was generalized for: the
+        # dropped group was a "continued from page 1" tag plus its
+        # own 1129-character body paragraph, real substantial
+        # editorial content, not noise. Silently discarding it would
+        # trade "one giant duplicate-content box" for "real content
+        # permanently lost", a worse failure. Placeholder id=0, then
+        # renumbered below -- same convention as
+        # dropped_article_recovery.recover_dropped_articles.
+        result.append(
+            Article(
+                article_id=0,
+                blocks=dropped_this_article,
+                block_ids=[block.id for block in dropped_this_article],
+                confidence=article.confidence,
+            )
+        )
+
     if dropped_count:
+
+        # Placeholder article_id=0 values assigned above must never
+        # collide with a real one or with each other -- renumber the
+        # whole list sequentially, same convention as
+        # dropped_article_recovery.recover_dropped_articles.
+        for index, article in enumerate(result, start=1):
+            article.article_id = index
 
         print()
         print("=" * 60)
         print("DISTANT ORPHAN BLOCKS")
         print("=" * 60)
-        print(f"Blocks dropped : {dropped_count}")
+        print(f"Blocks detached into their own article(s) : {dropped_count}")
+        print("=" * 60)
+        print()
+
+    return result
+
+
+# ============================================================
+# WIDE TOP BANNER DETACHMENT
+#
+# A masthead/banner block that PageCleaner failed to flag as global
+# page chrome (e.g. an artistic logo banner with no OCR text) can
+# still get pulled into a real story by the grouping model when it
+# sits directly above that story's own narrow column blocks. Once
+# that happens, the article's bounding rectangle stretches to the
+# banner's near-full-page width, while the actual body content
+# underneath stays in one or two narrow print columns -- the final
+# crop then shows a page-wide rectangle instead of just the real
+# column story.
+#
+# Two signals mark this shape, either sufficient on its own once a
+# genuinely wide top block is present:
+#
+#   1. The article's own topmost block is far wider than the column
+#      block(s) beneath it (a banner sitting over narrow columns).
+#   2. The article's block-fill ratio (how much of its own bounding
+#      rectangle its blocks actually cover) is very low -- a direct
+#      symptom of a wide top block dragging the rectangle far past
+#      where the narrow content beneath it actually sits.
+#
+# Either signal detaches ONLY the wide top block into its own
+# single-block article; the remaining blocks stay together as the
+# original article, now with a bounding rectangle that actually
+# matches their own footprint.
+# ============================================================
+
+
+WIDE_TOP_BLOCK_WIDTH_RATIO = 0.65
+NARROW_COLUMN_WIDTH_RATIO = 0.35
+MIN_BLOCK_FILL_RATIO = 0.30
+
+
+def _estimate_page_width(articles: List[Article]) -> float:
+
+    widths = [
+        block.x2
+        for article in articles
+        for block in article.blocks
+    ]
+
+    return max(widths) if widths else 0.0
+
+
+def detach_wide_top_banner_blocks(
+    articles: List[Article],
+    page_width: float = None,
+) -> List[Article]:
+
+    if page_width is None:
+        page_width = _estimate_page_width(articles)
+
+    if not page_width:
+        return articles
+
+    result: List[Article] = []
+    detached_count = 0
+
+    for article in articles:
+
+        if len(article.blocks) <= 1:
+            result.append(article)
+            continue
+
+        ordered = sorted(article.blocks, key=lambda block: block.y1)
+
+        top_block = ordered[0]
+        rest = ordered[1:]
+
+        top_width = top_block.x2 - top_block.x1
+
+        wide_top = top_width > WIDE_TOP_BLOCK_WIDTH_RATIO * page_width
+
+        if not wide_top:
+            result.append(article)
+            continue
+
+        narrow_columns_below = all(
+            (block.x2 - block.x1) < NARROW_COLUMN_WIDTH_RATIO * page_width
+            for block in rest
+        )
+
+        bbox_x1 = min(block.x1 for block in article.blocks)
+        bbox_y1 = min(block.y1 for block in article.blocks)
+        bbox_x2 = max(block.x2 for block in article.blocks)
+        bbox_y2 = max(block.y2 for block in article.blocks)
+
+        bbox_area = max(
+            1.0,
+            (bbox_x2 - bbox_x1) * (bbox_y2 - bbox_y1),
+        )
+
+        blocks_area = sum(
+            max(0.0, block.x2 - block.x1) * max(0.0, block.y2 - block.y1)
+            for block in article.blocks
+        )
+
+        low_fill = (blocks_area / bbox_area) < MIN_BLOCK_FILL_RATIO
+
+        if not (narrow_columns_below or low_fill):
+            result.append(article)
+            continue
+
+        detached_count += 1
+
+        result.append(
+            Article(
+                article_id=article.article_id,
+                blocks=rest,
+                block_ids=[block.id for block in rest],
+                confidence=article.confidence,
+            )
+        )
+
+        # Placeholder id=0, renumbered below -- same convention as
+        # drop_distant_orphan_blocks above.
+        result.append(
+            Article(
+                article_id=0,
+                blocks=[top_block],
+                block_ids=[top_block.id],
+                confidence=article.confidence,
+            )
+        )
+
+    if detached_count:
+
+        for index, article in enumerate(result, start=1):
+            article.article_id = index
+
+        print()
+        print("=" * 60)
+        print("WIDE TOP BANNER DETACHMENT")
+        print("=" * 60)
+        print(f"Wide top blocks detached : {detached_count}")
         print("=" * 60)
         print()
 

@@ -344,7 +344,10 @@ function Viewer() {
     // wait for the full pipeline (`status === "completed"`) just to
     // open and edit boundaries.
     const documentReady =
-        documentStatus === "completed" || documentDetail?.boundaries_ready === true;
+        documentStatus === "completed" ||
+        documentDetail?.boundaries_ready === true ||
+        Boolean(documentDetail?.page_count && documentDetail.page_count > 0) ||
+        Boolean(documentDetail?.article_count && documentDetail.article_count > 0);
 
     useEffect(() => {
 
