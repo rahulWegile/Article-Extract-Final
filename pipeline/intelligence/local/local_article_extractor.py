@@ -329,6 +329,7 @@ class LocalArticleExtractor:
     def process_document(
         self,
         document_dir: str | Path,
+        printed_page_map: dict[int, int] | None = None,
     ) -> list[dict[str, Any]]:
 
         document_dir = Path(document_dir)
@@ -450,6 +451,7 @@ class LocalArticleExtractor:
                 articles=all_articles,
                 continuation_links=[],
                 pending_continuations=[],
+                printed_page_map=printed_page_map,
             )
         )
 

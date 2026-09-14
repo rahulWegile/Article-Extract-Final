@@ -39,6 +39,7 @@ from pipeline.openai.newspaper_client import (
 
 from pipeline.intelligence.local.masthead.masthead_extractor import (
     LocalMastheadExtractor,
+    build_printed_page_map,
 )
 
 # ============================================================
@@ -1020,6 +1021,44 @@ class PipelineService:
                     "No pages were rendered "
                     "from the PDF."
                 )
+
+            # =================================================
+            # Printed page folio map
+            #
+            # A continuation marker such as "Continued from P 1"
+            # quotes the PRINTED page number, which can disagree
+            # with the physical PDF page index (e.g. an unnumbered
+            # front jacket ad pushes the real front page a few PDF
+            # pages in). This reads the running folio off every
+            # page so continuation matching can translate between
+            # the two. Best-effort and never blocking: an empty
+            # map here just means continuation matching falls back
+            # to treating printed numbers as physical page indices,
+            # exactly as before this existed.
+            # =================================================
+
+            printed_page_map = {}
+
+            try:
+
+                printed_page_map = build_printed_page_map(
+                    self.local_masthead_extractor,
+                    pages,
+                )
+
+                if printed_page_map:
+
+                    print(
+                        f"Printed->PDF page map: {printed_page_map}"
+                    )
+
+            except Exception as exc:
+
+                print(
+                    f"⚠ Printed-page folio mapping failed: {exc}"
+                )
+
+                printed_page_map = {}
 
             # =================================================
             # STEP 2
@@ -2138,7 +2177,8 @@ class PipelineService:
 
             gemini_articles = (
                 article_extractor.process_document(
-                    document_dir
+                    document_dir,
+                    printed_page_map=printed_page_map,
                 )
             )
 

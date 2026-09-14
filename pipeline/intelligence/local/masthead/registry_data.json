@@ -220,5 +220,41 @@
         "verified": false,
         "notes": "auto-learned from a Gemini fallback result",
         "confirmation_count": 1
+    },
+    {
+        "template_id": "the_economic_times_new_delhi_gurgaon",
+        "newspaper_name": "The Economic Times",
+        "edition": "New Delhi / Gurgaon",
+        "language": "English",
+        "name_ocr_variants": [
+            "E ECONOMIC TIMES"
+        ],
+        "masthead_region": [
+            0.21530240885416665,
+            0.0,
+            0.9379233546401515,
+            0.09276533121201161
+        ],
+        "date_region": [
+            0.0,
+            0.059335487108525424,
+            1.0,
+            0.0843326374105513
+        ],
+        "edition_region": [
+            0.0,
+            0.059335487108525424,
+            1.0,
+            0.0843326374105513
+        ],
+        "edition_patterns": [
+            "NEW DELHI  GURGAON"
+        ],
+        "edition_primary_token": "NEW DELHI  GURGAON",
+        "date_format_hint": "",
+        "sample_source": "output\\temp\\run_0402cfc0c80e\\pages\\page_001.png",
+        "verified": false,
+        "notes": "auto-learned from a Gemini fallback result",
+        "confirmation_count": 1
     }
 ]

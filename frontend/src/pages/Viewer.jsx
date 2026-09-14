@@ -19,6 +19,15 @@ import ToastStack from "../components/ToastStack";
 const API_BASE = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
 
 const MIN_BOX_SIZE = 10;
+
+// A pointerdown-then-move on a selected box is only treated as an
+// intentional reposition once the cursor has actually travelled this
+// many screen pixels -- below that, ordinary hand tremor while
+// clicking would otherwise register as a real (if tiny) move on the
+// very first pointermove event, quietly creating an unsaved edit the
+// user never meant to make.
+const MOVE_COMMIT_THRESHOLD_PX = 4;
+
 const MIN_SCALE = 1;
 const MAX_SCALE = 10;
 const MAX_HISTORY = 100;
@@ -197,13 +206,22 @@ function Viewer() {
     const toastCounterRef = useRef(0);
     const failedToastShownRef = useRef(false);
 
+    // Tracks the live `page` value so a save that's still in flight in the
+    // background (see `handleConfirmNavigateAndSave`) can tell, once its
+    // request resolves, whether the user is still looking at the page it
+    // was saving -- if they've since moved on, it must not overwrite the
+    // now-displayed page's boundaries/selection with stale data.
+    const pageRef = useRef(page);
+    useEffect(() => {
+        pageRef.current = page;
+    }, [page]);
+
     const { creates, edits, deletes } = diffBoundaries(
         originalBoundaries,
         draftBoundaries
     );
 
     const pendingCount = creates.length + edits.length + deletes.length;
-    const navigationLocked = saving || pendingCount > 0;
 
     const editedArticleIds = new Set(edits.map((item) => item.article_id));
 
@@ -345,9 +363,7 @@ function Viewer() {
     // open and edit boundaries.
     const documentReady =
         documentStatus === "completed" ||
-        documentDetail?.boundaries_ready === true ||
-        Boolean(documentDetail?.page_count && documentDetail.page_count > 0) ||
-        Boolean(documentDetail?.article_count && documentDetail.article_count > 0);
+        documentDetail?.boundaries_ready === true;
 
     useEffect(() => {
 
@@ -429,6 +445,31 @@ function Viewer() {
 
     };
 
+    // Central gate for every way the user can change page (prev/next
+    // buttons, sidebar thumbnails, arrow keys). Saving never blocks
+    // navigation -- it runs in the background (see
+    // `handleConfirmNavigateAndSave`). Unsaved-but-idle edits prompt the
+    // user to save-and-go (or they can hit Discard first) rather than just
+    // refusing silently.
+    const goToPage = useCallback((targetPage) => {
+
+        if (!pageData) {
+            return;
+        }
+
+        if (targetPage < 1 || targetPage > pageData.page_count || targetPage === page) {
+            return;
+        }
+
+        if (pendingCount > 0) {
+            setConfirmDialog({ type: "navigate", targetPage });
+            return;
+        }
+
+        setPage(targetPage);
+
+    }, [page, pageData, pendingCount]);
+
     useEffect(() => {
 
         const handleKeyDown = (event) => {
@@ -492,16 +533,12 @@ function Viewer() {
 
             }
 
-            if (navigationLocked) {
-                return;
-            }
-
             if (event.key === "ArrowLeft" && page > 1) {
-                setPage((current) => current - 1);
+                goToPage(page - 1);
             }
 
             if (event.key === "ArrowRight" && pageData && page < pageData.page_count) {
-                setPage((current) => current + 1);
+                goToPage(page + 1);
             }
 
         };
@@ -510,7 +547,7 @@ function Viewer() {
 
         return () => window.removeEventListener("keydown", handleKeyDown);
 
-    }, [page, pageData, navigationLocked, confirmDialog, handleZoomIn, handleZoomOut, handleResetZoom, handleFitWidth]);
+    }, [page, pageData, confirmDialog, goToPage, handleZoomIn, handleZoomOut, handleResetZoom, handleFitWidth]);
 
     useEffect(() => {
 
@@ -557,6 +594,19 @@ function Viewer() {
                 setSelectedKey(drag.newKey);
 
             } else if (drag.type === "move") {
+
+                if (!drag.committed) {
+
+                    const screenDx = event.clientX - drag.startClientX;
+                    const screenDy = event.clientY - drag.startClientY;
+
+                    if (Math.hypot(screenDx, screenDy) < MOVE_COMMIT_THRESHOLD_PX) {
+                        return;
+                    }
+
+                    drag.committed = true;
+
+                }
 
                 const dx = current.x - drag.start.x;
                 const dy = current.y - drag.start.y;
@@ -679,6 +729,9 @@ function Viewer() {
         dragRef.current = {
             type: "move",
             start: toSvgPoint(event.clientX, event.clientY),
+            startClientX: event.clientX,
+            startClientY: event.clientY,
+            committed: false,
             origBbox: item.bbox,
             key: item.key,
             historyPushed: false,
@@ -734,7 +787,7 @@ function Viewer() {
         if (!selectedKey) {
             return;
         }
-        setConfirmDialog("delete");
+        setConfirmDialog({ type: "delete" });
     };
 
     const handleConfirmDelete = () => {
@@ -752,7 +805,7 @@ function Viewer() {
         if (pendingCount === 0) {
             return;
         }
-        setConfirmDialog("discard");
+        setConfirmDialog({ type: "discard" });
     };
 
     const handleConfirmDiscard = () => {
@@ -765,161 +818,221 @@ function Viewer() {
 
     };
 
+    // Returns true only if every staged change saved without error, so
+    // callers (e.g. the "save before leaving this page" prompt) know
+    // whether it's safe to proceed. `saving` is always cleared in the
+    // `finally` below -- however this exits, the UI can never get stuck
+    // permanently locked.
+    //
+    // Callers may navigate away (via `goToPage`) before this resolves --
+    // it never blocks navigation. `savedPage` pins down which page this
+    // call's `deletes`/`edits`/`creates`/`page` closure belongs to, so once
+    // the request comes back we can tell whether the user is still looking
+    // at it before touching any page-scoped UI state (see `pageRef` below).
     const handleSaveAll = async () => {
 
         if (pendingCount === 0) {
-            return;
+            return true;
         }
+
+        const savedPage = page;
 
         setSaving(true);
         setSaveProgress({ done: 0, total: pendingCount });
 
-        const results = [];
-        let completed = 0;
+        try {
 
-        const advance = () => {
-            completed += 1;
-            setSaveProgress({ done: completed, total: pendingCount });
-        };
+            const results = [];
+            let completed = 0;
 
-        for (const item of deletes) {
+            const advance = () => {
+                completed += 1;
+                setSaveProgress({ done: completed, total: pendingCount });
+            };
 
-            try {
+            for (const item of deletes) {
 
-                const response = await api.delete(
-                    `/documents/${documentId}/page/${page}/boundaries/${item.article_id}`
-                );
+                try {
 
-                results.push({
-                    article_id: item.article_id,
-                    action: "deleted",
-                    db_synced: response.data.db_synced,
-                    db_error: response.data.db_error,
-                });
+                    const response = await api.delete(
+                        `/documents/${documentId}/page/${page}/boundaries/${item.article_id}`
+                    );
 
-            } catch (error) {
-
-                results.push({
-                    article_id: item.article_id,
-                    action: "delete-failed",
-                    error: error?.response?.data?.detail || "Failed to delete.",
-                });
-
-            }
-
-            advance();
-
-        }
-
-        for (const item of edits) {
-
-            try {
-
-                const response = await api.post(
-                    `/documents/${documentId}/page/${page}/boundaries`,
-                    {
+                    results.push({
                         article_id: item.article_id,
-                        bbox: roundBbox(item.bbox),
-                    }
-                );
+                        action: "deleted",
+                        db_synced: response.data.db_synced,
+                        db_error: response.data.db_error,
+                    });
 
-                results.push({
-                    article_id: item.article_id,
-                    action: "edited",
-                    headline: response.data.headline,
-                    article_text: response.data.article_text,
-                    db_synced: response.data.db_synced,
-                    db_error: response.data.db_error,
-                });
+                } catch (error) {
 
-            } catch (error) {
+                    results.push({
+                        article_id: item.article_id,
+                        action: "delete-failed",
+                        error: error?.response?.data?.detail || "Failed to delete.",
+                    });
 
-                results.push({
-                    article_id: item.article_id,
-                    action: "edit-failed",
-                    error: error?.response?.data?.detail || "Failed to save.",
-                });
-
-            }
-
-            advance();
-
-        }
-
-        for (const item of creates) {
-
-            try {
-
-                const response = await api.post(
-                    `/documents/${documentId}/page/${page}/boundaries`,
-                    {
-                        article_id: null,
-                        bbox: roundBbox(item.bbox),
-                    }
-                );
-
-                results.push({
-                    article_id: response.data.article_id,
-                    action: "created",
-                    headline: response.data.headline,
-                    article_text: response.data.article_text,
-                    db_synced: response.data.db_synced,
-                    db_error: response.data.db_error,
-                });
-
-            } catch (error) {
-
-                results.push({
-                    article_id: null,
-                    action: "create-failed",
-                    error: error?.response?.data?.detail || "Failed to create.",
-                });
-
-            }
-
-            advance();
-
-        }
-
-        await loadBoundaries(page);
-
-        const failed = results.filter((r) => r.error);
-        const succeeded = results.length - failed.length;
-        const dbSyncFailures = results.filter((r) => r.db_synced === false);
-
-        if (succeeded > 0) {
-            pushToast("success", `${succeeded} boundary change${succeeded === 1 ? "" : "s"} saved.`);
-        }
-
-        if (failed.length > 0) {
-            pushToast("error", `${failed.length} change${failed.length === 1 ? "" : "s"} failed: ${failed[0].error}`);
-        }
-
-        if (dbSyncFailures.length > 0) {
-            pushToast("error", `${dbSyncFailures.length} change${dbSyncFailures.length === 1 ? "" : "s"} saved but failed to sync to the database.`);
-        }
-
-        setExtractionResults((prev) => {
-
-            const next = { ...prev };
-
-            results.forEach((r) => {
-                if (r.article_id && (r.headline || r.article_text)) {
-                    next[r.article_id] = { headline: r.headline, article_text: r.article_text };
                 }
+
+                advance();
+
+            }
+
+            for (const item of edits) {
+
+                try {
+
+                    const response = await api.post(
+                        `/documents/${documentId}/page/${page}/boundaries`,
+                        {
+                            article_id: item.article_id,
+                            bbox: roundBbox(item.bbox),
+                        }
+                    );
+
+                    results.push({
+                        article_id: item.article_id,
+                        action: "edited",
+                        headline: response.data.headline,
+                        article_text: response.data.article_text,
+                        db_synced: response.data.db_synced,
+                        db_error: response.data.db_error,
+                    });
+
+                } catch (error) {
+
+                    results.push({
+                        article_id: item.article_id,
+                        action: "edit-failed",
+                        error: error?.response?.data?.detail || "Failed to save.",
+                    });
+
+                }
+
+                advance();
+
+            }
+
+            for (const item of creates) {
+
+                try {
+
+                    const response = await api.post(
+                        `/documents/${documentId}/page/${page}/boundaries`,
+                        {
+                            article_id: null,
+                            bbox: roundBbox(item.bbox),
+                        }
+                    );
+
+                    results.push({
+                        article_id: response.data.article_id,
+                        action: "created",
+                        headline: response.data.headline,
+                        article_text: response.data.article_text,
+                        db_synced: response.data.db_synced,
+                        db_error: response.data.db_error,
+                    });
+
+                } catch (error) {
+
+                    results.push({
+                        article_id: null,
+                        action: "create-failed",
+                        error: error?.response?.data?.detail || "Failed to create.",
+                    });
+
+                }
+
+                advance();
+
+            }
+
+            // If the user has since navigated to a different page, don't
+            // refresh originalBoundaries/draftBoundaries here -- that state
+            // is global to whichever page is on screen, and this response
+            // belongs to `savedPage`, not the one now showing. Revisiting
+            // `savedPage` later re-fetches it fresh anyway.
+            const stillOnSavedPage = pageRef.current === savedPage;
+
+            if (stillOnSavedPage) {
+                await loadBoundaries(savedPage);
+            }
+
+            const failed = results.filter((r) => r.error);
+            const succeeded = results.length - failed.length;
+            const dbSyncFailures = results.filter((r) => r.db_synced === false);
+
+            if (succeeded > 0) {
+                pushToast("success", `${succeeded} boundary change${succeeded === 1 ? "" : "s"} saved.`);
+            }
+
+            if (failed.length > 0) {
+                pushToast("error", `${failed.length} change${failed.length === 1 ? "" : "s"} failed: ${failed[0].error}`);
+            }
+
+            if (dbSyncFailures.length > 0) {
+                pushToast("error", `${dbSyncFailures.length} change${dbSyncFailures.length === 1 ? "" : "s"} saved but failed to sync to the database.`);
+            }
+
+            setExtractionResults((prev) => {
+
+                const next = { ...prev };
+
+                results.forEach((r) => {
+                    if (r.article_id && (r.headline || r.article_text)) {
+                        next[r.article_id] = { headline: r.headline, article_text: r.article_text };
+                    }
+                });
+
+                return next;
+
             });
 
-            return next;
+            if (stillOnSavedPage) {
+                setLastSaveHadError(failed.length > 0);
+                historyRef.current = [];
+                setCanUndo(false);
+                setSelectedKey(null);
+            }
 
-        });
+            return failed.length === 0;
 
-        setLastSaveHadError(failed.length > 0);
+        } catch (error) {
 
-        historyRef.current = [];
-        setCanUndo(false);
-        setSelectedKey(null);
-        setSaving(false);
-        setSaveProgress(null);
+            console.error(error);
+            pushToast("error", "Something went wrong while saving. Please try again.");
+
+            if (pageRef.current === savedPage) {
+                setLastSaveHadError(true);
+            }
+
+            return false;
+
+        } finally {
+
+            setSaving(false);
+            setSaveProgress(null);
+
+        }
+
+    };
+
+    const handleConfirmNavigateAndSave = () => {
+
+        const targetPage = confirmDialog?.targetPage;
+
+        // Fire-and-forget: save the current page's changes in the
+        // background (toasts report the result whenever it lands) instead
+        // of making the user sit and wait for it before they can move on.
+        handleSaveAll();
+
+        setConfirmDialog(null);
+
+        if (targetPage) {
+            setPage(targetPage);
+        }
 
     };
 
@@ -1010,9 +1123,8 @@ function Viewer() {
                 pdfName={pageData.pdf_name}
                 page={page}
                 pageCount={pageData.page_count}
-                onPrevPage={() => setPage((current) => current - 1)}
-                onNextPage={() => setPage((current) => current + 1)}
-                navigationLocked={navigationLocked}
+                onPrevPage={() => goToPage(page - 1)}
+                onNextPage={() => goToPage(page + 1)}
                 editMode={editMode}
                 onToggleEditMode={handleToggleEditMode}
                 addMode={addMode}
@@ -1039,8 +1151,7 @@ function Viewer() {
                     page={page}
                     pageCount={pageData.page_count}
                     pageBoundaryCounts={pageBoundaryCounts}
-                    navigationLocked={navigationLocked}
-                    onSelectPage={setPage}
+                    onSelectPage={goToPage}
                     thumbBaseUrl={API_BASE}
                 />
 
@@ -1057,7 +1168,18 @@ function Viewer() {
                         wheel={{ step: 0.15, wheelDisabled: true }}
                         trackPadPanning={{ disabled: addMode }}
                         doubleClick={{ disabled: false }}
-                        panning={{ disabled: addMode, velocityDisabled: false }}
+                        // react-zoom-pan-pinch decides whether to start a pan
+                        // from its own native pointerdown listener on the
+                        // wrapper, which fires before our SVG handlers'
+                        // stopPropagation can have any effect -- so without
+                        // `excluded`, every click on a boundary box/handle
+                        // was liable to be swallowed as the start of a canvas
+                        // pan/drag instead of reaching the box.
+                        panning={{
+                            disabled: addMode,
+                            velocityDisabled: false,
+                            excluded: ["boundary-box", "boundary-sub-rect", "boundary-handle"],
+                        }}
                         pinch={{ disabled: false }}
                         alignmentAnimation={{ disabled: true }}
                         onTransform={(_ref, state) => setTransformState(state)}
@@ -1162,7 +1284,7 @@ function Viewer() {
             />
 
             <ConfirmDialog
-                open={confirmDialog === "delete"}
+                open={confirmDialog?.type === "delete"}
                 title="Delete boundary?"
                 message={`This will remove ${selectedItem?.isNew ? "this new boundary" : selectedItem?.article_id || "this article"} from the page.`}
                 confirmLabel="Delete"
@@ -1172,12 +1294,21 @@ function Viewer() {
             />
 
             <ConfirmDialog
-                open={confirmDialog === "discard"}
+                open={confirmDialog?.type === "discard"}
                 title="Discard changes?"
                 message={`This will revert every unsaved add, edit, and delete on this page (${pendingCount} change${pendingCount === 1 ? "" : "s"}).`}
                 confirmLabel="Discard"
                 danger
                 onConfirm={handleConfirmDiscard}
+                onCancel={() => setConfirmDialog(null)}
+            />
+
+            <ConfirmDialog
+                open={confirmDialog?.type === "navigate"}
+                title="Save changes before leaving this page?"
+                message={`You have ${pendingCount} unsaved change${pendingCount === 1 ? "" : "s"} on this page. Save & Continue saves them in the background and takes you to the next page right away.`}
+                confirmLabel="Save & Continue"
+                onConfirm={handleConfirmNavigateAndSave}
                 onCancel={() => setConfirmDialog(null)}
             />
 

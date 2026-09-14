@@ -207,6 +207,91 @@ Never create a new block ID.
 Never modify a block ID.
 
 =========================================================
+ADVERTISEMENT REGION LOCK — VERY IMPORTANT
+=========================================================
+
+ADVERTISEMENT CLASSIFICATION MUST BE DONE AT THE REGION LEVEL,
+NOT ONLY AT THE INDIVIDUAL BLOCK LEVEL.
+
+First inspect the page image for visually connected commercial/promotional
+regions.
+
+If multiple detected blocks are visually part of the same advertisement,
+ALL of those blocks must be classified as:
+
+advertisement
+
+This includes blocks containing:
+
+- advertisement headline
+- promotional text
+- product description
+- price
+- offer/discount
+- phone number
+- website
+- address
+- logo
+- product image
+- person/model image
+- QR code
+- contact details
+- call-to-action text
+- brand name
+- recruitment/property/service information
+
+IMPORTANT:
+
+A block inside an advertisement is NOT an article block simply because
+its OCR looks like normal newspaper prose.
+
+A block must NOT receive:
+
+article_title
+article_text
+article_image
+caption
+byline
+
+when it is visually part of an advertisement.
+
+=========================================================
+ADVERTISEMENT REGION BOUNDARY
+=========================================================
+
+When an advertisement contains multiple detected blocks:
+
+1. Identify the complete visual advertisement region.
+2. Treat all blocks visually belonging to that region as advertisement.
+3. Do NOT split the advertisement into multiple articles.
+4. Do NOT extract text from inside the advertisement as article content.
+5. Do NOT create an article root from any block inside the advertisement.
+
+The advertisement may contain text that looks exactly like a newspaper
+headline and body text. That does NOT make it an article.
+
+COMMERCIAL VISUAL DESIGN OVERRIDES HEADLINE DETECTION.
+
+=========================================================
+ADVERTISEMENT-FIRST ARTICLE CHECK
+=========================================================
+
+Before creating ANY article root, ask:
+
+"Is this candidate block or its surrounding visual region part of an
+advertisement?"
+
+If YES:
+
+- classify the relevant blocks as advertisement
+- exclude them from all articles
+- do NOT create an article root
+- do NOT recover them later as missing article content
+
+Only create an article after confirming that the candidate is genuine
+editorial newspaper content and NOT commercial/promotional content.
+
+=========================================================
 ARTICLE ROLES
 =========================================================
 
@@ -400,6 +485,131 @@ independent editorial story and supporting content.
 
 A kicker/eyebrow with no body text of its own MUST NOT become a
 standalone article.
+
+=========================================================
+ADVERTISEMENT OVERRIDE — HIGHEST PRIORITY
+=========================================================
+
+ADVERTISEMENT EXCLUSION HAS HIGHER PRIORITY THAN ALL ARTICLE
+CREATION AND ARTICLE SPLITTING RULES.
+
+Before creating ANY article, first determine whether the candidate
+region is an advertisement.
+
+If a region is visually or semantically promotional/commercial,
+classify it as:
+
+advertisement
+
+and NEVER create an article from any of its blocks.
+
+An advertisement MUST NOT become an article even when it contains:
+
+- a large headline
+- multiple text paragraphs
+- an image or photograph
+- a logo
+- a company or organization name
+- contact information
+- a price
+- a phone number
+- a website
+- an address
+- an offer or promotion
+- a recruitment message
+- a property listing
+- a product description
+- an institutional message
+- a call to action
+
+IMPORTANT:
+
+TEXT INSIDE AN ADVERTISEMENT IS STILL ADVERTISEMENT CONTENT.
+
+Do NOT create an article from text inside an advertisement merely
+because the text looks like an article headline and body text.
+
+Strong advertisement indicators include:
+
+- brand or company promotion
+- product/service promotion
+- price, discount, offer, package, booking, sale, admission,
+  vacancy, contact, or enquiry language
+- phone numbers, URLs, email addresses, addresses, QR codes
+- logos or strong branding
+- repeated promotional wording
+- "contact us", "call now", "visit", "book", "apply", "buy",
+  "available", "offer", "limited", "discount", "vacancy"
+- commercial property or recruitment content
+- visually boxed promotional layout
+- promotional graphics or product imagery
+- sponsored/institutional messaging
+
+If these signals conflict with headline + body detection,
+ADVERTISEMENT CLASSIFICATION WINS.
+
+A candidate that is advertisement content MUST NEVER be promoted
+to an article because it has:
+
+- its own heading
+- multiple text blocks
+- a separate visual region
+- a different topic
+- a large amount of text
+- a photograph
+- a small independent-looking layout
+
+=========================================================
+ADVERTISEMENT ARTICLE-BLOCK EXCLUSION
+=========================================================
+
+For every block classified as advertisement:
+
+- keep role = advertisement
+- do NOT assign it to any article
+- do NOT use it as an article_title
+- do NOT use it as article_text
+- do NOT use it as article_image
+- do NOT use its caption as article content
+- do NOT create a new article from it
+- do NOT attach it to a neighboring article
+
+If an advertisement contains text that resembles a newspaper story,
+inspect the surrounding visual design and commercial signals before
+creating an article.
+
+When advertisement evidence is present, prefer:
+
+advertisement
+
+over:
+
+article_title
+article_text
+article_image
+caption
+byline
+
+This rule overrides all later rules that say headline + body text
+normally creates an article.
+
+=========================================================
+FINAL ADVERTISEMENT SAFETY CHECK
+=========================================================
+
+Before finalizing each article, inspect all its blocks again.
+
+If ANY block belongs to an advertisement, remove that block from
+the article immediately.
+
+Then inspect whether the remaining blocks still form a valid article.
+
+If the remaining blocks do not form a valid independent editorial
+story, discard that article entirely.
+
+Never allow an advertisement to become an article through
+headline detection, body-text detection, embedded-article detection,
+small-article recovery, or article recovery.
 
 =========================================================
 ARTICLE ROOT DETECTION (VERY IMPORTANT)
@@ -1976,6 +2186,22 @@ For EVERY article:
 20. No internal supporting box has been incorrectly split from
     its parent story.
 
+    =========================================================
+ADVERTISEMENT RECOVERY EXCLUSION
+=========================================================
+
+During article recovery, NEVER recover a block into an article if
+the page image shows that the block belongs to an advertisement.
+
+If a block was incorrectly classified as article_title, article_text,
+article_image, caption, or byline but visually belongs to an advertisement:
+
+- reclassify it as advertisement
+- remove it from any article
+- do NOT create a replacement article
+
+ADVERTISEMENT STATUS ALWAYS OVERRIDES ARTICLE RECOVERY.
+
 
 =========================================================
 ARTICLE RECOVERY PASS
@@ -2012,14 +2238,23 @@ Ask:
 2. Does that headline have its own body text?
 3. Is it a separate editorial story?
 4. Can it be read independently?
+5. IS THE REGION DEFINITELY NOT AN ADVERTISEMENT OR OTHER
+   NON-EDITORIAL CONTENT?
 
-If YES:
+If the region is an advertisement, teaser_box, utility_box, caption,
+promotional panel, or other non-editorial content:
+
+DO NOT create an article.
+
+If YES to questions 1–5:
 
 REMOVE those blocks from the parent article.
 
 CREATE a separate article.
 
-This audit is mandatory for every article.
+ADVERTISEMENT STATUS ALWAYS OVERRIDES THIS AUDIT.
+
+This audit must NEVER convert advertisement content into an article.
 
 =========================================================
 FINAL GLOBAL VALIDATION

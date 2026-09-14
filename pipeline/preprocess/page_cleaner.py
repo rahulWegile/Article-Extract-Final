@@ -338,6 +338,20 @@ class PageCleaner:
     # enclosed blocks, not a distinct headline worth keeping.
     MIN_ENCLOSURE_HEADLINE_HEIGHT = 20
 
+    # A plain-text/title/caption block with <=2 chars of OCR text is
+    # normally discarded as noise (see the tiny-OCR-garbage check
+    # below), but a block the layout detector itself is this
+    # confident about is kept regardless -- the detector's geometry,
+    # not the OCR string, is the source of truth for whether real
+    # content exists there. Confirmed on real Tamil (The Hindu Tamil
+    # Thisai) pages: dense Tamil vowel-mark/conjunct fonts make OCR
+    # return empty or 1-2 character strings for genuine body
+    # paragraphs at a much higher rate than Latin/Devanagari text, and
+    # the length-based check alone discarded 49 of 59 detected text
+    # blocks on one page, stranding headlines with no body beneath
+    # them.
+    SHORT_TEXT_HIGH_CONFIDENCE_KEEP_THRESHOLD = 0.5
+
     def remove_noise(
         self,
         blocks,
@@ -475,12 +489,18 @@ class PageCleaner:
             # IMPORTANT:
             # Do not remove visual blocks, and do not remove the
             # structural blocks whose box carries meaning on its own
-            # (see keep_without_text above).
+            # (see keep_without_text above). Also do not remove a
+            # block the layout detector itself is highly confident
+            # about (see SHORT_TEXT_HIGH_CONFIDENCE_KEEP_THRESHOLD) --
+            # a short/empty OCR string there is an OCR failure, not
+            # proof the block itself is noise.
             #
 
             if (
                 len(text) <= 2
                 and cls not in keep_without_text
+                and block.confidence
+                < self.SHORT_TEXT_HIGH_CONFIDENCE_KEEP_THRESHOLD
             ):
                 continue
 

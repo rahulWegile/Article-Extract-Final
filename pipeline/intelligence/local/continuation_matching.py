@@ -148,6 +148,48 @@ def continuation_marker_target_page(article: dict[str, Any]) -> int | None:
     return None
 
 
+def continuation_marker_jump_slug(article: dict[str, Any]) -> str | None:
+    """
+    Extract the short catchphrase printed next to a forward jump
+    marker (e.g. "3 excise officials" from "►3 excise officials,
+    P 14"), as distinct from the source's own headline and from the
+    eventual target's headline.
+
+    Newspapers print this phrase precisely because it is often worded
+    differently from the full continuation headline on the target
+    page, so it is a strong, independent matching signal once present
+    (see score_continuation_pair).
+    """
+    continuation = article.get("continuation") or {}
+    if not isinstance(continuation, dict):
+        continuation = {}
+
+    slug = continuation.get("jump_slug")
+    if slug:
+        slug = str(slug).strip()
+        if slug:
+            return slug
+
+    marker = str(continuation.get("marker", "") or "").strip()
+    if not marker:
+        return None
+
+    # Fallback for extractions that never populated jump_slug
+    # explicitly: pull the text between an arrow glyph and the
+    # trailing page reference out of the raw marker.
+    match = re.search(
+        r"[►▸>»]\s*(.+?)\s*,?\s*(?:page|pg\.?|p\.?)\s*[-:]?\s*\d{1,4}\b",
+        marker,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        candidate = match.group(1).strip(" -–—:,.")
+        if candidate:
+            return candidate
+
+    return None
+
+
 def headline_is_titleless(article: dict[str, Any]) -> bool:
     headline = str(article.get("headline", "") or "").strip()
     normalized = " ".join(headline.lower().split())
@@ -391,6 +433,30 @@ def score_continuation_pair(
     else:
         final_score = 0.58 * text_score + 0.22 * metadata_score + 0.20 * headline_score
 
+    # Jump-slug evidence (see continuation_marker_jump_slug): a strong
+    # match requires near-complete token coverage against the TARGET
+    # headline, not a loose ratio, so it stays high-precision rather
+    # than a second chance for a weak general-overlap score.
+    jump_slug = continuation_marker_jump_slug(source)
+    slug_score = 0.0
+    slug_strong_match = False
+
+    if jump_slug and target_headline:
+        slug_norm = normalize_match_text(jump_slug)
+        slug_score = difflib.SequenceMatcher(
+            None, slug_norm, target_headline, autojunk=False
+        ).ratio()
+
+        slug_tokens = match_tokens(jump_slug)
+        target_tokens = set(match_tokens(target.get("headline", "")))
+
+        if len(slug_tokens) >= 2 and target_tokens:
+            covered = sum(1 for token in slug_tokens if token in target_tokens)
+            slug_strong_match = (covered == len(slug_tokens))
+
+    if slug_strong_match:
+        final_score = max(final_score, 0.80 * slug_score + 0.20 * text_score)
+
     return {
         "score": round(min(1.0, final_score), 4),
         "text_score": round(text_score, 4),
@@ -401,6 +467,8 @@ def score_continuation_pair(
         "ngram_overlap": round(ngram, 4),
         "target_titleless": titleless,
         "source_content_type": source_type,
+        "slug_score": round(slug_score, 4),
+        "slug_strong_match": slug_strong_match,
     }
 
 
@@ -422,6 +490,7 @@ def match_all_continuations(
     articles: list[dict[str, Any]],
     continuation_links: list[dict[str, Any]] | None = None,
     pending_continuations: list[dict[str, Any]] | None = None,
+    printed_page_map: dict[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """
     Deterministic, local continuation matching.
@@ -430,9 +499,17 @@ def match_all_continuations(
     specific target article on that page using text/metadata overlap
     scoring, with the exact numeric thresholds already validated in
     the Gemini-era codebase (see plan for rationale).
+
+    `printed_page_map` (optional) translates a PRINTED page number
+    quoted in a marker (e.g. "Continued from P 1") to the actual
+    physical PDF page index, for documents where a front jacket ad or
+    other unnumbered page means the two disagree. When absent or when
+    a given number has no entry, the printed number is used unchanged
+    -- identical to behavior before this parameter existed.
     """
     continuation_links = list(continuation_links or [])
     pending_continuations = list(pending_continuations or [])
+    printed_page_map = printed_page_map or {}
 
     article_map: dict[tuple[int, str], dict[str, Any]] = {}
     for article in articles:
@@ -511,6 +588,11 @@ def match_all_continuations(
         if target_page is None:
             continue
 
+        # Translate a PRINTED page reference to the physical PDF page
+        # it actually lives on (see printed_page_map docstring above).
+        # Silently unchanged when no mapping exists.
+        target_page = printed_page_map.get(target_page, target_page)
+
         candidates = [
             article
             for key, article in article_map.items()
@@ -584,6 +666,28 @@ def match_all_continuations(
                 or best_score["text_score"] >= 0.42
             )
         )
+
+        # A strong jump_slug match is positive, unambiguous evidence in
+        # its own right (see score_continuation_pair): every
+        # significant slug token appears in the TARGET's headline,
+        # which the generic overlap thresholds above can otherwise
+        # miss when the front-page arrow phrase is worded differently
+        # from both headlines. Still require at least 3 corroborating
+        # shared tokens between the full source and target text (the
+        # same floor the generic path already uses for a non-titleless
+        # target) so a slug never links on its own with zero other
+        # evidence, and the ambiguity-margin guard below still applies
+        # to it. shared_tokens is used rather than the text_score ratio
+        # because these are complete, independently-extracted article
+        # bodies (not split halves of one physical text), so the ratio
+        # is naturally diluted by length even for genuine matches -- a
+        # raw shared-token count is not.
+        slug_bypass = (
+            bool(best_score.get("slug_strong_match"))
+            and best_score["shared_tokens"] >= 3
+        )
+
+        strong_enough = strong_enough or slug_bypass
 
         if len(scored) > 1 and (best_score["score"] - second_score) < 0.045:
             strong_enough = False

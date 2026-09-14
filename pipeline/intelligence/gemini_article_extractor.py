@@ -176,6 +176,7 @@ class GeminiArticleExtractor:
     def process_document(
         self,
         document_dir: str | Path,
+        printed_page_map: dict[int, int] | None = None,
     ) -> list[dict[str, Any]]:
 
         document_dir = Path(
@@ -453,6 +454,7 @@ class GeminiArticleExtractor:
             articles=all_articles,
             continuation_links=all_links,
             pending_continuations=pending_continuations,
+            printed_page_map=printed_page_map,
         )
 
         print(
@@ -4319,6 +4321,51 @@ Return JSON only.
         return None
 
     @classmethod
+    def _continuation_marker_jump_slug(
+        cls,
+        article: dict[str, Any],
+    ) -> str | None:
+        """
+        Extract the short catchphrase printed next to a forward jump
+        marker (e.g. "3 excise officials" from "►3 excise officials,
+        P 14"), as distinct from the source's own headline and from
+        the eventual target's headline.
+
+        Newspapers print this phrase precisely because it is often
+        worded differently from the full continuation headline on the
+        target page, so it is a strong, independent matching signal
+        once present (see _score_continuation_pair).
+        """
+        continuation = article.get("continuation") or {}
+        if not isinstance(continuation, dict):
+            continuation = {}
+
+        slug = continuation.get("jump_slug")
+        if slug:
+            slug = str(slug).strip()
+            if slug:
+                return slug
+
+        marker = str(continuation.get("marker", "") or "").strip()
+        if not marker:
+            return None
+
+        # Fallback for older/local extractions that never populated
+        # jump_slug explicitly: pull the text between an arrow glyph
+        # and the trailing page reference out of the raw marker.
+        match = re.search(
+            r"[►▸>»]\s*(.+?)\s*,?\s*(?:page|pg\.?|p\.?)\s*[-:]?\s*\d{1,4}\b",
+            marker,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            candidate = match.group(1).strip(" -–—:,.")
+            if candidate:
+                return candidate
+
+        return None
+
+    @classmethod
     def _score_continuation_pair(
         cls,
         source: dict[str, Any],
@@ -4349,6 +4396,41 @@ Return JSON only.
         else:
             final_score=0.58*text_score + 0.22*metadata_score + 0.20*headline_score
 
+        # -----------------------------------------------------
+        # Jump-slug evidence (see _continuation_marker_jump_slug).
+        #
+        # A jump_slug is a distinct, independent signal from
+        # headline_score above: it is the short catchphrase printed
+        # next to the arrow/page marker, which newspapers routinely
+        # word differently from either headline (e.g. slug "3 excise
+        # officials" vs. front headline "12 dead, 34 in hospital in MP
+        # hooch tragedy" vs. target headline "3 MP excise officials
+        # among 6 suspended for hooch tragedy"). A strong slug match
+        # is required to be nearly complete token coverage against the
+        # TARGET headline, not a loose ratio, so it stays a high-
+        # precision signal rather than a second chance for a weak one.
+        # -----------------------------------------------------
+
+        jump_slug=cls._continuation_marker_jump_slug(source)
+        slug_score=0.0
+        slug_strong_match=False
+
+        if jump_slug and target_headline:
+            slug_norm=cls._normalize_match_text(jump_slug)
+            slug_score=difflib.SequenceMatcher(
+                None, slug_norm, target_headline, autojunk=False
+            ).ratio()
+
+            slug_tokens=cls._match_tokens(jump_slug)
+            target_tokens=set(cls._match_tokens(target.get("headline", "")))
+
+            if len(slug_tokens) >= 2 and target_tokens:
+                covered=sum(1 for token in slug_tokens if token in target_tokens)
+                slug_strong_match=(covered == len(slug_tokens))
+
+        if slug_strong_match:
+            final_score=max(final_score, 0.80*slug_score + 0.20*text_score)
+
         return {
             "score": round(min(1.0, final_score), 4),
             "text_score": round(text_score, 4),
@@ -4359,6 +4441,8 @@ Return JSON only.
             "ngram_overlap": round(ngram, 4),
             "target_titleless": titleless,
             "source_content_type": source_type,
+            "slug_score": round(slug_score, 4),
+            "slug_strong_match": slug_strong_match,
         }
 
     @classmethod
@@ -4367,6 +4451,7 @@ Return JSON only.
         articles: list[dict[str, Any]],
         continuation_links: list[dict[str, Any]],
         pending_continuations: list[dict[str, Any]],
+        printed_page_map: dict[int, int] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
         """
         Final deterministic repair pass.
@@ -4378,7 +4463,15 @@ Return JSON only.
 
         It is specifically designed for the common newspaper case where
         the continuation crop has no repeated headline/title.
+
+        `printed_page_map` (optional) translates a PRINTED page number
+        quoted in a marker (e.g. "Continued from P 1") to the actual
+        physical PDF page index, for documents where a front jacket ad
+        or other unnumbered page means the two disagree. When absent or
+        when a given number has no entry, the printed number is used
+        unchanged -- identical to behavior before this parameter existed.
         """
+        printed_page_map = printed_page_map or {}
         article_map: dict[tuple[int, str], dict[str, Any]] = {}
         for article in articles:
             if not isinstance(article, dict):
@@ -4466,6 +4559,11 @@ Return JSON only.
             if target_page is None:
                 continue
 
+            # Translate a PRINTED page reference to the physical PDF
+            # page it actually lives on (see printed_page_map docstring
+            # above). Silently unchanged when no mapping exists.
+            target_page = printed_page_map.get(target_page, target_page)
+
             # A target on the explicitly referenced page is the only page
             # considered. We never search the entire newspaper and guess.
             candidates = [
@@ -4534,6 +4632,29 @@ Return JSON only.
                     or best_score["text_score"] >= 0.42
                 )
             )
+
+            # A strong jump_slug match is positive, unambiguous evidence
+            # in its own right (see _score_continuation_pair): every
+            # significant slug token appears in the TARGET's headline,
+            # which the generic overlap thresholds above can otherwise
+            # miss when the front-page arrow phrase is worded
+            # differently from both headlines. Still require at least
+            # 3 corroborating shared tokens between the full source and
+            # target text (the same floor the generic path already
+            # uses for a non-titleless target) so a slug never links on
+            # its own with zero other evidence, and the ambiguity-
+            # margin guard below still applies to it. shared_tokens is
+            # used rather than the text_score ratio because these are
+            # complete, independently-extracted article bodies (not
+            # split halves of one physical text), so the ratio is
+            # naturally diluted by length even for genuine matches --
+            # a raw shared-token count is not.
+            slug_bypass = (
+                bool(best_score.get("slug_strong_match"))
+                and best_score["shared_tokens"] >= 3
+            )
+
+            strong_enough = strong_enough or slug_bypass
 
             # Avoid ambiguous matches where two target crops are nearly tied.
             if len(scored) > 1 and (best_score["score"] - second_score) < 0.045:

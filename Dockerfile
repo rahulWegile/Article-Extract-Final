@@ -62,7 +62,7 @@ RUN mkdir -p uploads output cache models/tessdata
 # (observed directly: two of these nine failed with "unexpected EOF"
 # on an otherwise fine connection) fails the entire build outright.
 RUN set -eux; \
-    for lang in guj mal urd pan ben asm ori tel kan; do \
+    for lang in guj mal urd pan ben asm ori tel kan tam; do \
         curl -fSL --retry 5 --retry-delay 3 --retry-all-errors \
             -o "models/tessdata/${lang}.traineddata" \
             "https://github.com/tesseract-ocr/tessdata_best/raw/main/${lang}.traineddata"; \

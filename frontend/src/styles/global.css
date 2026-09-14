@@ -1774,10 +1774,11 @@ ol{
 .boundary-box.boundary-box-hit-only{
     fill:none;
     stroke:none;
+    pointer-events:none;
 }
 
 .boundary-sub-rect{
-    pointer-events:none;
+    cursor:pointer;
 }
 
 .boundary-label rect{

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import re
+from collections import Counter
 from datetime import datetime, timedelta
 
 import cv2
@@ -21,6 +22,16 @@ OCR_CONFIDENCE_FLOOR = 0.55
 MAX_FUTURE_SLACK_DAYS = 1
 CONFIRMATIONS_REQUIRED = 3
 LEARN_REGION_PADDING = 0.01
+
+# Printed running-folio detection (see LocalMastheadExtractor.
+# extract_folio_number / build_printed_page_map below). Purely
+# positional -- no newspaper-specific template -- so it generalizes
+# to any masthead instead of needing a registry entry per paper.
+FOLIO_TOP_BAND_FRACTION = 0.08
+FOLIO_MARGIN_FRACTION = 0.15
+FOLIO_MIN_CONFIDENCE = 0.5
+FOLIO_MIN_OFFSET_SAMPLES = 3
+FOLIO_DOMINANT_OFFSET_RATIO = 0.7
 
 
 def _normalize(text: str) -> str:
@@ -348,6 +359,64 @@ class LocalMastheadExtractor:
 
         return None
 
+    def extract_folio_number(self, image_path):
+        """
+        Best-effort extraction of the printed running folio (page)
+        number from a page image.
+
+        Newspaper continuation markers ("Continued from P 1", "Turn
+        to Page 14") quote the PRINTED page number, which frequently
+        differs from the physical PDF page index once front-page ads
+        or unnumbered jacket pages are involved (see
+        build_printed_page_map). This reads the folio the same way a
+        human would: a short standalone number sitting in the outer
+        margin of the running head, near the top of the page.
+
+        Deliberately positional/generic -- no newspaper name or
+        layout is hardcoded, so it works for an unbounded universe of
+        papers, unlike the template registry used for masthead
+        identification above. Returns None on anything but a single,
+        unambiguous digit-only candidate, so callers can safely fall
+        back to treating the printed number as already being the
+        physical page index.
+        """
+        image = cv2.imread(str(image_path))
+
+        if image is None:
+            return None
+
+        lines = self._ocr_region_lines_with_boxes(
+            image, (0.0, 0.0, 1.0, FOLIO_TOP_BAND_FRACTION)
+        )
+
+        candidates = set()
+
+        for text, confidence, bbox in lines:
+
+            if confidence < FOLIO_MIN_CONFIDENCE:
+                continue
+
+            stripped = text.strip()
+
+            if not re.fullmatch(r"\d{1,3}", stripped):
+                continue
+
+            x1, _, x2, _ = bbox
+            x_center = (x1 + x2) / 2
+
+            in_left_margin = x_center <= FOLIO_MARGIN_FRACTION
+            in_right_margin = x_center >= (1 - FOLIO_MARGIN_FRACTION)
+
+            if not (in_left_margin or in_right_margin):
+                continue
+
+            candidates.add(int(stripped))
+
+        if len(candidates) != 1:
+            return None
+
+        return candidates.pop()
+
     def record_gemini_result(self, image_path, gemini_metadata):
         if not isinstance(gemini_metadata, dict):
             return
@@ -544,3 +613,103 @@ class LocalMastheadExtractor:
             f"({CONFIRMATIONS_REQUIRED - 1} more agreeing document(s) "
             "needed before it routes locally)"
         )
+
+
+def build_printed_page_map(folio_extractor, page_paths):
+    """
+    Map printed/folio page numbers -> physical PDF page index (1-based),
+    by OCR-reading the running folio off every rendered page of a
+    document.
+
+    This is what lets a continuation marker like "Continued from P 1"
+    resolve to the correct PDF page even when printed page 1 is not
+    physical PDF page 1 (e.g. an unnumbered front jacket ad pushes the
+    real front page a few PDF pages in).
+
+    A folio number that resolves to more than one physical page (most
+    commonly a supplement/section insert that restarts its own
+    numbering, e.g. a "DelhiTimes" page 3 alongside the main section's
+    page 3) is dropped rather than guessed -- callers should look up a
+    printed page number in this map and fall back to treating it as
+    the physical page index unchanged when it's absent, exactly as if
+    no offset existed.
+    """
+    raw: dict[int, set[int]] = {}
+
+    for index, page_path in enumerate(page_paths, start=1):
+
+        try:
+            folio = folio_extractor.extract_folio_number(page_path)
+        except Exception:
+            folio = None
+
+        if folio is None:
+            continue
+
+        raw.setdefault(folio, set()).add(index)
+
+    printed_page_map = {
+        folio: next(iter(pdf_pages))
+        for folio, pdf_pages in raw.items()
+        if len(pdf_pages) == 1
+    }
+
+    # -----------------------------------------------------------
+    # Extrapolate the front page(s).
+    #
+    # A newspaper's own front page conventionally carries no printed
+    # folio number at all -- there is nothing there for
+    # extract_folio_number to read -- so "printed page 1" (the most
+    # common continuation target of all: the classic front-page jump
+    # story) can never appear in the map above from direct OCR alone.
+    #
+    # When several OTHER pages agree on the same (pdf_index - folio)
+    # offset, that offset almost certainly holds for the front page
+    # too, so it is used to fill in any printed number still missing
+    # from the map. This is arithmetic derived from THIS document's
+    # own OCR evidence, not a per-newspaper rule, so it stays generic.
+    #
+    # Guarded so a document that mixes independently paginated
+    # sections (e.g. a magazine insert restarting its own numbering)
+    # -- where no single offset dominates -- safely contributes
+    # nothing here rather than guessing. Even a wrong guess would only
+    # ever cost a missed match, never a false one: this map only
+    # selects which page to search on, and the text/slug scoring
+    # thresholds in the repair pass are what actually decide whether
+    # two crops are linked.
+    # -----------------------------------------------------------
+
+    offset_votes = Counter(
+        pdf_index - folio
+        for folio, pdf_index in printed_page_map.items()
+    )
+
+    if offset_votes:
+
+        dominant_offset, dominant_count = offset_votes.most_common(1)[0]
+        total_votes = sum(offset_votes.values())
+
+        if (
+            dominant_count >= FOLIO_MIN_OFFSET_SAMPLES
+            and dominant_count / total_votes >= FOLIO_DOMINANT_OFFSET_RATIO
+        ):
+
+            max_pdf_page = len(page_paths)
+            claimed_pdf_pages = set(printed_page_map.values())
+
+            for printed in range(1, max_pdf_page + 1):
+
+                if printed in printed_page_map:
+                    continue
+
+                inferred_pdf_page = printed + dominant_offset
+
+                if not (1 <= inferred_pdf_page <= max_pdf_page):
+                    continue
+
+                if inferred_pdf_page in claimed_pdf_pages:
+                    continue
+
+                printed_page_map[printed] = inferred_pdf_page
+
+    return printed_page_map

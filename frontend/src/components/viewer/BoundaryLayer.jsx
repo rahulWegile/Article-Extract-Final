@@ -37,6 +37,16 @@ const BoundaryLayer = forwardRef(function BoundaryLayer(
 
     const selectedItem = items.find((item) => item.key === selectedKey);
 
+    // Render largest-area boxes first (so they paint at the bottom) and
+    // smallest last (on top) -- when two boundaries overlap, the smaller
+    // one is almost always the more specific target the user meant to
+    // click, and SVG paints later siblings on top of earlier ones.
+    const itemsByRenderOrder = [...items].sort((a, b) => {
+        const areaA = (a.bbox.x2 - a.bbox.x1) * (a.bbox.y2 - a.bbox.y1);
+        const areaB = (b.bbox.x2 - b.bbox.x1) * (b.bbox.y2 - b.bbox.y1);
+        return areaB - areaA;
+    });
+
     return (
 
         <svg
@@ -57,7 +67,7 @@ const BoundaryLayer = forwardRef(function BoundaryLayer(
                 />
             )}
 
-            {items.map((item) => {
+            {itemsByRenderOrder.map((item) => {
 
                 const hasSubRects = item.sub_rects && item.sub_rects.length > 0;
                 const isSelected = item.key === selectedKey;
@@ -103,7 +113,14 @@ const BoundaryLayer = forwardRef(function BoundaryLayer(
                                 width={r.x2 - r.x1}
                                 height={r.y2 - r.y1}
                                 className={boxClassName + " boundary-sub-rect"}
-                            />
+                                onPointerDown={onBoxPointerDown(item)}
+                                onPointerEnter={() => onBoxHover(item.key)}
+                                onPointerLeave={() => onBoxHoverEnd(item.key)}
+                            >
+                                {item.is_multi_page && (
+                                    <title>Spans multiple pages — not editable here</title>
+                                )}
+                            </rect>
                         ))}
 
                         <g className={"boundary-label" + (isSelected ? " selected" : "")} pointerEvents="none">

@@ -56,7 +56,6 @@ function ViewerTopBar({
     pageCount,
     onPrevPage,
     onNextPage,
-    navigationLocked,
     editMode,
     onToggleEditMode,
     addMode,
@@ -114,7 +113,7 @@ function ViewerTopBar({
                     <button
                         type="button"
                         onClick={onPrevPage}
-                        disabled={page <= 1 || navigationLocked}
+                        disabled={page <= 1}
                         aria-label="Previous page"
                         title="Previous page (Left arrow)"
                     >
@@ -126,7 +125,7 @@ function ViewerTopBar({
                     <button
                         type="button"
                         onClick={onNextPage}
-                        disabled={page >= pageCount || navigationLocked}
+                        disabled={page >= pageCount}
                         aria-label="Next page"
                         title="Next page (Right arrow)"
                     >

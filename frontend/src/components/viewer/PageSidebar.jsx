@@ -1,4 +1,4 @@
-function PageThumbnail({ pageNumber, active, thumbSrc, boundaryCount, disabled, onSelect }) {
+function PageThumbnail({ pageNumber, active, thumbSrc, boundaryCount, onSelect }) {
 
     return (
 
@@ -6,7 +6,6 @@ function PageThumbnail({ pageNumber, active, thumbSrc, boundaryCount, disabled, 
             type="button"
             className={"studio-page-thumb" + (active ? " is-active" : "")}
             onClick={() => onSelect(pageNumber)}
-            disabled={disabled}
             aria-current={active}
             title={`Page ${pageNumber}`}
         >
@@ -35,7 +34,6 @@ function PageSidebar({
     page,
     pageCount,
     pageBoundaryCounts,
-    navigationLocked,
     onSelectPage,
     thumbBaseUrl,
 }) {
@@ -69,7 +67,6 @@ function PageSidebar({
                             active={pageNumber === page}
                             thumbSrc={`${thumbBaseUrl}/documents/${documentId}/page/${pageNumber}/thumbnail`}
                             boundaryCount={pageBoundaryCounts[pageNumber]}
-                            disabled={navigationLocked && pageNumber !== page}
                             onSelect={onSelectPage}
                         />
 

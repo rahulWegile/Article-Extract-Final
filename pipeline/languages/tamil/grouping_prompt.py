@@ -1,10 +1,13 @@
 # Grouping prompt for Tamil.
 #
 # Physically separate per language so this one can be tuned without
-# touching any other language's prompt. Currently byte-identical to
-# every other non-Hindi language's copy -- that is expected: this is
-# the starting point for independent tuning, not a claim that Tamil
-# already needs different rules.
+# touching any other language's prompt. Adds a TAMIL-SPECIFIC LAYOUT
+# RULES section (see below) on top of the shared generic prompt, to
+# fix confirmed real-page failures: kicker/dateline blocks isolated
+# into their own 1-block article, photos/captions left detached from
+# their story, weather-keyword news stories misclassified as the
+# "weather" role, and adjacent columns merged across a visible
+# dividing line.
 
 TAMIL_GROUPING_PROMPT = """
 You are an expert newspaper editor, newspaper page-layout analyst,
@@ -1976,6 +1979,56 @@ Blocks classified as:
 - unknown
 
 must NOT appear inside any article.
+
+=========================================================
+TAMIL-SPECIFIC LAYOUT RULES (HIGHEST PRIORITY)
+=========================================================
+
+These rules apply specifically to Tamil newspaper pages and override
+any conflicting general guidance above.
+
+1. NO KICKER-ONLY ARTICLES.
+
+   Never create a standalone one-block article consisting only of a
+   kicker, eyebrow line, dateline, or closing/attribution sentence
+   (for example a trailing line such as "இவ்வாறு அதில்
+   கூறப்பட்டுள்ளது" -- "this is what it said/stated").
+
+   A kicker, dateline, or closing sentence is NEVER a complete
+   article by itself. If such a block has no body text of its own,
+   attach it to the nearest story it introduces, continues, or
+   closes -- do NOT leave it as an isolated single-block article.
+
+2. PHOTOS AND CAPTIONS ALWAYS JOIN A STORY.
+
+   Always group a photograph and its caption with the news story
+   printed directly below, above, or beside it, following the same
+   column and reading flow as the surrounding text. A photo and
+   caption on their own, with no connection made to a nearby story,
+   is not a valid outcome -- find the story they illustrate and
+   attach them to it (see IMAGE OWNERSHIP RULE / CAPTION OWNERSHIP
+   RULE above). Only leave them unassigned when no story on the page
+   is genuinely their subject.
+
+3. WEATHER KEYWORDS ARE NOT THE "weather" ROLE.
+
+   A regular news report about heat, rain, or weather conditions
+   (for example one containing "வெயில்" -- heat/sun) that reports an
+   event, impact, warning, or reaction as ordinary editorial content
+   is a normal news article (article_title / article_text), NOT the
+   "weather" role. Reserve the "weather" role strictly for a
+   dedicated weather-data panel/box (temperature listings, forecast
+   table, city-wise weather summary) -- never for a prose news story
+   that merely mentions weather.
+
+4. RESPECT VERTICAL COLUMN DIVIDERS.
+
+   Tamil pages commonly separate adjacent stories with a visible
+   vertical rule line or column gutter. When a vertical dividing line
+   or clear column boundary separates two headlines, treat the
+   content on each side as belonging to its own headline -- do NOT
+   merge blocks from both sides into one article merely because they
+   sit in the same row or touch at that boundary.
 
 =========================================================
 OUTPUT FORMAT

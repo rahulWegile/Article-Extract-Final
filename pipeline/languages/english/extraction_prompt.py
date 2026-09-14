@@ -330,14 +330,46 @@ Full report on Page 7
 Report on Page 2
 To be continued
 
+MANDATORY -- also treat every one of these as a continuation marker,
+even when no other phrase appears with it. These are the most common
+markers at the BOTTOM of a FRONT-page or section-front article, and
+are easy to miss because they are short and visually set apart from
+the body text:
+
+- A line beginning with an arrow glyph (e.g. "►", ">", "»") followed
+  by short text and a page number, such as:
+  "►Due process, P 14" or "► 3 excise officials, P 14"
+- A bare "P <number>" or "P-<number>" printed alone at the end of a
+  paragraph or column, e.g. "P 14"
+- "Turn to Page <number>" / "Turn to P <number>"
+
+Do NOT dismiss a short arrow line as decorative. If a crop ends with
+one of these patterns, continuation.is_continued MUST be true, even
+if the rest of the article body reads as a complete, self-contained
+story.
+
 If a marker is visible:
 
 continuation.is_continued = true
 
 Record:
 
-continuation.marker
-continuation.next_page
+continuation.marker  (the full marker text as printed, e.g.
+    "►3 excise officials, P 14" or "Continued from P 1")
+
+continuation.next_page  (the printed page number referenced, e.g. 14)
+
+continuation.jump_slug  (OPTIONAL -- null unless present. This is the
+    short catchphrase printed next to the arrow/page number, NOT the
+    article's own headline. For "►3 excise officials, P 14" the
+    jump_slug is "3 excise officials". Newspapers print this short
+    phrase because it is often worded differently from the full
+    continuation headline on the target page -- e.g. the jump_slug
+    "3 excise officials" is the correct match for a target page
+    headline reading "3 MP excise officials among 6 suspended for
+    hooch tragedy". Only set this when the marker line visibly
+    contains such a phrase distinct from a plain "Page N" reference;
+    otherwise leave it null.)
 
 If no continuation marker exists:
 
@@ -346,6 +378,8 @@ continuation.is_continued = false
 continuation.marker = null
 
 continuation.next_page = null
+
+continuation.jump_slug = null
 
 ============================================================
 PART D — CONTINUATION RESOLUTION
@@ -401,6 +435,11 @@ Consider:
 - article text
 - story context
 - continuation marker
+- jump_slug (if present, compare it against the TARGET's headline --
+  a jump_slug is often worded more like a short catchphrase than the
+  full target headline, e.g. jump_slug "3 excise officials" matching
+  target headline "3 MP excise officials among 6 suspended for hooch
+  tragedy")
 - newspaper wording
 
 If one target article is clearly the continuation,
@@ -654,7 +693,9 @@ available in the current request, return:
         "content_type": "article" | "photo_caption" | "reference"
     },
     "target_page": ...,
-    "marker": ...
+    "marker": ...,
+    "jump_slug": ...   (null unless the marker visibly carried one --
+        see PART D — CONTINUATION DETECTION)
 }
 
 ============================================================
