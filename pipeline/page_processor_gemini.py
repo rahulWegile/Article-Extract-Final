@@ -65,6 +65,7 @@ def prepare_page(
     document_dir,
     is_rtl=False,
     layout_confidence=None,
+    ocr_engine_label=None,
 ):
 
     # =====================================================
@@ -137,13 +138,22 @@ def prepare_page(
     )
 
     # =====================================================
-    # Stage 2 : Page-Level RapidOCR
+    # Stage 2 : Page-Level OCR
     # =====================================================
 
-    print()
-    print("Running RapidOCR...")
+    engine_label = (
+        ocr_engine_label
+        or ocr_engine.__class__.__name__
+    )
 
-    stage_start = time.perf_counter()
+    print()
+    print(
+        f"Running OCR "
+        f"({ocr_engine.__class__.__name__} - "
+        f"{engine_label})..."
+    )
+
+    ocr_start = time.perf_counter()
 
     ocr_results = ocr_engine.process_blocks(
         page_path,
@@ -166,14 +176,20 @@ def prepare_page(
             ocr.lines
         )
 
-    print(
-        "✓ RapidOCR completed"
+    ocr_elapsed = (
+        time.perf_counter()
+        - ocr_start
     )
 
-    stage_start = _record_timing(timings, 
-        "RapidOCR",
-        stage_start,
+    print(
+        f"✓ OCR completed: "
+        f"{len(ocr_results)} blocks read "
+        f"({ocr_elapsed:.2f}s)"
     )
+
+    timing_label = f"OCR ({engine_label})"
+
+    timings[timing_label] = ocr_elapsed
 
     # =====================================================
     # Stage 2.5 : Build Block Knowledge
@@ -297,6 +313,7 @@ def prepare_page(
         "knowledge_map": knowledge_map,
         "timings": timings,
         "page_start": page_start,
+        "ocr_engine_label": engine_label,
     }
 
 
@@ -329,7 +346,11 @@ def run_gemini(page_path, json_path, prompt=HINDI_GROUPING_PROMPT):
         - gemini_start
     )
 
-    return gemini_response, gemini_elapsed
+    # GeminiService's usage shape (usage_metadata) isn't captured here
+    # -- out of scope, no current language pipeline routes boundary
+    # grouping through Gemini. None keeps the 3-tuple contract shared
+    # with run_openai/run_local.
+    return gemini_response, gemini_elapsed, None
 
 
 # =========================================================
@@ -366,7 +387,7 @@ def run_openai(page_path, json_path, prompt=ENGLISH_GROUPING_PROMPT):
         - openai_start
     )
 
-    return openai_response, openai_elapsed
+    return openai_response, openai_elapsed, service.last_usage
 
 
 # =========================================================
@@ -378,8 +399,9 @@ def run_local(page_path, json_path, prompt=None):
     Drop-in replacement for run_openai / run_gemini that groups the
     page with pipeline.article.local_grouper instead of a model.
 
-    Returns the same (response, elapsed) pair and the same response
-    shape, so finish_page and every stage after it are unchanged.
+    Returns the same (response, elapsed, usage) triple (usage always
+    None here -- no API call) and the same response shape, so
+    finish_page and every stage after it are unchanged.
 
     Accepts (and ignores) `prompt` purely so callers can invoke
     run_local/run_gemini/run_openai interchangeably with the same
@@ -414,7 +436,7 @@ def run_local(page_path, json_path, prompt=None):
         f"in {local_elapsed:.2f}s"
     )
 
-    return local_response, local_elapsed
+    return local_response, local_elapsed, None
 
 
 # =========================================================
@@ -425,6 +447,7 @@ def finish_page(
     prep,
     gemini_response,
     gemini_elapsed,
+    gemini_usage=None,
     use_contested_block_arbitration: bool = True,
     use_orphan_block_reassignment: bool = True,
     use_orphan_title_root_repair: bool = True,
@@ -432,6 +455,9 @@ def finish_page(
     use_unclaimed_image_recovery: bool = True,
     use_unclaimed_footprint_recovery: bool = True,
     use_article_splitter: bool = True,
+    use_wide_top_banner_detachment: bool = True,
+    use_dropped_article_recovery: bool = True,
+    use_boundary_decomposition: bool = True,
 ):
 
     page_number = prep["page_number"]
@@ -442,6 +468,7 @@ def finish_page(
     knowledge_map = prep["knowledge_map"]
     timings = prep["timings"]
     page_start = prep["page_start"]
+    ocr_engine_label = prep.get("ocr_engine_label")
 
     timings["LLM API"] = gemini_elapsed
 
@@ -483,6 +510,31 @@ def finish_page(
         f"✓ LLM response saved -> "
         f"{response_path}"
     )
+
+    if gemini_usage is not None:
+
+        usage_path = (
+            response_dir
+            / f"page_{page_number:03d}_usage.json"
+        )
+
+        with open(
+            usage_path,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                gemini_usage,
+                f,
+                indent=4,
+                ensure_ascii=False,
+            )
+
+        print(
+            f"✓ Boundary-grouping token usage saved -> "
+            f"{usage_path}"
+        )
 
     stage_start = _record_timing(timings,
         "LLM response save",
@@ -553,6 +605,9 @@ def finish_page(
                 use_unclaimed_footprint_recovery
             ),
             use_article_splitter=use_article_splitter,
+            use_wide_top_banner_detachment=use_wide_top_banner_detachment,
+            use_dropped_article_recovery=use_dropped_article_recovery,
+            use_boundary_decomposition=use_boundary_decomposition,
         )
     )
 
@@ -728,7 +783,7 @@ def finish_page(
 
     timing_order = [
         "Layout detection",
-        "RapidOCR",
+        f"OCR ({ocr_engine_label})",
         "Block knowledge",
         "Page cleaning",
         "Page JSON export",
@@ -806,7 +861,7 @@ def process_page(
 
     run_page_llm = run_gemini if is_hindi else run_openai
 
-    llm_response, llm_elapsed = run_page_llm(
+    llm_response, llm_elapsed, llm_usage = run_page_llm(
         page_path=page_path,
         json_path=prep["json_path"],
     )
@@ -815,5 +870,6 @@ def process_page(
         prep,
         llm_response,
         llm_elapsed,
+        llm_usage,
         use_contested_block_arbitration=is_hindi,
     )

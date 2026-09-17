@@ -637,7 +637,12 @@ class UrduPipelineService:
         gemini_success = False
         try:
             extractor = URDU.extractor_class(
-                pages_per_batch=3,
+                pages_per_batch=(
+                    URDU.extraction_pages_per_batch
+                ),
+                max_articles_per_batch=(
+                    URDU.extraction_max_articles_per_batch or 8
+                ),
                 prompt_template=URDU.extraction_prompt_template,
             )
             extractor.process_document(document_dir)

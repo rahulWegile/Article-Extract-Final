@@ -71,6 +71,39 @@ The article_text field must contain the FULL readable article prose
 visible inside the verified article crop.
 
 ============================================================
+GROUND TRUTH OCR ANCHORS & COMPLETENESS MANDATE
+============================================================
+
+Immediately before each article crop image, you will see a block
+labeled:
+
+DETECTED LAYOUT OCR TEXT (Ground Truth Anchors):
+Block <id> (<role>): <text>
+...
+
+This is machine-OCR text already extracted from that SAME crop's
+own layout blocks (via Tesseract Tamil engine). It is an authoritative
+reference anchor.
+
+1. ZERO HALLUCINATION (HEADLINES & TOPICS):
+   Transcribe the actual printed headline verbatim from the image and
+   OCR text. Never invent an unrelated topic or event from a photograph.
+
+2. COMPLETENESS MANDATE (ALL COLUMNS & BLOCKS):
+   Every 'plain text' block listed in the anchors represents a column
+   or paragraph of this article. Your article_text MUST transcribe ALL
+   content from ALL listed text blocks from first to last.
+   - If the crop contains multiple columns (e.g. Column 1 on the left,
+     Column 2 under a photo, Column 3 on the right), transcribe Column 1,
+     then Column 2, then Column 3 down to the last word.
+   - NEVER drop the rightmost column or stop early at an intermediate sentence.
+   - NEVER compress multi-block or multi-column articles into a single paragraph.
+
+3. VERBATIM TAMIL SCRIPT:
+   Transcribe article_text verbatim in Tamil script (தமிழ்).
+   Do not summarize, paraphrase, translate, or transliterate.
+
+============================================================
 PART C — ALL HEADINGS MUST BE CAPTURED
 ============================================================
 
@@ -221,11 +254,16 @@ Read the article according to NORMAL NEWSPAPER READING ORDER.
 
 For multi-column articles:
 
-1. Identify the article's first column.
-2. Read that column from TOP to BOTTOM.
-3. Continue to the next connected column from TOP to BOTTOM.
-4. Continue through all article columns.
-5. Continue until the COMPLETE article has been read.
+1. Read Column 1 top-to-bottom.
+2. Then read Column 2 top-to-bottom.
+3. Then read Column 3 (and Column 4, if present) top-to-bottom.
+4. Continue through all article columns until the COMPLETE article
+   has been read.
+
+NEVER omit a column merely because it wraps beside or below an
+image, photo, or caption. A column positioned next to or under a
+photograph is still part of the article and must be transcribed
+in full, in its correct reading-order position.
 
 Do NOT read horizontally across unrelated columns.
 
@@ -537,6 +575,15 @@ Turn to Page 4
 Full report on Page 7
 Report on Page 2
 To be continued
+
+Also detect Tamil-language continuation markers such as:
+
+தொடர்ச்சி 3-ஆம் பக்கம்
+மீதி 5-ஆம் பக்கத்தில்
+விவரம் பக்கம் 4-ல் பார்க்க
+தொடர்கிறது பக்கம் 6
+முழு செய்தி பக்கம் 2
+பக்கம் 8-ல் பார்க்க
 
 Also inspect visually clipped or edge-positioned continuation text.
 

@@ -317,7 +317,7 @@ class GeminiBoundaryPipeline:
         # passes in this sequence.
         #
 
-        if use_wide_top_banner_detachment:
+        if use_wide_top_banner_detachment and use_article_splitter:
 
             page_width_estimate = max(
                 (block.x2 for block in blocks),

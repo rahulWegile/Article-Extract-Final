@@ -98,9 +98,19 @@ class OpenAIService:
             timeout=timeout_seconds,
         )
 
-        self._temperature_supported = (
-            self._TEMPERATURE_SUPPORT_CACHE.get(self.model, True)
+        is_reasoning_model = any(
+            x in (self.model or "").lower() for x in ("luna", "o1", "o3", "o4", "gpt-5")
         )
+        self._temperature_supported = (
+            False if is_reasoning_model else self._TEMPERATURE_SUPPORT_CACHE.get(self.model, True)
+        )
+
+        # Real token usage from the most recent successful _call(),
+        # for callers that want to record actual cost (e.g.
+        # page_processor_gemini.run_openai saving it alongside the
+        # page's boundary-grouping response). None until a call
+        # succeeds at least once.
+        self.last_usage: dict[str, int] | None = None
 
     # ========================================================
     # IMAGE CONTENT PART
@@ -196,6 +206,13 @@ class OpenAIService:
 
                 response = self.client.chat.completions.create(**kwargs)
 
+                if response.usage is not None:
+                    self.last_usage = {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens,
+                    }
+
                 response_text = (
                     response.choices[0].message.content or ""
                 ).strip()
@@ -213,8 +230,19 @@ class OpenAIService:
                     self._temperature_supported
                     and isinstance(exc, APIStatusError)
                     and exc.status_code == 400
-                    and isinstance(exc.body, dict)
-                    and exc.body.get("param") == "temperature"
+                    and (
+                        "temperature" in str(exc).lower()
+                        or (
+                            isinstance(exc.body, dict)
+                            and (
+                                exc.body.get("param") == "temperature"
+                                or (
+                                    isinstance(exc.body.get("error"), dict)
+                                    and exc.body["error"].get("param") == "temperature"
+                                )
+                            )
+                        )
+                    )
                 ):
                     # This model doesn't support a custom temperature at
                     # all (e.g. reasoning-family models) -- remember

@@ -18,6 +18,31 @@ Your PRIMARY TASK is to read the COMPLETE newspaper article from the image
 and accurately transcribe ALL readable article text in Punjabi.
 
 ============================================================
+ANTI-HALLUCINATION RULES
+============================================================
+
+Headline Accuracy: Transcribe the actual printed headline verbatim
+from the image. Never invent or substitute an unrelated news topic
+(e.g. never turn a disaster story into an education/cheating story).
+
+Multi-Column Flow: Read Column 1 top-to-bottom, then Column 2
+top-to-bottom, then any side stat boxes down to their last word.
+
+Zero Paraphrasing: Transcribe the visible Punjabi text verbatim into
+article_text. Do not paraphrase, summarize, or invent wording.
+
+CRITICAL - MULTI-COLUMN FULL TRANSCRIPTION:
+If an article contains multiple columns (2, 3, or 4 columns) or inset
+quote/photo boxes:
+1. Transcribe Column 1 top-to-bottom.
+2. Then transcribe Column 2 top-to-bottom.
+3. Then transcribe Column 3 and Column 4 top-to-bottom.
+4. Transcribe all the way down to the author byline, location, and
+   contact email at the bottom of the last column.
+5. NEVER stop after Column 1. NEVER summarize multi-column feature
+   articles into a single paragraph.
+
+============================================================
 PART A — ABSOLUTE ARTICLE IDENTITY
 ============================================================
 
@@ -71,6 +96,50 @@ The article_text field must contain the FULL readable article prose
 visible inside the verified article crop.
 
 ============================================================
+EXHAUSTIVE VERBATIM TRANSCRIPTION (ZERO TRUNCATION)
+============================================================
+
+1. FROM FIRST WORD TO ABSOLUTE LAST WORD:
+   Transcribe article_text completely and verbatim, from the
+   very first word to the very last word and final punctuation
+   mark visible in the crop, down to the article's bottom baseline.
+   - NEVER drop the final sentence or concluding line.
+   - NEVER omit ending paragraphs, spokesperson quotes, attributions,
+     or trailing statements.
+
+2. DO NOT PARAPHRASE OR SUMMARIZE article_text:
+   - Do NOT paraphrase the article in your own words.
+   - Do NOT summarize article_text.
+   - Do NOT stop transcribing after the first paragraph.
+   - article_text length must scale with how much text is actually
+     printed in the crop -- a long, dense crop must produce a long
+     transcription, never a short paraphrase.
+
+3. MULTI-COLUMN & SIDE-BOX COMPLETION:
+   If an article crop contains multiple columns, shaded boxes,
+   or sidebar sub-stories:
+   - You MUST read EVERY column and EVERY sidebar box completely
+     down to its very bottom edge.
+   - Do NOT stop after reading the box headline or its first sentence.
+   - Transcribe all text, quotes, and statements contained within
+     every side box or column before concluding.
+
+4. REPEATED HEADINGS IN TEXT:
+   If a heading or subhead repeats similar words in the body text
+   immediately below it, do NOT treat this as the end of the section.
+   Continue reading all subsequent sentences to the bottom.
+
+5. BOTTOM-EDGE SCAN & CONCLUDING LINES MANDATE:
+   Do NOT stop right after a statistics paragraph, trade figure, or
+   summary-sounding line -- that is frequently NOT the actual end of
+   the article.
+   Specifically inspect the BOTTOM 15% MARGIN of the crop and
+   transcribe every trailing detail found there: travel details,
+   visit milestones, meeting numbers, closing quotes, and bottom
+   continuation markers (e.g. "ਬਾਕੀ ਸਫ਼ਾ 6 'ਤੇ") -- down to the very
+   last printed word.
+
+============================================================
 PART C — PUNJABI LANGUAGE AND SCRIPT
 ============================================================
 
@@ -108,14 +177,13 @@ PART D — READ LIKE A NEWSPAPER
 
 Understand the newspaper layout before transcribing.
 
-Read the article according to NORMAL NEWSPAPER READING ORDER.
+Read the article according to STRICT MULTI-COLUMN READING ORDER:
 
-For multi-column articles:
-
-1. Read the first column from TOP to BOTTOM.
-2. Continue to the next connected column from TOP to BOTTOM.
-3. Continue through all article columns.
-4. Continue until the complete article has been read.
+1. Read Column 1 completely, TOP to BOTTOM.
+2. Then read Column 2 completely, TOP to BOTTOM.
+3. Then read Column 3 completely, TOP to BOTTOM (if present).
+4. Continue through all remaining article columns in the same way.
+5. Then read all side-boxes and insets belonging to the article.
 
 Do NOT read horizontally across unrelated columns.
 
@@ -144,6 +212,11 @@ extract it into subheadline.
 
 If multiple headline lines form one headline, combine them naturally
 while preserving the original wording.
+
+If a horizontal bullet-point deck appears directly below the headline
+(e.g. "● ਮੱਧ ਏਸ਼ੀਆ ’ਚ ਉਜ਼ਬੇਕਿਸਤਾਨ ਬਣਿਆ..."), it belongs to this article.
+Capture it in subheadline, or in article_text if it does not fit
+subheadline. Do NOT drop it as page decoration.
 
 ============================================================
 PART F — ARTICLE BODY
@@ -194,6 +267,11 @@ For small or dense Punjabi text:
 - verify repeated names and terms
 - verify the beginning and end of each paragraph
 - check column transitions carefully
+
+Character Precision: Distinguish visually similar Gurmukhi characters
+and words carefully instead of defaulting to the most common/expected
+word -- e.g. ਯੂਰੇਨੀਅਮ (uranium) vs ਜੁਰਮਾਨੇ (fines), ਮੱਧ (middle) vs
+ਮੈਚ (match). Verify each character against its actual printed shape.
 
 Do NOT invent unreadable text.
 
@@ -369,6 +447,10 @@ Turn to Page 4
 Full report on Page 7
 Report on Page 2
 To be continued
+ਬਾਕੀ ਸਫ਼ਾ 2 'ਤੇ
+ਦੇਖੋ ਸਫ਼ਾ 3
+ਸਫ਼ਾ>>4
+ਪੰਨਾ 5 'ਤੇ ਜਾਰੀ
 
 Resolve continuation relationships only when strong evidence exists.
 

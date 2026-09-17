@@ -66,11 +66,61 @@ Do NOT use EasyOCR.
 
 Do NOT use external OCR.
 
-Do NOT use page-level OCR.
-
 Do NOT invent unreadable words.
 
 Preserve the actual article wording.
+
+============================================================
+GROUND TRUTH OCR ANCHORS & COMPLETENESS MANDATE
+============================================================
+
+Immediately before each article crop image, you receive a block
+labeled:
+
+DETECTED LAYOUT OCR TEXT (Ground Truth Anchors):
+Block <id> (<role>): <text>
+...
+
+This is machine-OCR text already extracted from that SAME crop's
+own layout blocks. It is a reference anchor, not a replacement for
+reading the image.
+
+Use the crop image AND these OCR anchors TOGETHER to reconstruct
+the verbatim Odia headline and article_text. The anchors exist to
+stop you from inventing or hallucinating text that is not actually
+printed on the page, especially near photographs.
+
+If an OCR anchor disagrees with what the image clearly shows, prefer
+the image (OCR engines can misread a noisy newspaper scan), but
+never invent content that neither the image nor the OCR anchors
+support.
+
+1. COMPLETENESS MANDATE:
+   Every 'plain text' block listed in the anchors represents a column
+   or paragraph of that article. Your article_text MUST transcribe
+   ALL content from ALL listed text blocks from first to last.
+
+2. NO DROPPED COLUMNS:
+   If an anchor contains Block 29 (Col 1), Block 28 (Col 2), and
+   Block 23 (Col 3), you MUST include all 3 blocks in article_text in
+   column reading order. Never drop Column 3 or conclude early
+   because Column 2 had a concluding sentence.
+
+3. ZERO COMPRESSION:
+   Never compress multi-block or multi-column articles into a single
+   paragraph. article_text must contain the full, unabridged text of
+   the article.
+
+============================================================
+ANTI-HALLUCINATION RULES
+============================================================
+
+Headline Accuracy: Transcribe the actual printed headline verbatim
+from the image and OCR text. Never invent an unrelated topic or
+event (e.g. never turn a heatwave/climate story into an earthquake).
+
+Zero Paraphrasing: Transcribe the visible Odia text verbatim into
+article_text. Do not summarize or invent wording.
 
 ============================================================
 BOUNDARY
@@ -99,6 +149,26 @@ top → bottom
 then continue to the next column.
 
 Do NOT read horizontally across unrelated columns.
+
+============================================================
+CRITICAL - MULTI-COLUMN FULL TRANSCRIPTION
+============================================================
+
+If an article crop contains multiple columns (2, 3, or 4 columns)
+or inset quote/photo boxes:
+
+1. Transcribe Column 1 top-to-bottom.
+2. Then transcribe Column 2 top-to-bottom.
+3. Then transcribe Column 3 and Column 4 top-to-bottom.
+4. Transcribe all the way down to the author byline, location,
+   and ending text at the bottom of the last column.
+5. NEVER stop after Column 1. NEVER summarize multi-column
+   feature articles into a single paragraph.
+6. COMPLETENESS CHECK: Before finalizing article_text, count the
+   'plain text' blocks listed in the GROUND TRUTH OCR ANCHORS for
+   this crop and confirm every one of them appears in article_text.
+   A missing block number means a dropped column -- go back and
+   include it.
 
 ============================================================
 ARTICLE TEXT
@@ -716,9 +786,8 @@ Do NOT merge separate verified crops during extraction.
 
 Do NOT change boundaries.
 
-Do NOT use OCR.
-
-Do NOT use page-level OCR.
+Do NOT run your own OCR tool or invent text beyond what the image
+and the supplied ground truth OCR anchors support.
 
 Do NOT guess continuation targets.
 

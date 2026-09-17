@@ -234,6 +234,7 @@ def extract_article_text_from_blocks(
         confidence = float(block.get("ocr_confidence", 0.0) or 0.0)
 
         lines.append({
+            "id": block.get("id"),
             "text": text,
             "confidence": confidence,
             "bbox": block.get("bbox", {}) or {},

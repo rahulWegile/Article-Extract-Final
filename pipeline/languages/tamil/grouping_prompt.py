@@ -2010,16 +2010,13 @@ any conflicting general guidance above.
    RULE above). Only leave them unassigned when no story on the page
    is genuinely their subject.
 
-3. WEATHER KEYWORDS ARE NOT THE "weather" ROLE.
+3. PROSE WEATHER STORIES ARE NOT THE "weather" ROLE.
 
-   A regular news report about heat, rain, or weather conditions
-   (for example one containing "வெயில்" -- heat/sun) that reports an
-   event, impact, warning, or reaction as ordinary editorial content
-   is a normal news article (article_title / article_text), NOT the
-   "weather" role. Reserve the "weather" role strictly for a
-   dedicated weather-data panel/box (temperature listings, forecast
-   table, city-wise weather summary) -- never for a prose news story
-   that merely mentions weather.
+   Any multi-column news report about heat, rain, meteorological warnings, or
+   temperature rises (such as "அதிகபட்ச வெப்பநிலை 5 டிகிரி உயரும்") is an ordinary
+   editorial news article (article_title / article_text), NEVER the non-editorial
+   "weather" role. Reserve the "weather" role strictly for standalone numerical
+   forecast boxes/tables without narrative prose.
 
 4. RESPECT VERTICAL COLUMN DIVIDERS.
 
@@ -2029,6 +2026,47 @@ any conflicting general guidance above.
    content on each side as belonging to its own headline -- do NOT
    merge blocks from both sides into one article merely because they
    sit in the same row or touch at that boundary.
+
+5. NESTED / INSET ARTICLE RULE -- ALL-OR-NOTHING.
+
+   Tamil front pages routinely print a boxed sub-story (துணைச் செய்தி)
+   inside or beside a larger parent story -- for example a boxed
+   award/honour item such as "பிரதமர் மோடிக்கு உயரிய விருது" sitting
+   inside a larger visit/travel story. Such an inset MUST NEVER be
+   split so that only its headline becomes its own article while its
+   body paragraphs stay behind with the parent. Choose exactly ONE of:
+
+   a) INDEPENDENT -- if the inset has its own headline AND its own
+      body text reporting its own distinct development, group that
+      headline together with ALL of its own body-text blocks into one
+      independent article. Do not leave any of its body-text blocks
+      behind in the parent article.
+
+   b) ABSORBED -- if the inset is a supporting callout, pull-quote,
+      or reaction panel that cannot be cleanly separated from the
+      parent story, absorb the ENTIRE box -- headline AND body
+      together -- into the parent article. Do not split the headline
+      out on its own merely because it is a title-class block.
+
+   NO HOLLOW NESTED ARTICLES: an article whose bounding box sits
+   inside or against another article's bounding box MUST contain at
+   least one of its own article_text blocks. NEVER output an article
+   consisting only of an article_title with zero article_text blocks
+   when that article sits inside a parent story -- this produces an
+   isolated, bodyless headline box floating inside the parent's
+   boundary, with the inset's own body text misassigned to the parent
+   instead, and causes text to bleed between the two stories when
+   each is cropped.
+
+6. EXPERT ADVICE & SIGNED GUEST COLUMNS ARE EDITORIAL ARTICLES, NOT ADVERTISEMENTS.
+
+   Signed articles, opinion columns, financial planning advice, health features, or
+   analysis written by an expert, doctor, lawyer, or certified advisor (for example,
+   an investment advice column with an author portrait like "அனிதா மோகன், நிதி ஆலோசகர்"
+   and an author-opinion disclaimer at the bottom) are EDITORIAL ARTICLES
+   (article_title / article_text).
+   NEVER classify such editorial columns as "advertisement". Reserve the "advertisement"
+   role strictly for commercial store sales, product promotions, or recruitment notices.
 
 =========================================================
 OUTPUT FORMAT

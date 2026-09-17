@@ -31,3 +31,11 @@ frontend/dist/
 *.log
 .DS_Store
 Thumbs.db
+
+# Large archives -- e.g. models.zip, shared out-of-band to populate
+# models/ (see README.md) -- must never be sent into the build
+# context; models/ itself is already bind-mounted, not copied in by
+# the Dockerfile.
+models.zip
+*.zip
+*.tar.gz

@@ -29,6 +29,7 @@ from pipeline.languages.odia import ODIA
 from pipeline.languages.urdu import URDU
 
 _NON_DEFAULT_PIPELINES = (
+    ENGLISH,
     HINDI,
     GUJARATI,
     MARATHI,
@@ -49,4 +50,4 @@ def resolve_language_pipeline(language: str):
         if language_pipeline.matches(language):
             return language_pipeline
 
-    return ENGLISH
+    return HINDI

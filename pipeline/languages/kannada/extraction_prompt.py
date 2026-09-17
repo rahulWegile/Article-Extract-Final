@@ -66,11 +66,42 @@ Do NOT use EasyOCR.
 
 Do NOT use external OCR.
 
-Do NOT use page-level OCR.
-
 Do NOT invent unreadable words.
 
 Preserve the actual article wording.
+
+============================================================
+GROUND TRUTH OCR ANCHORS & COMPLETENESS MANDATE
+============================================================
+
+Immediately before each article crop image, you will see a block
+labeled:
+
+DETECTED LAYOUT OCR TEXT (Ground Truth Anchors):
+Block <id> (<role>): <text>
+...
+
+This is machine-OCR text already extracted from that SAME crop's
+own layout blocks (via Tesseract Kannada engine). It is an authoritative
+reference anchor.
+
+1. ZERO HALLUCINATION / ZERO PARAPHRASING:
+   You MUST NOT paraphrase or invent a generic summary. You must
+   transcribe the EXACT names (e.g. ಶೇಬಿನ್ ಬೇಬಿ, ಪೂನಂ, ಹೆಬ್ಬಗೋಡಿ ಠಾಣೆ),
+   locations, dates, monetary amounts, and details printed in the image
+   and OCR anchors.
+
+2. COMPLETENESS MANDATE (ALL COLUMNS & BLOCKS):
+   Every 'plain text' block listed in the anchors represents a column
+   or paragraph of this article. Your article_text MUST transcribe ALL
+   content from ALL listed text blocks from first to last.
+   - Transcribe Column 1, then Column 2 (around photos), then Column 3
+     down to the last word.
+   - NEVER compress multi-column articles into a single paragraph.
+
+3. VERBATIM KANNADA SCRIPT:
+   Transcribe article_text verbatim in Kannada script (ಕನ್ನಡ).
+   Do not summarize, paraphrase, translate, or transliterate.
 
 ============================================================
 BOUNDARY
@@ -116,6 +147,56 @@ in the image (e.g. Tamil script stays Tamil, Devanagari stays
 Devanagari, Gujarati script stays Gujarati, English stays
 English). Do NOT translate or transliterate it into a different
 language or script.
+
+============================================================
+ANTI-HALLUCINATION & ZERO PARAPHRASING
+============================================================
+
+Transcribe the visible Kannada text verbatim into article_text.
+
+Never paraphrase, summarize, or invent wording.
+
+Never substitute a word you cannot read with a similar-looking
+word. If a word is genuinely unreadable, leave it out rather
+than guessing.
+
+============================================================
+MULTI-COLUMN COMPLETENESS MANDATE
+============================================================
+
+If an article crop contains multiple columns (2, 3, or 4 columns)
+or inset quote/photo boxes:
+
+1. Transcribe Column 1 top-to-bottom.
+2. Then transcribe Column 2 top-to-bottom.
+3. Then transcribe Column 3 and Column 4 top-to-bottom.
+4. Transcribe all the way down to the author byline, location,
+   and contact info at the bottom of the last column.
+5. NEVER stop after Column 1. NEVER summarize multi-column
+   feature articles into a single paragraph.
+
+============================================================
+SCRIPT PRESERVATION
+============================================================
+
+Preserve Kannada language and Kannada script (ಕನ್ನಡ ಲಿಪಿ).
+
+Do NOT translate article_text into English or Hindi.
+
+Do NOT transliterate it into Latin characters.
+
+============================================================
+BOTTOM 15% MARGIN SCAN
+============================================================
+
+Inspect the bottom 15% margin of the crop for concluding lines,
+quotes, and Kannada continuation markers, for example:
+
+ಉಳಿದ ಭಾಗ ಪುಟ 4 ರಲ್ಲಿ
+ಮುಂದಿನ ವಿವರ ಪುಟ 6 ನೋಡಿ
+
+Do not truncate the transcription before this margin has been
+read.
 
 ============================================================
 STRUCTURED KNOWLEDGE
@@ -335,6 +416,10 @@ Turn to Page 4
 Full report on Page 7
 Report on Page 2
 To be continued
+ಮುಂದುವರಿದಿದೆ ೩-ನೇ ಪುಟದಲ್ಲಿ
+ಬಾಕಿ ೫-ನೇ ಪುಟ
+ವಿವರ ೪-ನೇ ಪುಟ ನೋಡಿ
+ಪುಟ ೨ ರಲ್ಲಿ ನೋಡಿ
 
 If a marker is visible:
 
@@ -717,8 +802,6 @@ Do NOT merge separate verified crops during extraction.
 Do NOT change boundaries.
 
 Do NOT use OCR.
-
-Do NOT use page-level OCR.
 
 Do NOT guess continuation targets.
 

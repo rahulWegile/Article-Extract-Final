@@ -69,11 +69,37 @@ Do NOT use EasyOCR.
 
 Do NOT use external OCR.
 
-Do NOT use page-level OCR.
-
 Do NOT invent unreadable words.
 
 Preserve the actual article wording.
+
+============================================================
+GROUND TRUTH OCR ANCHORS & COMPLETENESS MANDATE
+============================================================
+
+Immediately before each article crop image, you will see a block
+labeled:
+
+DETECTED LAYOUT OCR TEXT (Ground Truth Anchors):
+<text>
+
+This is machine-OCR text already extracted from that SAME crop's
+own layout blocks (via UTRNet Urdu engine). It is an authoritative
+reference anchor.
+
+1. ZERO HALLUCINATION / ZERO PARAPHRASING:
+   Do NOT paraphrase or write a generic summary. Transcribe the
+   EXACT headline, names, locations, and facts provided in the OCR
+   anchors and visible in the image verbatim.
+
+2. COMPLETENESS MANDATE:
+   Transcribe the complete article across all columns down to the
+   very last word. Never truncate to a single paragraph.
+
+3. RIGHT-TO-LEFT (RTL) COLUMN ORDER:
+   Urdu reads from RIGHT TO LEFT (دائیں سے بائیں). Transcribe
+   Column 1 on the far RIGHT first, then Column 2 (center), then
+   Column 3 on the LEFT.
 
 ============================================================
 BOUNDARY
@@ -90,18 +116,21 @@ Do not merge it with another crop.
 Do not create a new boundary.
 
 ============================================================
-READING ORDER
+CRITICAL — URDU RIGHT-TO-LEFT (RTL) MULTI-COLUMN READING ORDER
 ============================================================
 
-Newspaper articles can contain multiple columns.
+Urdu newspaper text is written and read from RIGHT TO LEFT (دائیں سے بائیں).
+When an article crop contains multiple columns (2, 3, or 4 columns):
 
-Read each column:
+1. COLUMN FLOW IS STRICTLY RIGHT TO LEFT:
+   - Transcribe Column 1 on the far RIGHT first.
+   - Next transcribe Column 2 in the CENTER (to the left of Column 1).
+   - Next transcribe Column 3 on the far LEFT.
+   - NEVER read Left-to-Right across columns.
 
-top → bottom
-
-then continue to the next column.
-
-Do NOT read horizontally across unrelated columns.
+2. WITHIN EACH COLUMN:
+   - Transcribe top to bottom from the top of the column to its end.
+   - Then jump to the top of the next column to its left.
 
 ============================================================
 ARTICLE TEXT
@@ -332,6 +361,15 @@ Turn to Page 4
 Full report on Page 7
 Report on Page 2
 To be continued
+
+Urdu-language markers such as:
+
+بقیہ صفحہ ۳ پر
+بقیہ صفحہ ۵ پر ملاحظہ فرمائیں
+تفصیلات صفحہ ۴ پر دیکھئے
+جاری صفحہ ۶
+مکمل رپورٹ صفحہ ۲ پر
+صفحہ ۸ پر
 
 If a marker is visible:
 

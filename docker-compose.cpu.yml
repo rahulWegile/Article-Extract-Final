@@ -1,0 +1,22 @@
+# CPU fallback override for teammates without an NVIDIA GPU / NVIDIA
+# Container Toolkit. Layers on top of docker-compose.yml: forces
+# OCR_DEVICE=cpu and clears the GPU device reservation so the backend
+# container can start on a machine with no GPU passthrough at all.
+# Everything else (db, frontend, volumes) is inherited unchanged.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up --build
+
+services:
+  backend:
+    environment:
+      OCR_DEVICE: cpu
+
+    # `!reset` explicitly clears the base file's GPU reservation list
+    # instead of merging into it -- a plain empty `deploy: {}` here
+    # would NOT remove it, since compose merges mapping/sequence
+    # fields by default rather than replacing them.
+    deploy:
+      resources:
+        reservations:
+          devices: !reset []

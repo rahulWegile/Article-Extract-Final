@@ -101,6 +101,29 @@ then continue to the next column.
 Do NOT read horizontally across unrelated columns.
 
 ============================================================
+ANTI-HALLUCINATION & ZERO PARAPHRASING
+============================================================
+
+Transcribe visible Bengali text verbatim into article_text.
+
+Never paraphrase, summarize, or invent wording.
+
+============================================================
+CRITICAL - MULTI-COLUMN FULL TRANSCRIPTION
+============================================================
+
+If an article crop contains multiple columns (2, 3, or 4 columns)
+or inset quote/photo boxes:
+
+1. Transcribe Column 1 top-to-bottom.
+2. Then transcribe Column 2 top-to-bottom.
+3. Then transcribe Column 3 and Column 4 top-to-bottom.
+4. Transcribe all the way down to the author byline, location,
+   and contact info at the bottom of the last column.
+5. NEVER stop after Column 1. NEVER summarize multi-column
+   feature articles into a single paragraph.
+
+============================================================
 ARTICLE TEXT
 ============================================================
 
@@ -116,6 +139,20 @@ in the image (e.g. Tamil script stays Tamil, Devanagari stays
 Devanagari, Gujarati script stays Gujarati, English stays
 English). Do NOT translate or transliterate it into a different
 language or script.
+
+Preserve Bengali language and Bengali script (বাংলা লিপি). Do NOT
+translate into English or Hindi, and do NOT transliterate into
+Latin characters.
+
+============================================================
+BOTTOM 15% MARGIN SCAN
+============================================================
+
+Inspect the bottom margin (the last 15% of the crop) for
+concluding lines, quotes, and Bengali continuation markers, e.g.:
+
+বাকি অংশ পাতা 4 এ
+বিস্তারিত পৃষ্ঠা 6 এ দেখুন
 
 ============================================================
 STRUCTURED KNOWLEDGE

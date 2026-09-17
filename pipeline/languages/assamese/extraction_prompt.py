@@ -66,11 +66,42 @@ Do NOT use EasyOCR.
 
 Do NOT use external OCR.
 
-Do NOT use page-level OCR.
-
 Do NOT invent unreadable words.
 
 Preserve the actual article wording.
+
+============================================================
+GROUND TRUTH OCR ANCHORS & COMPLETENESS MANDATE
+============================================================
+
+Immediately before each article crop image, you will see a block
+labeled:
+
+DETECTED LAYOUT OCR TEXT (Ground Truth Anchors):
+Block <id> (<role>): <text>
+...
+
+This is machine-OCR text already extracted from that SAME crop's
+own layout blocks (via Tesseract Assamese engine). It is an authoritative
+reference anchor.
+
+1. ZERO HALLUCINATION (HEADLINES & TOPICS):
+   Transcribe the actual printed headline verbatim from the image and
+   OCR text. Never invent an unrelated topic or event from a photograph.
+
+2. COMPLETENESS MANDATE (ALL COLUMNS & BLOCKS):
+   Every 'plain text' block listed in the anchors represents a column
+   or paragraph of this article. Your article_text MUST transcribe ALL
+   content from ALL listed text blocks from first to last.
+   - If the crop contains multiple columns (e.g. Column 1 on the left,
+     Column 2 under a photo, Column 3 under a photo on the right),
+     transcribe Column 1, then Column 2, then Column 3 down to the last word.
+   - NEVER drop the rightmost column or stop at an intermediate sentence.
+   - NEVER compress multi-block or multi-column articles into a single paragraph.
+
+3. VERBATIM ASSAMESE SCRIPT:
+   Transcribe article_text verbatim in Assamese script (অসমীয়া).
+   Do not summarize, paraphrase, translate, or transliterate.
 
 ============================================================
 BOUNDARY
@@ -99,6 +130,22 @@ top → bottom
 then continue to the next column.
 
 Do NOT read horizontally across unrelated columns.
+
+============================================================
+CRITICAL - MULTI-COLUMN FULL TRANSCRIPTION
+============================================================
+
+If an article crop contains multiple columns (2, 3, or 4 columns)
+or inset quote/photo boxes:
+
+1. Read Column 1 top-to-bottom.
+2. Then read Column 2 top-to-bottom.
+3. Then read Column 3 (and Column 4, if present) top-to-bottom.
+4. Transcribe all the way down to the author byline, location,
+   and ending text at the bottom of the last column.
+5. NEVER omit a column that wraps under or beside a photograph.
+6. NEVER stop after Column 1. NEVER summarize multi-column
+   feature articles into a single paragraph.
 
 ============================================================
 ARTICLE TEXT
@@ -335,6 +382,12 @@ Turn to Page 4
 Full report on Page 7
 Report on Page 2
 To be continued
+বাকী অংশ ৩ পৃষ্ঠাত
+শেষাংশ ৫ পৃষ্ঠাত চাওক
+বিতং ৭ পৃষ্ঠাত
+২ পৃষ্ঠাত চাওক
+অব্যাহত ৪ পৃষ্ঠাত
+বাকী ২ পৃষ্ঠাত
 
 If a marker is visible:
 

@@ -6,8 +6,8 @@ from pipeline.languages.kannada.extraction_prompt import (
     KANNADA_EXTRACTION_PROMPT,
 )
 from pipeline.ocr.tesseract_engine import TesseractOCREngine
-from pipeline.intelligence.gemini_article_extractor import (
-    GeminiArticleExtractor,
+from pipeline.intelligence.openai_article_extractor import (
+    OpenAIArticleExtractor,
 )
 
 
@@ -31,26 +31,26 @@ KANNADA = LanguagePipeline(
     matches=matches,
     ocr_engine_factory=lambda: TesseractOCREngine(lang="kan"),
     ocr_engine_label="tesseract (kannada)",
-    # Grouping/boundary detection stays on OpenAI (llm_provider below)
-    # -- only ARTICLE-LEVEL TEXT EXTRACTION is switched to Gemini here,
-    # via extractor_class. Same pattern Marathi/Punjabi/Gujarati/
-    # Assamese/Bengali use.
-    #
-    # TEMPORARY: no completed Kannada document existed yet to measure
-    # (unlike the languages above, where extracted-text length vs. OCR
-    # text length was directly compared) -- this is a preemptive match
-    # to the same fix, on the same reasoning: OpenAIArticleExtractor's
-    # pinned model (OPENAI_ARTICLE_MODEL=gpt-5.6-luna) is confirmed
-    # failing on multiple other non-Latin, non-Devanagari scripts, and
-    # Kannada shares that same architecture (Tesseract OCR + OpenAI
-    # extraction). Verify against a real completed Kannada document
-    # the same way Urdu/Punjabi crops were checked before trusting
-    # this. To revert: change extractor_class back to
-    # OpenAIArticleExtractor (and restore the `from
-    # pipeline.intelligence.openai_article_extractor import
-    # OpenAIArticleExtractor` import above).
     llm_provider="openai",
     grouping_prompt=KANNADA_GROUPING_PROMPT,
     extraction_prompt_template=KANNADA_EXTRACTION_PROMPT,
-    extractor_class=GeminiArticleExtractor,
+    extractor_class=OpenAIArticleExtractor,
+
+    # Matches Odia's batching: share the extraction prompt's fixed
+    # overhead across 1 page at a time, capped at 8 article crops per
+    # call so gpt-5.6-luna has enough completion-token headroom to
+    # transcribe every column verbatim instead of compressing/
+    # truncating articles (see the MULTI-COLUMN COMPLETENESS MANDATE
+    # in extraction_prompt.py).
+    extraction_pages_per_batch=1,
+    extraction_max_articles_per_batch=8,
+
+    use_article_splitter=True,
+    use_boundary_decomposition=True,
+    use_orphan_block_reassignment=True,
+
+    # Kannada headlines/banners can span across columns; disable
+    # wide-top-banner detachment so a genuine multi-column headline
+    # isn't cut away from its own body.
+    use_wide_top_banner_detachment=False,
 )

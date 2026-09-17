@@ -15,6 +15,10 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from openai import APIConnectionError, APIStatusError
 
+from pipeline.intelligence.local.block_text_extractor import (
+    extract_article_text_from_blocks,
+)
+
 
 
 # ============================================================
@@ -80,7 +84,11 @@ class OpenAIArticleExtractor:
     """
 
     DEFAULT_MODEL = "gpt-5.6-luna"
-    DEFAULT_PAGES_PER_BATCH = 3
+
+    # Page-by-page architecture: each page's crops are extracted as soon
+    # as they exist (see backend/services/pipeline_service.py), rather
+    # than waiting to batch several pages into one request.
+    DEFAULT_PAGES_PER_BATCH = 1
 
     # ========================================================
     # INITIALIZATION
@@ -90,7 +98,8 @@ class OpenAIArticleExtractor:
         self,
         api_key: str | None = None,
         model: str | None = None,
-        pages_per_batch: int = 3,
+        pages_per_batch: int | None = None,
+        max_articles_per_batch: int | None = None,
         prompt_template: str | None = None,
     ):
 
@@ -114,7 +123,27 @@ class OpenAIArticleExtractor:
 
         self.pages_per_batch = max(
             1,
-            int(pages_per_batch),
+            int(
+                pages_per_batch
+                if pages_per_batch is not None
+                else self.DEFAULT_PAGES_PER_BATCH
+            ),
+        )
+
+        # Hard cap on article crops per OpenAI request, independent of
+        # how many pages are packed into the batch -- a broadsheet page
+        # can carry 10-12 articles on its own, which previously meant a
+        # single 3-page batch could ship 20+ crops in one call and starve
+        # gpt-5.6-luna's completion-token budget (~470 tokens/article)
+        # until it dropped whole columns/entities. See process_document's
+        # chunking of _discover_articles() output by this cap.
+        self.max_articles_per_batch = max(
+            1,
+            int(
+                max_articles_per_batch
+                if max_articles_per_batch is not None
+                else os.getenv("OPENAI_MAX_ARTICLES_PER_BATCH", "8")
+            ),
         )
 
         # Per-language extraction prompt template (see
@@ -123,6 +152,30 @@ class OpenAIArticleExtractor:
         # has always carried, so callers that don't pass one behave
         # exactly as before.
         self.prompt_template = prompt_template
+
+        # Whether to inject each crop's already-computed per-block
+        # OCR text (Tesseract/RapidOCR/UTRNet, from page_json/page_NNN.json,
+        # looked up via crop_metadata["block_ids"] -- see _load_page_blocks /
+        # _build_layout_ocr_anchor_text) as a "ground truth anchor" content
+        # block right above that crop's image. Detected from the prompt
+        # template itself rather than a separate constructor flag, so this
+        # is scoped to exactly the languages whose extraction prompt
+        # documents the anchors (currently Odia and Urdu -- see
+        # pipeline/languages/odia/extraction_prompt.py's and
+        # pipeline/languages/urdu/extraction_prompt.py's "GROUND TRUTH OCR
+        # ANCHORS" sections) without touching pipeline_service.py's/
+        # boundary_editor.py's extractor_class(...) call sites or every
+        # other language's prompt/behavior.
+        self._use_layout_ocr_anchors = (
+            "GROUND TRUTH OCR ANCHORS" in (self.prompt_template or "")
+        )
+
+        # Cache of page_json blocks already loaded this run, keyed by
+        # (document_dir, page) -- mirrors
+        # LocalArticleExtractor._load_page_blocks's per-page cache so a
+        # multi-page batch doesn't re-read the same page_NNN.json once per
+        # article crop on that page.
+        self._page_blocks_cache: dict[tuple[str, int], list[dict[str, Any]]] = {}
 
         timeout_seconds = int(
             os.getenv(
@@ -136,11 +189,13 @@ class OpenAIArticleExtractor:
             timeout=timeout_seconds,
         )
 
-        # Some models (e.g. the gpt-5.x reasoning family) reject any
-        # temperature other than their default (1) with a 400. Assume
-        # support until proven otherwise, then remember it for the
-        # rest of this instance's calls instead of re-probing every time.
-        self._temperature_supported = True
+        # Some models (e.g. the gpt-5.x/luna/o-series reasoning family) reject any
+        # temperature other than their default (1) with a 400. Skip custom
+        # temperature from the start for known reasoning models.
+        is_reasoning_model = any(
+            x in (self.model or "").lower() for x in ("luna", "o1", "o3", "o4", "gpt-5")
+        )
+        self._temperature_supported = not is_reasoning_model
 
         # OpenAI hard-caps a single request's total image payload at
         # 50MB (base64-encoded) -- confirmed by a real 400 on a
@@ -173,6 +228,11 @@ class OpenAIArticleExtractor:
         print(
             f"Pages per batch : "
             f"{self.pages_per_batch}"
+        )
+
+        print(
+            f"Max articles/batch : "
+            f"{self.max_articles_per_batch}"
         )
 
         print(
@@ -213,6 +273,113 @@ class OpenAIArticleExtractor:
                 "detail": "high",
             },
         }
+
+    # ========================================================
+    # LAYOUT OCR ANCHORS (see self._use_layout_ocr_anchors above)
+    # ========================================================
+
+    def _load_page_blocks(
+        self,
+        document_dir: Path,
+        page_number: int,
+    ) -> list[dict[str, Any]]:
+
+        cache_key = (str(document_dir), page_number)
+
+        if cache_key in self._page_blocks_cache:
+            return self._page_blocks_cache[cache_key]
+
+        page_json_path = (
+            Path(document_dir)
+            / "page_json"
+            / f"page_{page_number:03d}.json"
+        )
+
+        blocks: list[dict[str, Any]] = []
+
+        if page_json_path.exists():
+
+            try:
+
+                with open(
+                    page_json_path,
+                    "r",
+                    encoding="utf-8",
+                ) as f:
+
+                    blocks = json.load(f).get("blocks") or []
+
+            except Exception as exc:
+
+                print(
+                    "WARNING: Could not read "
+                    f"{page_json_path}: {exc}"
+                )
+
+                blocks = []
+
+        self._page_blocks_cache[cache_key] = blocks
+
+        return blocks
+
+    def _build_layout_ocr_anchor_text(
+        self,
+        document_dir: Path,
+        page_number: int,
+        crop_metadata: dict[str, Any],
+    ) -> str | None:
+        """
+        Ground-truth OCR anchor for one article crop: the already-
+        computed page-level OCR text of exactly the layout blocks that
+        make up this crop (crop_metadata["block_ids"], written by
+        FinalArticleCropper into crop.json), reusing the same
+        page_json lookup LocalArticleExtractor relies on instead of
+        running OCR a second time. Falls back to crop_metadata["text"]
+        for engines like UTRNet that write their recognized text
+        directly into crop.json rather than a page_json/page_NNN.json
+        block table. Returns None when there is nothing useful to
+        anchor with so callers can skip the content block entirely
+        rather than send an empty anchor.
+        """
+
+        block_ids = crop_metadata.get("block_ids") or []
+        page_blocks = self._load_page_blocks(
+            document_dir,
+            page_number,
+        )
+
+        if page_blocks and block_ids:
+
+            ocr_result = extract_article_text_from_blocks(
+                page_blocks,
+                block_ids,
+            )
+
+            lines = ocr_result.get("lines") or []
+
+            anchor_lines = [
+                f"Block {line.get('id')} ({line.get('block_class')}): "
+                f"{line.get('text')}"
+                for line in lines
+                if str(line.get("text", "") or "").strip()
+            ]
+
+            if anchor_lines:
+                return (
+                    "DETECTED LAYOUT OCR TEXT (Ground Truth Anchors):\n"
+                    + "\n".join(anchor_lines)
+                )
+
+        # Fallback for Urdu / engines that store full OCR text directly
+        # in crop.json rather than a page_json block table.
+        direct_text = str(crop_metadata.get("text", "") or "").strip()
+        if direct_text:
+            return (
+                "DETECTED LAYOUT OCR TEXT (Ground Truth Anchors):\n"
+                + direct_text
+            )
+
+        return None
 
     # ========================================================
     # PROCESS DOCUMENT
@@ -310,7 +477,7 @@ class OpenAIArticleExtractor:
         # ----------------------------------------------------
 
         batches = (
-            self._make_page_batches(
+            self._make_batch_specs(
                 pages,
                 crop_root,
             )
@@ -361,20 +528,23 @@ class OpenAIArticleExtractor:
         # Process batches sequentially
         # ----------------------------------------------------
 
-        for batch_index, batch_pages in enumerate(
+        for batch_index, batch_spec in enumerate(
             batches,
             start=1,
         ):
 
             result = self.process_batch(
                 document_dir=document_dir,
-                page_numbers=batch_pages,
+                page_numbers=batch_spec["page_numbers"],
                 batch_index=batch_index,
                 output_root=output_root,
                 pending_continuations=(
                     pending_continuations
                 ),
                 known_pages=pages,
+                article_id_subset=(
+                    batch_spec["article_id_subset"]
+                ),
             )
 
             results.append(
@@ -476,6 +646,48 @@ class OpenAIArticleExtractor:
             )
             print()
 
+        self.finalize_batches(
+            document_dir=document_dir,
+            model=self.model,
+            pages_per_batch=self.pages_per_batch,
+            all_articles=all_articles,
+            all_links=all_links,
+            pending_continuations=pending_continuations,
+            output_root=output_root,
+            results=results,
+            printed_page_map=printed_page_map,
+        )
+
+        return results
+
+    # ========================================================
+    # FINALIZE BATCHES (shared tail: text repair + logical
+    # article merge + final_logical_articles.json/manifest.json)
+    #
+    # Factored out of process_document() so a caller driving
+    # process_batch() directly, one page at a time (see the
+    # page-by-page architecture in
+    # backend/services/pipeline_service.py), can run this exact
+    # same finalization once at the end -- instead of only being
+    # reachable via the all-batches-at-once process_document()
+    # loop. process_document() itself calls this and its own
+    # behavior/output is unchanged.
+    # ========================================================
+
+    @classmethod
+    def finalize_batches(
+        cls,
+        document_dir: Path,
+        model: str,
+        pages_per_batch: int,
+        all_articles: list[dict[str, Any]],
+        all_links: list[dict[str, Any]],
+        pending_continuations: list[dict[str, Any]],
+        output_root: Path,
+        results: list[dict[str, Any]],
+        printed_page_map: dict[int, int] | None = None,
+    ) -> dict[str, Any]:
+
         # ====================================================
         # FINAL TEXT-BASED CONTINUATION REPAIR
         # ====================================================
@@ -495,7 +707,7 @@ class OpenAIArticleExtractor:
             all_links,
             pending_continuations,
             repair_report,
-        ) = self._repair_titleless_continuations(
+        ) = cls._repair_titleless_continuations(
             articles=all_articles,
             continuation_links=all_links,
             pending_continuations=pending_continuations,
@@ -514,7 +726,7 @@ class OpenAIArticleExtractor:
         # ====================================================
 
         logical_articles = (
-            self._build_logical_articles(
+            cls._build_logical_articles(
                 articles=all_articles,
                 continuation_links=all_links,
                 pending_continuations=(
@@ -535,10 +747,10 @@ class OpenAIArticleExtractor:
                 str(document_dir),
 
             "model":
-                self.model,
+                model,
 
             "pages_per_batch":
-                self.pages_per_batch,
+                pages_per_batch,
 
             "article_count":
                 len(all_articles),
@@ -595,10 +807,10 @@ class OpenAIArticleExtractor:
                 str(document_dir),
 
             "model":
-                self.model,
+                model,
 
             "pages_per_batch":
-                self.pages_per_batch,
+                pages_per_batch,
 
             "batch_count":
                 len(results),
@@ -691,7 +903,7 @@ class OpenAIArticleExtractor:
         print("=" * 60)
         print()
 
-        return results
+        return final_output
 
     # ========================================================
     # PROCESS ONE BATCH
@@ -707,6 +919,7 @@ class OpenAIArticleExtractor:
             dict[str, Any]
         ],
         known_pages: list[int],
+        article_id_subset: list[str] | None = None,
     ) -> dict[str, Any]:
 
         crop_root = (
@@ -752,6 +965,16 @@ class OpenAIArticleExtractor:
                     page_number,
                 )
             )
+
+            if article_id_subset is not None:
+
+                subset = set(article_id_subset)
+
+                articles = [
+                    article
+                    for article in articles
+                    if article["article_id"] in subset
+                ]
 
             for article in articles:
 
@@ -843,6 +1066,30 @@ class OpenAIArticleExtractor:
                         ),
                     }
                 )
+
+                # --------------------------------------------
+                # Ground-truth layout OCR anchors (Odia, Urdu --
+                # see self._use_layout_ocr_anchors)
+                # --------------------------------------------
+
+                if self._use_layout_ocr_anchors:
+
+                    anchor_text = (
+                        self._build_layout_ocr_anchor_text(
+                            document_dir,
+                            page_number,
+                            crop_metadata,
+                        )
+                    )
+
+                    if anchor_text:
+
+                        contents.append(
+                            {
+                                "type": "text",
+                                "text": anchor_text,
+                            }
+                        )
 
                 # --------------------------------------------
                 # Image
@@ -1176,8 +1423,19 @@ class OpenAIArticleExtractor:
                     self._temperature_supported
                     and isinstance(exc, APIStatusError)
                     and exc.status_code == 400
-                    and isinstance(exc.body, dict)
-                    and exc.body.get("param") == "temperature"
+                    and (
+                        "temperature" in str(exc).lower()
+                        or (
+                            isinstance(exc.body, dict)
+                            and (
+                                exc.body.get("param") == "temperature"
+                                or (
+                                    isinstance(exc.body.get("error"), dict)
+                                    and exc.body["error"].get("param") == "temperature"
+                                )
+                            )
+                        )
+                    )
                 ):
                     # This model doesn't support a custom temperature at
                     # all (e.g. reasoning-family models) -- remember
@@ -1431,6 +1689,45 @@ class OpenAIArticleExtractor:
         )
 
         # ====================================================
+        # PER-ARTICLE RESPONSE LOG (batch progress visibility)
+        # ====================================================
+
+        print()
+        print(f"Articles returned in batch {batch_index}:")
+
+        total_batch_chars = 0
+
+        for article in articles:
+
+            article_id = article.get("article_id", "?")
+            headline = str(article.get("headline", "") or "")
+            article_text = str(article.get("article_text", "") or "")
+
+            total_batch_chars += len(article_text)
+
+            print(
+                f"  • {article_id} | "
+                f"Headline: {headline[:60]} | "
+                f"Text: {len(article_text)} chars"
+            )
+
+            quality = article.get("quality") or {}
+            missing_text = bool(quality.get("missing_text"))
+            readability = quality.get("text_readability")
+
+            if missing_text or readability == "low":
+                print(
+                    f"    ⚠ Quality Warning: "
+                    f"text_readability={readability}, "
+                    f"missing_text={missing_text}"
+                )
+
+        print(
+            f"Total article_text characters in batch: "
+            f"{total_batch_chars}"
+        )
+
+        # ====================================================
         # RESULT
         # ====================================================
 
@@ -1443,6 +1740,16 @@ class OpenAIArticleExtractor:
 
             "model":
                 self.model,
+
+            "usage": (
+                {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                }
+                if response.usage is not None
+                else None
+            ),
 
             "requested_article_count":
                 len(article_manifest),
@@ -1748,8 +2055,19 @@ class OpenAIArticleExtractor:
                     self._temperature_supported
                     and isinstance(exc, APIStatusError)
                     and exc.status_code == 400
-                    and isinstance(exc.body, dict)
-                    and exc.body.get("param") == "temperature"
+                    and (
+                        "temperature" in str(exc).lower()
+                        or (
+                            isinstance(exc.body, dict)
+                            and (
+                                exc.body.get("param") == "temperature"
+                                or (
+                                    isinstance(exc.body.get("error"), dict)
+                                    and exc.body["error"].get("param") == "temperature"
+                                )
+                            )
+                        )
+                    )
                 ):
                     self._temperature_supported = False
                     continue
@@ -3266,81 +3584,139 @@ Return JSON only.
     # CREATE PAGE BATCHES
     # ========================================================
 
-    def _page_image_bytes(
-        self,
-        crop_root: Path,
-        page_number: int,
-    ) -> int:
-
-        total = 0
-
-        for article in self._discover_articles(
-            crop_root,
-            page_number,
-        ):
-
-            try:
-
-                total += (
-                    article["image_path"]
-                    .stat()
-                    .st_size
-                )
-
-            except OSError:
-                pass
-
-        return total
-
-    def _make_page_batches(
+    def _make_batch_specs(
         self,
         pages: list[int],
         crop_root: Path,
-    ) -> list[list[int]]:
+    ) -> list[dict[str, Any]]:
+        """
+        Groups pages into batch specs -- {"page_numbers": [...],
+        "article_id_subset": [...] | None} -- respecting three caps on
+        a single OpenAI request at once:
 
-        batches: list[list[int]] = []
+        - self.pages_per_batch: max page count.
+        - self.max_batch_image_bytes: max raw image payload (OpenAI
+          hard-caps the base64-encoded total at 50MB).
+        - self.max_articles_per_batch: max article crops -- a single
+          broadsheet page alone can carry 10-12 articles, which would
+          otherwise starve gpt-5.6-luna's completion-token budget
+          (~470 tokens/article) on one call until it dropped whole
+          columns/entities.
 
-        current_batch: list[int] = []
+        article_id_subset is None for a normal group that fits
+        entirely under the article-count cap (process_batch sends
+        every crop on those pages); it is a specific list of article
+        IDs when a SINGLE page alone produced more crops than the cap,
+        in which case that page ships alone, split into several
+        sub-batches of at most self.max_articles_per_batch crops each.
+        """
+
+        batches: list[dict[str, Any]] = []
+
+        current_pages: list[int] = []
         current_bytes = 0
+        current_article_count = 0
+
+        def _flush_current_group():
+            if current_pages:
+                batches.append(
+                    {
+                        "page_numbers": list(current_pages),
+                        "article_id_subset": None,
+                    }
+                )
 
         for page_number in pages:
 
-            page_bytes = self._page_image_bytes(
+            page_articles = self._discover_articles(
                 crop_root,
                 page_number,
             )
 
+            article_count = len(page_articles)
+
+            page_bytes = 0
+
+            for article in page_articles:
+
+                try:
+
+                    page_bytes += (
+                        article["image_path"]
+                        .stat()
+                        .st_size
+                    )
+
+                except OSError:
+                    pass
+
+            if article_count > self.max_articles_per_batch:
+
+                # This single page alone exceeds the article-count
+                # cap -- flush whatever group is pending, then split
+                # THIS page's own article IDs into sub-batches of at
+                # most max_articles_per_batch each, instead of
+                # shipping every crop on the page in one oversized
+                # call.
+                _flush_current_group()
+                current_pages = []
+                current_bytes = 0
+                current_article_count = 0
+
+                article_ids = [
+                    article["article_id"]
+                    for article in page_articles
+                ]
+
+                for chunk_start in range(
+                    0,
+                    len(article_ids),
+                    self.max_articles_per_batch,
+                ):
+
+                    chunk = article_ids[
+                        chunk_start
+                        : chunk_start + self.max_articles_per_batch
+                    ]
+
+                    batches.append(
+                        {
+                            "page_numbers": [page_number],
+                            "article_id_subset": chunk,
+                        }
+                    )
+
+                continue
+
             # Close out the current batch before adding this page if
-            # it would either exceed the page-count cap, or push the
-            # raw image payload over budget -- unless the batch is
-            # still empty, since a single oversized page still has
-            # to go out on its own (there's no smaller unit to split
-            # it into).
-            if current_batch and (
-                len(current_batch)
+            # it would exceed the page-count cap, push the raw image
+            # payload over budget, or push the running article-crop
+            # total over the cap -- unless the batch is still empty,
+            # since a single oversized page still has to go out on its
+            # own (there's no smaller unit to split it into).
+            if current_pages and (
+                len(current_pages)
                 >= self.pages_per_batch
                 or current_bytes + page_bytes
                 > self.max_batch_image_bytes
+                or current_article_count + article_count
+                > self.max_articles_per_batch
             ):
 
-                batches.append(
-                    current_batch
-                )
+                _flush_current_group()
 
-                current_batch = []
+                current_pages = []
                 current_bytes = 0
+                current_article_count = 0
 
-            current_batch.append(
+            current_pages.append(
                 page_number
             )
 
             current_bytes += page_bytes
+            current_article_count += article_count
 
-        if current_batch:
-
-            batches.append(
-                current_batch
-            )
+        _flush_current_group()
 
         return batches
 
@@ -4490,8 +4866,8 @@ Return JSON only.
             return target
 
         patterns = (
-            r"(?:more\s+on|continued\s+on|continued\s+from|report\s+on|full\s+report\s+on|turn\s+to|see|to\s+be\s+continued)[^\n]{0,100}?(?:page|pg\.?|p\.?)\s*[-:]?\s*(\d{1,4})\b",
-            r"(?:page|pg\.?|p\.?)\s*[-:]?\s*(\d{1,4})\b",
+            r"(?:more\s+on|continued\s+on|continued\s+from|report\s+on|full\s+report\s+on|turn\s+to|see|to\s+be\s+continued|शेष|जारी|बाकी|देखें|उर्वरित|उर्वरित\s*भाग|पुढे\s*वाचा|सविस्तर\s*वृत्त|सविस्तर\s*बातमी|पुढे\s*पहा|पहा|बघा|ਬਾਕੀ|ਜਾਰੀ|ਦੇਖੋ|ଅବଶିଷ୍ଟ|ଅବଶିଷ୍ଟାଂଶ|ଜାରି|ବାକି|ଦେଖନ୍ତୁ|અનુસંધાન|બાકી|ચાલુ|જુઓ|વિગતવાર|સંપૂર્ણ\s*અહેવાલ|বাকি|বাকি\s*অংশ|চলবে|চলমান|দেখুন|বিস্তারিত|বিস্তারিত\s*প্রতিবেদন|বাকী\s*অংশ|বাকী|শেষাংশ|চাওক|বিতং|অব্যাহত|পঢ়ক|தொடர்ச்சி|தொடர்கிறது|மீதி|பார்க்க|பார்வை|முழு\s*செய்தி|விவரம்|ಉಳಿದ\s*ಭಾಗ|ಮುಂದುವರಿದಿದೆ|ಮುಂದುವರಿಕೆ|ನೋಡಿ|ವಿವರ|ಸಂಪೂರ್ಣ\s*ವರದಿ|ಬಾಕಿ|بقیہ|جاری|ملاحظہ|ملاحظہ\s*فرمائیں|دیکھئے|تفصیل|تفصیلات|مکمل\s*رپورٹ)[^\n]{0,100}?(?:page|pg\.?|p\.?|पेज|पृष्ठ|पान|पान\s*क्र\.?|पान\s*नं\.?|ਸਫ਼ਾ|ਪੰਨਾ|ਪੇਜ|ପୃଷ୍ଠା|ପୃଷ୍ଠାରେ|ପେଜ୍|ପୃ|પાના|પાનું|પાના\s*નં\.?|પેજ|পাতা|পৃষ্ঠা|পাতায়|পৃষ্ঠায়|পেজ|পৃষ্ঠাত|পৃ\.?|পৃ:|பக்கம்|பக்கத்தில்|பக்\.?|பக்:|ಪುಟ|ಪುಟಕ್ಕೆ|ಪುಟದಲ್ಲಿ|ಪೇಜ್|ಪು\.?|ಪು:|صفحہ|صفحے|صفحۂ|ص\.?|ص:)\s*[-:>]*\s*(\d{1,4})\b",
+            r"(?:page|pg\.?|p\.?|पेज|पृष्ठ|पान|पान\s*क्र\.?|पान\s*नं\.?|ਸਫ਼ਾ|ਪੰਨਾ|ਪੇਜ|ପୃଷ୍ଠା|ପୃଷ୍ଠାରେ|ପେଜ୍|ପୃ|પાના|પાનું|પાના\s*નં\.?|પેજ|পাতা|পৃষ্ঠা|পাতায়|পৃষ্ঠায়|পেজ|পৃষ্ঠাত|পৃ\.?|পৃ:|பக்கம்|பக்கத்தில்|பக்\.?|பக்:|ಪುಟ|ಪುಟಕ್ಕೆ|ಪುಟದಲ್ಲಿ|ಪೇಜ್|ಪು\.?|ಪು:|صفحہ|صفحے|صفحۂ|ص\.?|ص:)\s*[-:>]*\s*(\d{1,4})\b",
         )
 
         candidates=[]

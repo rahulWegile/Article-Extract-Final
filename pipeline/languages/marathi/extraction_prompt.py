@@ -101,6 +101,46 @@ then continue to the next column.
 Do NOT read horizontally across unrelated columns.
 
 ============================================================
+ANTI-HALLUCINATION & ZERO PARAPHRASING
+============================================================
+
+Transcribe the visible Marathi text verbatim into article_text.
+
+Do NOT paraphrase.
+
+Do NOT summarize the article body into article_text.
+
+Do NOT invent words, sentences, or facts that are not visibly
+printed in the crop.
+
+The summary is a separate field -- article_text itself must
+always be the verbatim transcription.
+
+============================================================
+MULTI-COLUMN COMPLETENESS MANDATE
+============================================================
+
+If an article crop contains multiple columns (2, 3, or 4
+columns) or inset quote/photo boxes:
+
+1. Transcribe Column 1 top-to-bottom.
+2. Then transcribe Column 2 top-to-bottom.
+3. Then transcribe Column 3 and Column 4 top-to-bottom.
+4. Transcribe all the way down to the author byline, location,
+   and contact info at the bottom of the last column.
+5. NEVER stop after Column 1. NEVER summarize multi-column
+   feature articles into a single paragraph.
+
+============================================================
+BOTTOM MARGIN SCAN
+============================================================
+
+Before finalizing article_text, inspect the bottom 15% of the
+crop for concluding lines, spokesperson quotes, and
+continuation markers (e.g. "पान 4 वर", "उर्वरित वृत्त पान 6 वर")
+that are easy to miss if transcription stops early.
+
+============================================================
 ARTICLE TEXT
 ============================================================
 
@@ -111,11 +151,9 @@ Do NOT summarize article_text.
 
 The summary is a separate field.
 
-Transcribe article_text in the exact language and script shown
-in the image (e.g. Tamil script stays Tamil, Devanagari stays
-Devanagari, Gujarati script stays Gujarati, English stays
-English). Do NOT translate or transliterate it into a different
-language or script.
+Preserve the Marathi language and Devanagari script exactly as
+printed. Do NOT translate article_text into English or Hindi,
+and do NOT transliterate it into Latin characters.
 
 ============================================================
 STRUCTURED KNOWLEDGE
@@ -335,6 +373,11 @@ Turn to Page 4
 Full report on Page 7
 Report on Page 2
 To be continued
+पान 4 वर
+उर्वरित वृत्त पान 6 वर
+उर्वरित भाग पान 3 वर
+सविस्तर वृत्त पान 5 वर
+पुढे वाचा पान 2 वर
 
 If a marker is visible:
 

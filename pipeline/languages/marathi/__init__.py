@@ -9,9 +9,6 @@ from pipeline.ocr.rapidocr_engine import RapidOCREngine
 from pipeline.intelligence.openai_article_extractor import (
     OpenAIArticleExtractor,
 )
-from pipeline.intelligence.gemini_article_extractor import (
-    GeminiArticleExtractor,
-)
 
 
 def matches(language: str) -> bool:
@@ -39,5 +36,17 @@ MARATHI = LanguagePipeline(
     llm_provider="openai",
     grouping_prompt=MARATHI_GROUPING_PROMPT,
     extraction_prompt_template=MARATHI_EXTRACTION_PROMPT,
-    extractor_class=GeminiArticleExtractor,
+    extractor_class=OpenAIArticleExtractor,
+
+    # 1 page per batch, max 8 article crops per batch -- keeps each
+    # OpenAI call small so a page with many crops doesn't get bundled
+    # into a slow, oversized request (matches Punjabi's settings).
+    extraction_pages_per_batch=1,
+    extraction_max_articles_per_batch=8,
+
+    # Boundary safeguards to prevent multi-column headline slicing.
+    use_article_splitter=True,
+    use_boundary_decomposition=True,
+    use_orphan_block_reassignment=True,
+    use_wide_top_banner_detachment=False,
 )

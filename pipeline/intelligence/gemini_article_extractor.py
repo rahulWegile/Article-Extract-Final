@@ -431,6 +431,48 @@ class GeminiArticleExtractor:
             )
             print()
 
+        self.finalize_batches(
+            document_dir=document_dir,
+            model=self.model,
+            pages_per_batch=self.pages_per_batch,
+            all_articles=all_articles,
+            all_links=all_links,
+            pending_continuations=pending_continuations,
+            output_root=output_root,
+            results=results,
+            printed_page_map=printed_page_map,
+        )
+
+        return results
+
+    # ========================================================
+    # FINALIZE BATCHES (shared tail: text repair + logical
+    # article merge + final_logical_articles.json/manifest.json)
+    #
+    # Factored out of process_document() so a caller driving
+    # process_batch() directly, one page at a time (see the
+    # page-by-page architecture in
+    # backend/services/pipeline_service.py), can run this exact
+    # same finalization once at the end -- instead of only being
+    # reachable via the all-batches-at-once process_document()
+    # loop. process_document() itself calls this and its own
+    # behavior/output is unchanged.
+    # ========================================================
+
+    @classmethod
+    def finalize_batches(
+        cls,
+        document_dir: Path,
+        model: str,
+        pages_per_batch: int,
+        all_articles: list[dict[str, Any]],
+        all_links: list[dict[str, Any]],
+        pending_continuations: list[dict[str, Any]],
+        output_root: Path,
+        results: list[dict[str, Any]],
+        printed_page_map: dict[int, int] | None = None,
+    ) -> dict[str, Any]:
+
         # ====================================================
         # FINAL TEXT-BASED CONTINUATION REPAIR
         # ====================================================
@@ -450,7 +492,7 @@ class GeminiArticleExtractor:
             all_links,
             pending_continuations,
             repair_report,
-        ) = self._repair_titleless_continuations(
+        ) = cls._repair_titleless_continuations(
             articles=all_articles,
             continuation_links=all_links,
             pending_continuations=pending_continuations,
@@ -469,7 +511,7 @@ class GeminiArticleExtractor:
         # ====================================================
 
         logical_articles = (
-            self._build_logical_articles(
+            cls._build_logical_articles(
                 articles=all_articles,
                 continuation_links=all_links,
                 pending_continuations=(
@@ -490,10 +532,10 @@ class GeminiArticleExtractor:
                 str(document_dir),
 
             "model":
-                self.model,
+                model,
 
             "pages_per_batch":
-                self.pages_per_batch,
+                pages_per_batch,
 
             "article_count":
                 len(all_articles),
@@ -550,10 +592,10 @@ class GeminiArticleExtractor:
                 str(document_dir),
 
             "model":
-                self.model,
+                model,
 
             "pages_per_batch":
-                self.pages_per_batch,
+                pages_per_batch,
 
             "batch_count":
                 len(results),
@@ -646,7 +688,7 @@ class GeminiArticleExtractor:
         print("=" * 60)
         print()
 
-        return results
+        return final_output
 
     # ========================================================
     # PROCESS ONE BATCH
@@ -662,6 +704,7 @@ class GeminiArticleExtractor:
             dict[str, Any]
         ],
         known_pages: list[int],
+        article_id_subset: list[str] | None = None,
     ) -> dict[str, Any]:
 
         crop_root = (
@@ -1607,6 +1650,209 @@ class GeminiArticleExtractor:
         print("=" * 60)
 
         return result
+
+    # ========================================================
+    # SINGLE-ARTICLE RE-EXTRACTION
+    # ========================================================
+    #
+    # Used by backend/services/boundary_editor.py when a user
+    # manually draws/edits/merges one article boundary in the
+    # Viewer -- a focused one-crop retry through Gemini instead of
+    # the full 3-page batch path above, mirroring
+    # OpenAIArticleExtractor._extract_single_article's contract and
+    # return shape exactly so callers don't need to special-case
+    # the provider.
+    # ========================================================
+
+    def _extract_single_article(
+        self,
+        page_number: int,
+        article_id: str,
+        image_path: str,
+        crop_metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+
+        image_path = Path(image_path)
+
+        manifest_item = {
+            "page": page_number,
+            "article_id": article_id,
+            "image": str(image_path),
+            "crop_metadata": crop_metadata,
+        }
+
+        contents: list[Any] = []
+
+        contents.append(
+            types.Part.from_text(
+                text=(
+                    "\n"
+                    "================================================\n"
+                    "VERIFIED ARTICLE CROP\n"
+                    f"PAGE: {page_number}\n"
+                    f"ARTICLE_ID: {article_id}\n"
+                    f"IMAGE: {image_path.name}\n"
+                    "================================================\n"
+                )
+            )
+        )
+
+        metadata = {
+            "page": page_number,
+            "article_id": article_id,
+            "bbox": crop_metadata.get("bbox"),
+            "width": crop_metadata.get("width"),
+            "height": crop_metadata.get("height"),
+            "source_width": crop_metadata.get("source_width"),
+            "source_height": crop_metadata.get("source_height"),
+            "boundary_source": crop_metadata.get("boundary_source"),
+        }
+
+        contents.append(
+            types.Part.from_text(
+                text=(
+                    "Verified crop metadata:\n"
+                    + json.dumps(metadata, ensure_ascii=False)
+                )
+            )
+        )
+
+        try:
+
+            image_bytes = image_path.read_bytes()
+
+        except Exception as exc:
+
+            print(
+                "  WARNING: could not read crop image "
+                f"for re-extraction: {exc}"
+            )
+
+            return None
+
+        contents.append(
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type="image/png",
+            )
+        )
+
+        prompt = self._build_prompt(
+            page_numbers=[page_number],
+            article_manifest=[manifest_item],
+            pending_continuations=[],
+            known_pages=[page_number],
+        )
+
+        contents.insert(
+            0,
+            types.Part.from_text(text=prompt),
+        )
+
+        contents.insert(
+            1,
+            types.Part.from_text(
+                text=(
+                    "\nSINGLE-ARTICLE RE-EXTRACTION PASS\n"
+                    "This is a focused retry for ONE article crop\n"
+                    "that appeared truncated on the first pass.\n"
+                    "Transcribe article_text completely and\n"
+                    "verbatim, from the first word to the very\n"
+                    "last word visible in the crop. Do not stop\n"
+                    "early and do not summarize.\n"
+                )
+            ),
+        )
+
+        MAX_RETRIES = 3
+        RETRY_DELAY = 5
+
+        response = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+
+            try:
+
+                response = (
+                    self.client.models.generate_content(
+                        model=self.model,
+
+                        contents=contents,
+
+                        config=types.GenerateContentConfig(
+                            temperature=0,
+
+                            response_mime_type=(
+                                "application/json"
+                            ),
+
+                            response_schema=(
+                                self._response_schema()
+                            ),
+                        ),
+                    )
+                )
+
+                break
+
+            except (APIError, httpx.TimeoutException, httpx.ConnectError) as exc:
+
+                is_timeout = isinstance(
+                    exc,
+                    (httpx.TimeoutException, httpx.ConnectError),
+                )
+
+                retryable = (
+                    is_timeout
+                    or getattr(exc, "code", None) in (429, 500, 502, 503, 504)
+                )
+
+                if not retryable or attempt == MAX_RETRIES:
+
+                    print(
+                        "  WARNING: single-article "
+                        f"re-extraction failed: {exc}"
+                    )
+
+                    return None
+
+                time.sleep(RETRY_DELAY)
+
+        if response is None:
+            return None
+
+        response_text = (
+            response.text
+            or ""
+        ).strip()
+
+        if not response_text:
+            return None
+
+        try:
+
+            parsed = self._parse_json(response_text)
+
+        except Exception as exc:
+
+            print(
+                "  WARNING: could not parse re-extraction "
+                f"response: {exc}"
+            )
+
+            return None
+
+        result_articles = parsed.get("articles", [])
+
+        if not isinstance(result_articles, list) or not result_articles:
+            return None
+
+        for candidate in result_articles:
+
+            if str(candidate.get("article_id")) == str(article_id):
+                return candidate
+
+        return result_articles[0]
 
     # ========================================================
     # PROMPT

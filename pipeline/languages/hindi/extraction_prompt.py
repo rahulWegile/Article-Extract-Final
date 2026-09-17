@@ -1,13 +1,10 @@
 # Article-extraction prompt template for Hindi.
 #
-# Copied verbatim from GeminiArticleExtractor's previously-hardcoded
-# template. Hindi extracts via Gemini (gpt cannot read Devanagari),
-# so this is the Gemini-flavoured template, not the OpenAI one every
-# other language uses.
+# Configured for OpenAIArticleExtractor (batching + cross-page continuation resolution).
 #
 # Placeholders (__PAGES__, __KNOWN_PAGES__, __CROP_INVENTORY__,
 # __PENDING_CONTINUATIONS__) are substituted by
-# GeminiArticleExtractor._build_prompt at call time -- keep them intact.
+# OpenAIArticleExtractor._build_prompt at call time -- keep them intact.
 
 HINDI_EXTRACTION_PROMPT = """
 You are the newspaper article extraction and
@@ -111,6 +108,36 @@ article text.
 Do NOT summarize article_text.
 
 The summary is a separate field.
+
+Transcribe article_text in the exact language and script shown
+in the image (Devanagari stays Devanagari). Do NOT translate or
+transliterate it into a different language or script.
+
+============================================================
+EXHAUSTIVE VERBATIM TRANSCRIPTION (ZERO TRUNCATION)
+============================================================
+
+1. FROM FIRST WORD TO ABSOLUTE LAST WORD:
+   Transcribe article_text completely and verbatim, from the
+   very first word to the very last word and final punctuation mark (।)
+   visible in the crop.
+   - NEVER drop the final sentence or concluding line.
+   - NEVER omit ending paragraphs, spokesperson quotes, attributions,
+     or trailing statements.
+
+2. MULTI-COLUMN & SIDE-BOX COMPLETION:
+   If an article crop contains multiple columns, shaded boxes,
+   or sidebar sub-stories:
+   - You MUST read EVERY column and EVERY sidebar box completely
+     down to its very bottom edge.
+   - Do NOT stop after reading the box headline or its first sentence.
+   - Transcribe all text, quotes, and statements contained within
+     every side box or column before concluding.
+
+3. REPEATED HEADINGS IN TEXT:
+   If a heading or subhead repeats similar words in the body text
+   immediately below it, do NOT treat this as the end of the section.
+   Continue reading all subsequent sentences to the bottom.
 
 ============================================================
 STRUCTURED KNOWLEDGE
@@ -330,6 +357,14 @@ Turn to Page 4
 Full report on Page 7
 Report on Page 2
 To be continued
+शेष पृष्ठ 2 पर
+शेष पेज 3 पर
+पृष्ठ 4 पर जारी
+पेज 5 पर देखें
+बाकी पेज 6 पर
+पेज 2 से जारी
+पृष्ठ 3 का शेष
+जारी पृष्ठ 4
 
 If a marker is visible:
 

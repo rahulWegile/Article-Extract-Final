@@ -99,6 +99,11 @@ class LanguagePipeline:
     # (pipeline/article/article_splitter.split_oversized_articles).
     use_article_splitter: bool = True
 
+    # Detach a wide top block (e.g. masthead banner) from narrow columns
+    # below it (pipeline/article/article_splitter.detach_wide_top_banner_blocks).
+    # Disabled for broadsheet languages where main headlines span across columns.
+    use_wide_top_banner_detachment: bool = True
+
     # Whether this language is printed right-to-left (currently only
     # Urdu -- Perso-Arabic Nastaliq). Affects two purely geometric,
     # pre-LLM computations that both assume left-to-right print by
@@ -163,3 +168,28 @@ class LanguagePipeline:
     # Set together with document_order_extractor_factory; None for
     # languages with no Stream B.
     document_order_reconcile_articles: Optional[Callable] = None
+
+    # Number of pages' crops grouped into one article-extraction call,
+    # in the page-by-page pipeline (backend/services/pipeline_service.py's
+    # interleave_extraction path). 1 (the default, every language except
+    # Hindi) means extraction fires immediately after each page's own
+    # crops are written. A value > 1 buffers that many pages' crops
+    # before firing one shared extraction call across them, trading a
+    # small per-page cost reduction (shared prompt overhead -- see
+    # OpenAIArticleExtractor.process_batch) for less even, larger
+    # requests. Purely a batching-size knob: the pipeline stays fully
+    # sequential either way (one API call in flight at a time), so this
+    # never introduces concurrent/overlapping API calls or "overload"
+    # risk against boundary-grouping, which always remains one page,
+    # one call, regardless of this setting.
+    extraction_pages_per_batch: int = 1
+
+    # Safety cap on total article crops per extraction call, on top of
+    # extraction_pages_per_batch. None (the default, every language
+    # except Hindi) means no cap beyond the page-count one. When set,
+    # a page whose crops would push the running total past this value
+    # is held back to start the NEXT batch instead of being force-fit
+    # into the current one -- mirrors the existing byte-size safety
+    # cap in OpenAIArticleExtractor._make_page_batches ("a single
+    # oversized page still ships alone").
+    extraction_max_articles_per_batch: Optional[int] = None

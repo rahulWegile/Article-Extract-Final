@@ -3,24 +3,14 @@ from pipeline.languages.hindi.grouping_prompt import HINDI_GROUPING_PROMPT
 from pipeline.languages.hindi.extraction_prompt import (
     HINDI_EXTRACTION_PROMPT,
 )
-from pipeline.ocr.rapidocr_engine import RapidOCREngine
-from pipeline.intelligence.gemini_article_extractor import (
-    GeminiArticleExtractor,
-)
-from pipeline.languages.hindi.document_order_extractor import (
-    GeminiDocumentOrderExtractor,
-)
-from pipeline.languages.hindi.heading_repair import (
-    repair_missing_headings,
-)
-from pipeline.languages.hindi.reconcile import (
-    reconcile_articles,
+from pipeline.ocr.tesseract_engine import TesseractOCREngine
+from pipeline.intelligence.openai_article_extractor import (
+    OpenAIArticleExtractor,
 )
 
 
 def matches(language: str) -> bool:
     """
-    Copied verbatim from the old PipelineService._is_hindi_language.
     "Hindi", "hi", "hin", and anything containing "hindi" (e.g.
     "Hindi (Devanagari)") all count.
     """
@@ -30,23 +20,39 @@ def matches(language: str) -> bool:
     return lang in ("hi", "hin", "hindi") or "hindi" in lang
 
 
-# The one language that differs from the shared/default pipeline:
-# Gemini for grouping + extraction (gpt-5.6-luna cannot read
-# Devanagari, confirmed on real headline crops), layout-distance
-# contested-block arbitration instead of first-claim-wins, and a
-# concurrent document-order extraction pass ("Stream B") to recover
-# headings the boundary pipeline missed.
 HINDI = LanguagePipeline(
     code="hindi",
     matches=matches,
-    ocr_engine_factory=lambda: RapidOCREngine(lang="hi"),
-    ocr_engine_label="devanagari (hindi)",
-    llm_provider="gemini",
+    ocr_engine_factory=lambda: TesseractOCREngine(lang="hin"),
+    ocr_engine_label="tesseract (hindi)",
+    llm_provider="openai",
     grouping_prompt=HINDI_GROUPING_PROMPT,
     extraction_prompt_template=HINDI_EXTRACTION_PROMPT,
-    extractor_class=GeminiArticleExtractor,
-    use_contested_block_arbitration=True,
-    document_order_extractor_factory=GeminiDocumentOrderExtractor,
-    document_order_repair_headings=repair_missing_headings,
-    document_order_reconcile_articles=reconcile_articles,
+    extractor_class=OpenAIArticleExtractor,
+    use_contested_block_arbitration=False,
+
+    # 2-page extraction batching: shares the extraction prompt's fixed
+    # overhead across 2 pages instead of paying it on every single
+    # page. Boundary detection is unaffected -- it stays one page,
+    # one call, regardless of this setting.
+    extraction_pages_per_batch=2,
+
+    # Safety cap: even within a 2-page group, never send more than 25
+    # article crops in one extraction call -- a page with an unusually
+    # high article count (20+ seen on real Hindi pages) paired with a
+    # second page could otherwise produce an oversized request. A page
+    # that would push the running total past this cap is held back and
+    # starts the NEXT batch instead of being force-fit into this one.
+    extraction_max_articles_per_batch=25,
+
+    # Disable heuristic splitters and repairs to preserve OpenAI grouping decisions
+    use_orphan_block_reassignment=False,
+    use_orphan_title_root_repair=False,
+    use_unclaimed_kicker_recovery=False,
+    use_unclaimed_image_recovery=False,
+    use_unclaimed_footprint_recovery=False,
+    use_article_splitter=False,
+    use_wide_top_banner_detachment=False,
+    use_dropped_article_recovery=False,
+    use_boundary_decomposition=False,
 )

@@ -4,7 +4,8 @@ Manual boundary editing for the document Viewer.
 Lets a user draw a brand-new article boundary (for an article the
 pipeline missed) or drag/resize an existing one directly on a page,
 then re-crops that region and re-runs text extraction on it using
-the same OpenAI vision path the main pipeline uses.
+the same vision extractor (OpenAI or Gemini, per this document's
+language pipeline) the main pipeline uses.
 
 Editing is only supported for single-page (standalone) articles --
 an article whose logical record spans multiple pages (a continuation)
@@ -196,11 +197,10 @@ def _extract_and_persist(
 
     # Use this document's own language pipeline (see
     # pipeline/languages/) so, e.g., a Hindi document re-extracts
-    # through the same provider the automatic pipeline used for it --
-    # falling back to OpenAIArticleExtractor when that language's
-    # extractor doesn't support single-crop re-extraction yet (today:
-    # GeminiArticleExtractor only implements the batched
-    # process_document() path, not _extract_single_article()).
+    # through the same provider (Gemini) the automatic pipeline used
+    # for it -- falling back to OpenAIArticleExtractor only if some
+    # future language's extractor_class doesn't implement
+    # _extract_single_article() at all.
     lang_pipeline = resolve_language_pipeline(
         _resolve_document_language(document_dir)
     )
@@ -231,9 +231,20 @@ def _extract_and_persist(
     )
 
     if extracted is None:
+
+        # Name the API key this document's actual extractor reads,
+        # so a Gemini-routed language (e.g. Hindi) doesn't get told
+        # to check OPENAI_API_KEY when GeminiArticleExtractor was
+        # the one that failed.
+        api_key_hint = (
+            "GEMINI_API_KEY"
+            if "Gemini" in type(extractor).__name__
+            else "OPENAI_API_KEY"
+        )
+
         raise RuntimeError(
             "Text re-extraction failed for this boundary. Check "
-            "OPENAI_API_KEY / model availability and try again."
+            f"{api_key_hint} / model availability and try again."
         )
 
     physical_article = dict(extracted)

@@ -1,13 +1,18 @@
 # Article-extraction prompt template for Gujarati.
 #
-# Deliberately a copy of Hindi's extraction prompt, per the
-# requirement that Gujarati behave like Hindi. Note it is fed to
-# OpenAIArticleExtractor (Gujarati keeps the OpenAI provider), not
-# to Gemini -- the placeholders are the same in both extractors,
-# so the template is portable between them.
+# Configured for OpenAIArticleExtractor (batching + cross-page
+# continuation resolution), matching Hindi/Punjabi/Odia. Carries the
+# same verbatim-transcription discipline ported from Hindi/Odia's
+# prompts: anti-hallucination/zero-paraphrasing, multi-column
+# completeness, script preservation, and a bottom-margin scan for
+# Gujarati continuation markers.
 #
-# Still physically separate so it can diverge from Hindi later
-# without touching Hindi.
+# Placeholders (__PAGES__, __KNOWN_PAGES__, __CROP_INVENTORY__,
+# __PENDING_CONTINUATIONS__) are substituted by
+# OpenAIArticleExtractor._build_prompt at call time -- keep them intact.
+#
+# Physically separate per language so this one can be tuned without
+# touching any other language's prompt.
 
 GUJARATI_EXTRACTION_PROMPT = """
 You are the newspaper article extraction and
@@ -102,6 +107,53 @@ then continue to the next column.
 Do NOT read horizontally across unrelated columns.
 
 ============================================================
+ANTI-HALLUCINATION & ZERO PARAPHRASING
+============================================================
+
+Transcribe visible Gujarati text verbatim into article_text.
+
+Never paraphrase, summarize, or invent wording.
+
+If a word is genuinely unreadable, do not guess a replacement
+word -- leave it out rather than inventing text that is not
+actually visible in the crop.
+
+============================================================
+CRITICAL - MULTI-COLUMN FULL TRANSCRIPTION
+============================================================
+
+If an article crop contains multiple columns (2, 3, or 4 columns)
+or inset quote/photo boxes:
+
+1. Transcribe Column 1 top-to-bottom.
+2. Then transcribe Column 2 top-to-bottom.
+3. Then transcribe Column 3 and Column 4 top-to-bottom.
+4. Transcribe all the way down to the author byline, location,
+   and contact info at the bottom of the last column.
+5. NEVER stop after Column 1. NEVER summarize multi-column
+   feature articles into a single paragraph.
+
+============================================================
+BOTTOM MARGIN SCAN
+============================================================
+
+Before finalizing article_text, inspect the bottom 15% of the
+crop for concluding lines, closing quotes, attributions, and
+Gujarati continuation markers such as:
+
+અનુસંધાન પાના 4 પર
+બાકી પાના 6 પર
+ચાલુ પાના 2 પર
+પાના 3 પર જુઓ
+વિગતવાર અહેવાલ પાના 5 પર
+સંપૂર્ણ અહેવાલ પાના 7 પર
+
+Do NOT stop transcribing before this bottom margin has been
+read. A continuation marker found there must still be recorded
+under continuation.marker / continuation.next_page (see PART D
+below).
+
+============================================================
 ARTICLE TEXT
 ============================================================
 
@@ -111,6 +163,11 @@ article text.
 Do NOT summarize article_text.
 
 The summary is a separate field.
+
+Transcribe article_text in the exact language and script shown
+in the image: preserve Gujarati language and Gujarati script.
+Do NOT translate it into English or Hindi, and do NOT
+transliterate it into Latin characters.
 
 ============================================================
 STRUCTURED KNOWLEDGE
@@ -330,6 +387,12 @@ Turn to Page 4
 Full report on Page 7
 Report on Page 2
 To be continued
+અનુસંધાન પાના 4 પર
+બાકી પાના 6 પર
+ચાલુ પાના 2 પર
+પાના 3 પર જુઓ
+વિગતવાર અહેવાલ પાના 5 પર
+સંપૂર્ણ અહેવાલ પાના 7 પર
 
 If a marker is visible:
 
